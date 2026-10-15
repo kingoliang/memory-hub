@@ -26,6 +26,7 @@ const DRAIN_LIMIT = 16 * 1024 * 1024
 /** 认证失败限流：同一来源 60 秒内最多允许这么多次失败，超过返回 429。 */
 export const AUTH_FAIL_LIMIT = 10
 const AUTH_FAIL_WINDOW_MS = 60_000
+const OAUTH_PROBE_RE = /^\/(?:\.well-known\/(?:oauth-|openid-)[\w./-]*|register|authorize|token)$/
 
 function sendJson(res, status, obj, headers = {}) {
   const body = JSON.stringify(obj)
@@ -137,7 +138,14 @@ export async function startServer(config, { logger = getLogger(), scheduler = tr
       return sendJson(res, 200, { ok: true, version: SERVER_VERSION, bind: req.socket.localAddress })
     }
     if (admin.owns(pathname)) return admin.handle(req, res, url)
-    if (pathname !== `${base}/mcp`) return sendJson(res, 404, { error: 'not found' })
+    if (pathname !== `${base}/mcp`) {
+      // OAuth 发现/动态注册探测：客户端收到 401 后会去试这些路径，最后报"Dynamic Client Registration rejected (HTTP 404)"。
+      // 本服务不做 OAuth（只认静态 Bearer 令牌），所以仍是 404，但把原因写进响应体——客户端会把响应体原样带进它的报错。
+      if (OAUTH_PROBE_RE.test(pathname) || (base && OAUTH_PROBE_RE.test(pathname.slice(base.length)))) {
+        return sendJson(res, 404, { error: 'not found', message: '本服务不支持 OAuth / 动态客户端注册，只认静态 Bearer 令牌：请在 MCP 客户端配置里加请求头 Authorization: Bearer <令牌>（令牌由管理员创建，见管理界面“令牌”页）' })
+      }
+      return sendJson(res, 404, { error: 'not found' })
+    }
 
     const origin = req.headers.origin
     if (origin !== undefined && !originAllowed(String(origin))) {

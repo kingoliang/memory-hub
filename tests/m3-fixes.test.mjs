@@ -29,10 +29,12 @@ test('a. 无效令牌：401 + invalid_token，信息不泄露原因细节；OAut
     assert.match(res.headers.get('www-authenticate') || '', /^Bearer realm="memory-hub", error="invalid_token"/)
     const j = await res.json()
     assert.match(j.message, /令牌无效/)
-    for (const p of ['/.well-known/oauth-protected-resource', '/.well-known/oauth-authorization-server', '/register']) {
-      const r = await fetch(h.url + p)
+    for (const p of ['/.well-known/oauth-protected-resource', '/.well-known/oauth-authorization-server', '/.well-known/oauth-protected-resource/mcp', '/register', '/authorize', '/token']) {
+      const r = await fetch(h.url + p, { method: p === '/register' ? 'POST' : 'GET' })
       assert.equal(r.status, 404, p)
-      assert.equal((await r.json()).error, 'not found')
+      const j = await r.json()
+      assert.equal(j.error, 'not found')
+      assert.match(j.message, /不支持 OAuth.*Bearer/, p)
     }
   })
 })
