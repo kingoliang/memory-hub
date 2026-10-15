@@ -102,6 +102,7 @@ async function renderRoute() {
   } catch (e) {
     if (my !== renderToken) return
     if (e?.status === 401) return // onUnauthorized 已切到登录页
+    console.error('页面渲染失败', name, e?.stack || e)
     mount(shell.view, errorBlock(e))
   }
   refreshBadges()

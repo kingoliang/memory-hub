@@ -5,7 +5,7 @@
 const SVG_NS = 'http://www.w3.org/2000/svg'
 const FORBIDDEN_TAGS = new Set(['script', 'iframe', 'object', 'embed', 'style', 'link', 'meta', 'base', 'frame', 'frameset', 'applet', 'img', 'video', 'audio', 'source', 'foreignobject'])
 const SVG_TAGS = new Set(['svg', 'path', 'g', 'rect', 'circle', 'line', 'polyline', 'polygon', 'text', 'title', 'defs', 'lineargradient', 'stop'])
-const ALLOWED_ATTR = /^(?:class|id|href|title|type|value|placeholder|name|for|role|colspan|rowspan|disabled|checked|selected|readonly|required|rows|cols|min|max|step|maxlength|autocomplete|autofocus|target|rel|hidden|tabindex|open|aria-[\w-]+|data-[\w-]+|viewBox|width|height|d|x|y|x1|x2|y1|y2|rx|ry|cx|cy|r|fill|stroke|stroke-width|stroke-linecap|stroke-linejoin|stroke-dasharray|points|transform|opacity|text-anchor|dominant-baseline|font-size|preserveAspectRatio|focusable|offset|stop-color|stop-opacity|fill-opacity|stroke-opacity)$/
+const ALLOWED_ATTR = /^(?:class|id|href|title|type|value|placeholder|name|for|role|colspan|rowspan|disabled|checked|selected|readonly|required|rows|cols|min|max|step|maxlength|autocomplete|autofocus|list|target|rel|hidden|tabindex|open|aria-[\w-]+|data-[\w-]+|viewBox|width|height|d|x|y|x1|x2|y1|y2|rx|ry|cx|cy|r|fill|stroke|stroke-width|stroke-linecap|stroke-linejoin|stroke-dasharray|points|transform|opacity|text-anchor|dominant-baseline|font-size|preserveAspectRatio|focusable|offset|stop-color|stop-opacity|fill-opacity|stroke-opacity)$/
 
 /** 只放行 http(s) 链接（外链）与站内哈希路由（#/…）。其余一律丢弃。 */
 export function safeHref(v) {

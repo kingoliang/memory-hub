@@ -58,7 +58,7 @@ code { background: var(--mute-soft); padding: .12em .4em; border-radius: 6px; }
 .main { min-width: 0; display: flex; flex-direction: column; }
 .topbar { position: sticky; top: 0; z-index: 5; display: flex; align-items: center; gap: 10px; padding: 12px 28px; background: color-mix(in srgb, var(--bg) 88%, transparent); backdrop-filter: blur(10px); border-bottom: 1px solid var(--line); }
 .topbar-title { flex: 1; font-weight: 650; color: var(--muted); }
-.menu-btn { display: none; }
+.btn.menu-btn { display: none; }
 .scrim { display: none; }
 .view { padding: 28px; max-width: 1280px; width: 100%; margin: 0 auto; outline: none; }
 .page { display: flex; flex-direction: column; gap: 20px; }
@@ -67,7 +67,7 @@ code { background: var(--mute-soft); padding: .12em .4em; border-radius: 6px; }
 /* ---------- 基础组件 ---------- */
 .icon { width: 18px; height: 18px; flex: none; }
 .icon-sm { width: 14px; height: 14px; margin-right: 4px; vertical-align: -2px; }
-.btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; padding: 8px 14px; border: 1px solid var(--line-strong); border-radius: var(--radius-sm); background: var(--surface); color: var(--text); font: inherit; font-weight: 550; cursor: pointer; transition: background .15s, border-color .15s, transform .05s; }
+.btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; padding: 8px 14px; border: 1px solid var(--line-strong); border-radius: var(--radius-sm); background: var(--surface); color: var(--text); font: inherit; font-weight: 550; white-space: nowrap; cursor: pointer; transition: background .15s, border-color .15s, transform .05s; }
 .btn:hover { background: var(--surface-2); text-decoration: none; }
 .btn:active { transform: translateY(1px); }
 .btn:disabled { opacity: .5; cursor: not-allowed; }
@@ -231,7 +231,7 @@ a.tag:hover { border-color: var(--accent); color: var(--accent); text-decoration
   .sidebar { position: fixed; z-index: 30; left: 0; top: 0; width: 276px; transform: translateX(-102%); transition: transform .22s ease; box-shadow: var(--shadow); }
   .nav-open .sidebar { transform: none; }
   .nav-open .scrim { display: block; position: fixed; inset: 0; z-index: 20; background: rgba(0, 0, 0, .4); }
-  .menu-btn { display: inline-flex; }
+  .btn.menu-btn { display: inline-flex; }
   .topbar { padding: 10px 16px; } .view { padding: 18px 16px 40px; }
   h1 { font-size: 22px; } .panel-body, .panel-head { padding-left: 16px; padding-right: 16px; } .card-row { padding: 14px 16px; }
   .bar-row { grid-template-columns: minmax(70px, 110px) 1fr 44px; }
