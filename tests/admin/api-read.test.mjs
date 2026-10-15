@@ -181,7 +181,8 @@ test('检索可限定状态与过滤组合；空白 q = 不检索；通配符 % 
     assert.equal(combo.json.total, 8)
     assert.equal((await c.get('/admin/api/cards' + qs({ q: '   ' }))).json.total, 26)
     assert.equal((await c.get('/admin/api/cards' + qs({ q: '%' }))).json.total, 0)
-    assert.equal((await c.get('/admin/api/cards' + qs({ q: '_' }))).json.total, 0)
+    const lit = getDb(h.home).prepare("SELECT COUNT(*) n FROM cards WHERE instr(lower(path || char(10) || title || char(10) || body), '_') > 0").get().n
+    assert.equal((await c.get('/admin/api/cards' + qs({ q: '_' }))).json.total, lit, '_ 只按字面量匹配，不是 LIKE 通配符')
     assert.equal((await c.get('/admin/api/cards' + qs({ q: "'; DROP TABLE cards;--" }))).json.total, 0)
     assert.equal(getDb(h.home).prepare('SELECT COUNT(*) n FROM cards').get().n, 26)
   })

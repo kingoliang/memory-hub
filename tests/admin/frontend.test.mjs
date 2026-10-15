@@ -129,8 +129,14 @@ test('卡片详情页渲染 XSS 卡：标题 / 标签 / 正文都只是文本', 
     const root = renderCardDetail(card)
     const nodes = [...walkNodes(root)]
     const tags = new Set(nodes.map((n) => n.tagName?.toLowerCase()).filter(Boolean))
-    for (const bad of ['script', 'img', 'iframe', 'style', 'svg']) assert.ok(!tags.has(bad), `渲染产生了 <${bad}>`)
-    for (const n of nodes) for (const k of Object.keys(n.attributes || {})) assert.ok(!/^on/i.test(k), k)
+    for (const bad of ['script', 'img', 'iframe', 'style']) assert.ok(!tags.has(bad), `渲染产生了 <${bad}>`)
+    // 允许出现我们自己的静态 SVG 图标，但任何元素的属性名/值都不得带有卡片里的载荷
+    for (const n of nodes) {
+      for (const [k, v] of Object.entries(n.attributes || {})) {
+        assert.ok(!/^on/i.test(k), k)
+        assert.ok(!/onerror|<script|javascript:/i.test(String(v)), `${k}=${v}`)
+      }
+    }
     const text = textOf(root)
     assert.ok(text.includes(XSS_TITLE))
     assert.ok(text.includes('<script>1</script>'))
