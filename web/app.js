@@ -9,14 +9,14 @@ import { fmtNum } from './js/format.js'
 const NAV = [
   { group: '概览', items: [['overview', '总览', 'overview']] },
   { group: '记忆', items: [['cards', '卡片', 'cards'], ['queue', '待审队列', 'queue'], ['recycle', '回收站', 'trash'], ['tags', '标签', 'tag']] },
-  { group: '维护', items: [['tidy', '整理预览', 'broom'], ['lint', '健康报告', 'heart']] },
+  { group: '维护', items: [['tidy', '整理中心', 'broom'], ['lint', '健康报告', 'heart'], ['account', '账户', 'lock']] },
   { group: '观测', items: [['activity', '沉淀活跃度', 'pulse'], ['tokens', '令牌', 'key'], ['audit', '审计日志', 'log']] },
 ]
 const VIEWS = {
   overview: () => import('./js/views/overview.js'), cards: () => import('./js/views/cards.js'), card: () => import('./js/views/card.js'),
   queue: () => import('./js/views/queue.js'), recycle: () => import('./js/views/recycle.js'), tags: () => import('./js/views/tags.js'),
   tidy: () => import('./js/views/tidy.js'), lint: () => import('./js/views/lint.js'), activity: () => import('./js/views/activity.js'),
-  tokens: () => import('./js/views/tokens.js'), audit: () => import('./js/views/audit.js'),
+  tokens: () => import('./js/views/tokens.js'), audit: () => import('./js/views/audit.js'), account: () => import('./js/views/account.js'),
 }
 
 const root = document.getElementById('app')
@@ -73,7 +73,7 @@ function buildShell() {
     h('aside', { class: 'sidebar' }, [
       h('a', { class: 'brand', href: '#/overview' }, [h('span', { class: 'brand-mark' }, 'M'), h('div', null, [h('strong', null, '记忆中枢'), h('span', null, 'Memory Hub')])]),
       nav,
-      h('div', { class: 'sidebar-foot' }, [h('span', { class: 'chip-ro' }, '只读模式 · M2')]),
+      h('div', { class: 'sidebar-foot' }, [h('span', { class: 'chip-rw' }, '管理模式 · M3')]),
     ]),
     h('div', { class: 'scrim', on: { click: () => root.classList.remove('nav-open') } }),
     h('div', { class: 'main' }, [h('header', { class: 'topbar' }, [menu, title, logout]), view]),
@@ -93,7 +93,7 @@ async function renderRoute() {
   mount(shell.view, loading())
   try {
     const mod = await VIEWS[key]()
-    const ctx = { params, go, setTitle: (t) => { shell.title.textContent = t; document.title = `${t} · 记忆中枢` } }
+    const ctx = { params, go, reload: () => renderRoute(), setTitle: (t) => { shell.title.textContent = t; document.title = `${t} · 记忆中枢` } }
     const node = await mod.default(ctx)
     if (my !== renderToken) return
     mount(shell.view, node)

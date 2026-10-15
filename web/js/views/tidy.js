@@ -1,9 +1,46 @@
-// 整理预览（纯预览：只调用 tidyPlan，不执行任何改动）。
+// 整理中心：预览（tidyPlan，只读）→ 演练（dry-run）→ 输入确认词 → 执行 → 结果 / 回滚。
+// 执行前服务端自动 VACUUM INTO 备份并校验；每批后自检，失败自动回滚该批；planId 过期则拒绝；maxDelete 限制单次软删数。
 
 import { h } from '../dom.js'
-import { get } from '../api.js'
-import { panel, stat, notice, empty, badge, cardLink, icon } from '../ui.js'
-import { fmtNum, secretLabel } from '../format.js'
+import { get, post } from '../api.js'
+import { panel, stat, notice, empty, badge, cardLink, icon, table } from '../ui.js'
+import { fmtNum, secretLabel, fmtDate } from '../format.js'
+import { guard, toast, errText, confirmDialog } from '../dialogs.js'
+
+const BATCH_LABEL = { noise: '清理噪声卡（软删）', merge: '合并近似重复（并入独特行，被吸收卡软删）', tags: '标签归一' }
+const BATCH_STATUS = { applied: ['已提交', 'ok'], rolled_back: ['失败，已整批回滚', 'bad'], skipped: ['跳过', 'mute'], 'dry-run': ['演练', 'accent'] }
+const countsText = (c = {}) => Object.entries(c).filter(([k]) => ['removed', 'groups', 'tagsChanged'].includes(k)).map(([k, v]) => `${{ removed: '软删', groups: '合并组', tagsChanged: '标签变更' }[k]} ${v}`).join(' · ') || '—'
+
+/** 执行结果（含失败时的各批次状态）。 */
+export function resultPanel(r, ctx) {
+  const rows = (r.batches || []).map((b) => ({ name: b.name, status: b.status, counts: b.counts, error: b.error }))
+  return panel(r.dryRun ? '演练结果（库未改动）' : r.ok ? '整理已完成' : '整理未完成（失败的批次已自动回滚）', [
+    r.dryRun ? notice('info', `预计软删 ${r.plannedDeletes} 张`, '演练只计算会做什么，没有改动任何数据。确认无误后点"确认执行…"。') : null,
+    !r.dryRun && r.ok ? notice('ok', '已完成', `整理后：记忆库 ${r.after?.cards ?? '—'} 张，回收站 ${r.after?.deleted ?? '—'} 张。被软删的卡 30 天内可在回收站恢复。`) : null,
+    !r.dryRun && !r.ok ? notice('bad', '有批次失败', '失败批次的改动已全部撤销；已成功的批次仍然有效，可用下方的回滚文件整体还原。') : null,
+    table([
+      { label: '批次', render: (x) => BATCH_LABEL[x.name] || x.name },
+      { label: '状态', render: (x) => badge(BATCH_STATUS[x.status]?.[0] || x.status, BATCH_STATUS[x.status]?.[1] || 'neutral') },
+      { label: '数量', render: (x) => countsText(x.counts) },
+      { label: '说明', render: (x) => x.error || '—' },
+    ], rows, { emptyText: '无批次' }),
+    r.backup ? h('p', { class: 'sub' }, ['执行前备份：', h('code', null, r.backup.file), `（已校验 integrity_check=ok，cards=${r.backup.cards}）`]) : null,
+    r.rollbackFile ? h('div', { class: 'rollback-line' }, [h('span', { class: 'sub' }, ['回滚文件：', h('code', null, r.rollbackFile)]), rollbackButton(r.rollbackFile, ctx)]) : null,
+  ], { cls: 'result-panel' })
+}
+
+export function rollbackButton(file, ctx) {
+  const b = h('button', { type: 'button', class: 'btn btn-danger-ghost btn-sm' }, '回滚这次整理…')
+  b.addEventListener('click', guard(b, async () => {
+    if (!(await confirmDialog({ title: '回滚这次整理？', danger: true, confirmText: '回滚', message: '被软删的卡将从回收站恢复，合并/标签改动还原为整理前的值。回滚前服务端会再做一次备份；回滚文件只能使用一次。', lines: [`回滚文件：${file}`] }))) return
+    try {
+      const r = await post('tidy/rollback', { rollbackFile: file, confirm: true })
+      toast('ok', `已回滚：恢复 ${r.restored} 张卡，还原 ${r.reverted} 处正文/标签`)
+      ctx.reload()
+    } catch (e) { toast('bad', errText(e)) }
+  }))
+  return b
+}
 
 const section = (title, count, body, { open = false, tone = 'neutral', sub } = {}) => h('details', { class: 'fold', open }, [
   h('summary', null, [h('span', { class: 'fold-title' }, title), badge(fmtNum(count), count ? tone : 'mute'), sub ? h('span', { class: 'sub' }, sub) : null]),
@@ -12,8 +49,8 @@ const section = (title, count, body, { open = false, tone = 'neutral', sub } = {
 
 export default async function render(ctx) {
   const threshold = ctx.params.get('threshold') || ''
-  const d = await get('tidy/preview', { threshold, limit: 50 })
-  ctx.setTitle('整理预览')
+  const [d, rbs] = await Promise.all([get('tidy/preview', { threshold, limit: 50 }), get('tidy/rollbacks')])
+  ctx.setTitle('整理中心')
   const c = d.counts
   const form = h('form', { class: 'inline-form', on: { submit: (e) => {
     e.preventDefault()
@@ -25,9 +62,11 @@ export default async function render(ctx) {
   ])
   const more = (k, n) => (d.truncated[k] ? h('p', { class: 'sub' }, `仅显示前 ${n} 项，共 ${c[{ noise: 'noise', duplicates: 'duplicateGroups', tags: 'tagChanges', kindMisplaced: 'kindMisplaced', secrets: 'secrets', oversizeRaw: 'oversizeRaw' }[k]]} 项`) : null)
   return h('div', { class: 'page' }, [
-    h('div', { class: 'page-head' }, [h('h1', null, '整理预览'), h('p', { class: 'sub' }, ['planId ', h('code', null, d.planId), ` · ${fmtNum(d.totals.cards)} 张卡`])]),
-    notice('ok', '纯预览，不会修改任何数据', '本页只调用与 memory_tidy_plan 相同的计划逻辑。执行（软删 / 合并 / 标签归一）、确认与回滚在 M3 整理中心提供。'),
+    h('div', { class: 'page-head' }, [h('h1', null, '整理中心'), h('p', { class: 'sub' }, ['planId ', h('code', null, d.planId), ` · ${fmtNum(d.totals.cards)} 张卡`])]),
+    notice('ok', '预览不会修改任何数据', '下面先是计划预览（与 memory_tidy_plan 同一套逻辑）；要执行请用"执行整理"面板：先演练 → 再输入确认词 → 才会真正修改，且执行前自动备份、批后自检、失败自动回滚。'),
     panel('参数', form),
+    execPanel(d, threshold, ctx),
+    rollbackList(rbs.items, ctx),
     h('div', { class: 'stats' }, [
       stat('噪声卡', c.noise, { tone: c.noise ? 'tone-warn' : '' }),
       stat('近似重复组', c.duplicateGroups, { hint: `可吸收 ${c.duplicateAbsorbable} 张` }),
@@ -50,4 +89,69 @@ export default async function render(ctx) {
     section('明文密钥疑似', c.secrets, [h('ul', { class: 'plain-list' }, d.secrets.map((x) => h('li', null, [icon('lock', 'icon-sm'), cardLink(x.path, x.path), ' ', x.types.map((t) => badge(secretLabel(t), 'bad'))]))), more('secrets', d.secrets.length)], { open: c.secrets > 0, tone: 'bad', sub: '只显示卡路径与类型，从不显示值' }),
     section('超大 raw 卡', c.oversizeRaw, [h('ul', { class: 'plain-list' }, d.oversizeRaw.map((r) => h('li', null, [cardLink(r.path, r.path), h('span', { class: 'sub' }, ` ${fmtNum(r.chars)} 字`)]))), more('oversizeRaw', d.oversizeRaw.length)], { sub: '长会话原文未蒸馏' }),
   ])
+}
+
+function execPanel(d, threshold, ctx) {
+  const resultHost = h('div', { class: 'result-host', 'aria-live': 'polite' })
+  const checks = Object.keys(BATCH_LABEL).map((k) => h('input', { type: 'checkbox', value: k, checked: true, 'aria-label': BATCH_LABEL[k] }))
+  const maxDelete = h('input', { type: 'number', min: '0', max: '5000', step: '1', value: '50', 'aria-label': 'maxDelete' })
+  const dryBtn = h('button', { type: 'button', class: 'btn btn-primary' }, '演练（dry-run）')
+  const goBtn = h('button', { type: 'button', class: 'btn btn-danger', disabled: true }, '确认执行…')
+  const all = [dryBtn, goBtn, maxDelete, ...checks]
+  let lastDry = null
+  const payload = (extra = {}) => ({
+    planId: d.planId, batches: checks.filter((c) => c.checked).map((c) => c.value), maxDelete: Number(maxDelete.value),
+    ...(threshold ? { threshold: Number(threshold) } : {}), ...extra,
+  })
+  const show = (node) => { while (resultHost.firstChild) resultHost.removeChild(resultHost.firstChild); if (node) resultHost.appendChild(node) }
+  const fail = (e) => {
+    if (e.code === 'plan_stale') show(notice('warn', '计划已过期', '库在你生成预览之后发生了变化（有新卡写入或被改动），为安全起见拒绝执行。请刷新预览后重新演练。'))
+    else show(notice('bad', e.code === 'max_delete_exceeded' ? '超过 maxDelete 上限' : '没有执行', errText(e)))
+    if (e.extra?.batches) show(resultPanel({ ...e.extra, ok: false, dryRun: false }, ctx))
+  }
+  const invalidate = () => { lastDry = null; goBtn.disabled = true }
+  for (const c of [...checks, maxDelete]) c.addEventListener('change', invalidate)
+  dryBtn.addEventListener('click', guard(all, async () => {
+    invalidate()
+    if (!payload().batches.length) { show(notice('warn', '请至少勾选一个批次')); return }
+    try {
+      const r = await post('tidy/apply', payload())
+      lastDry = r; show(resultPanel(r, ctx))
+      goBtn.disabled = !(r.plannedDeletes > 0 || (r.summary?.tagChanges > 0 && payload().batches.includes('tags')) || (r.summary?.duplicateGroups > 0 && payload().batches.includes('merge')))
+      if (goBtn.disabled) show(notice('info', '没有需要执行的项', '所选批次下计划为空，无需执行。'))
+    } catch (e) { fail(e) }
+  }))
+  goBtn.addEventListener('click', guard(all, async () => {
+    if (!lastDry) return
+    const p = payload()
+    const ok = await confirmDialog({
+      title: '确认执行整理？', danger: true, confirmText: '执行整理', requireText: '整理', requireLabel: '请输入「整理」以确认',
+      message: '这会真正修改记忆库。执行前自动备份，批后自检，失败自动回滚该批；被软删的卡 30 天内可恢复。',
+      lines: [`批次：${p.batches.map((b) => BATCH_LABEL[b]).join('；')}`, `预计软删 ${lastDry.plannedDeletes} 张（上限 maxDelete=${p.maxDelete}）`, `计划 ID：${d.planId}`],
+    })
+    if (!ok) return
+    try {
+      const r = await post('tidy/apply', payload({ confirm: true }))
+      show(resultPanel(r, ctx)); toast('ok', '整理完成'); lastDry = null; goBtn.disabled = true
+    } catch (e) { fail(e); toast('bad', errText(e)) }
+  }))
+  return panel('执行整理', [
+    h('div', { class: 'exec-grid' }, [
+      h('fieldset', { class: 'fieldset' }, [h('legend', null, '批次（按顺序执行）'), h('div', { class: 'checks' }, checks.map((c) => h('label', { class: 'check' }, [c, h('span', null, BATCH_LABEL[c.value])])))]),
+      h('label', null, ['maxDelete（单次最多软删张数，超出则拒绝执行）', maxDelete]),
+    ]),
+    h('div', { class: 'edit-actions' }, [dryBtn, goBtn]),
+    resultHost,
+  ], { sub: '流程：演练 → 确认执行（输入确认词）→ 查看结果与回滚文件' })
+}
+
+function rollbackList(items, ctx) {
+  if (!items.length) return null
+  return panel('可用的回滚文件', table([
+    { label: '时间', render: (x) => fmtDate(x.createdAt) },
+    { label: '类型', render: (x) => (x.kind === 'tags' ? `标签操作${x.op ? '（' + x.op + '）' : ''}` : '整理') },
+    { label: '内容', render: (x) => `软删 ${x.removed} · 合并 ${x.merged} · 标签 ${x.tagsChanged}` },
+    { label: '文件', render: (x) => h('code', null, x.file) },
+    { label: '', render: (x) => rollbackButton(x.file, ctx) },
+  ], items), { sub: '回滚文件只能使用一次，使用后失效' })
 }

@@ -1,15 +1,18 @@
 // 卡片列表 + 全文检索 + 过滤 + 排序（过滤条件全部放在 URL 哈希里，可分享、可回退）。
 
 import { h, mount } from '../dom.js'
-import { get } from '../api.js'
+import { get, post } from '../api.js'
 import { kindLabel, statusLabel, fmtNum } from '../format.js'
+import { createSelection, bulkBar, reportBatch } from '../bulk.js'
+import { confirmDialog, formDialog } from '../dialogs.js'
 import { panel, kindBadge, statusBadge, secretBadge, tagChip, pager, empty, badge, timeEl, cardLink, icon } from '../ui.js'
 
 const SORT_LABEL = { updated: '最近更新', created: '创建时间', title: '标题（拼音）', path: '路径', score: '匹配度' }
 
 /** 一行卡片（列表/待审/回收站共用）。extra：额外的元信息节点数组。 */
-export function cardRow(it, { extra = [], showScore = false } = {}) {
-  return h('article', { class: 'card-row' }, [
+export function cardRow(it, { extra = [], showScore = false, select = null, actions = null } = {}) {
+  return h('article', { class: 'card-row' + (select ? ' has-select' : '') }, [
+    select ? h('div', { class: 'card-row-select' }, select) : null,
     h('div', { class: 'card-row-main' }, [
       h('div', { class: 'card-row-title' }, [cardLink(it.path, it.title || '（无标题）'), showScore && it.score !== undefined ? badge(`匹配 ${it.score}`, 'accent') : null]),
       h('div', { class: 'card-row-meta' }, [
@@ -23,6 +26,7 @@ export function cardRow(it, { extra = [], showScore = false } = {}) {
       it.excerpt ? h('p', { class: 'card-row-excerpt' }, it.excerpt) : null,
       it.tags.length ? h('div', { class: 'card-row-tags' }, it.tags.slice(0, 8).map((t) => tagChip(t, `#/cards?tag=${encodeURIComponent(t)}`))) : null,
     ]),
+    actions ? h('div', { class: 'card-row-actions' }, actions) : null,
   ])
 }
 
@@ -79,13 +83,40 @@ export default async function render(ctx) {
   if (st.tag) active.push(`标签 ${st.tag}`)
   if (st.agent) active.push(`署名 ${facets.agents.find((a) => a.value === st.agent)?.name || st.agent}`)
 
+  // 批量操作：按当前状态过滤出合适的动作（软删 / 恢复 / 批准 / 驳回）；"全部"状态不提供批量
+  const selection = createSelection()
+  const bulkDefs = {
+    approved: [{ label: '软删所选', tone: 'danger', run: async (paths) => {
+      if (!(await confirmDialog({ title: `把 ${paths.length} 张卡移入回收站？`, message: '这些卡将不再被检索到，30 天内可在回收站恢复。', confirmText: `软删 ${paths.length} 张`, danger: true }))) return false
+      reportBatch(await post('cards/batch', { action: 'delete', paths, confirm: true }), '已软删')
+    } }],
+    deleted: [{ label: '恢复所选', tone: 'primary', run: async (paths) => {
+      if (!(await confirmDialog({ title: `恢复 ${paths.length} 张卡？`, confirmText: `恢复 ${paths.length} 张` }))) return false
+      reportBatch(await post('cards/batch', { action: 'restore', paths, confirm: true }), '已恢复')
+    } }],
+    pending: [
+      { label: '批准所选', tone: 'primary', run: async (paths) => {
+        if (!(await confirmDialog({ title: `批准 ${paths.length} 张卡？`, message: '批准后其他 Agent 可以检索到。', confirmText: `批准 ${paths.length} 张` }))) return false
+        reportBatch(await post('queue/approve', { paths, ...(paths.length > 1 ? { confirm: true } : {}) }), '已批准')
+      } },
+      { label: '驳回所选…', tone: 'danger', run: async (paths) => {
+        let ok = false
+        await formDialog({ title: `驳回 ${paths.length} 张卡`, submitText: `驳回 ${paths.length} 张`, danger: true, fields: [{ name: 'reason', label: '驳回理由（可选）', type: 'textarea', rows: 3, maxlength: 500 }],
+          onSubmit: async (v) => { reportBatch(await post('queue/reject', { paths, reason: v.reason, ...(paths.length > 1 ? { confirm: true } : {}) }), '已驳回'); ok = true } })
+        if (!ok) return false
+      } },
+    ],
+  }
+  const bulkActions = bulkDefs[st.status]
+  const bar = bulkActions && data.items.length ? bulkBar(selection, bulkActions, { reload: ctx.reload }) : null
   const list = data.items.length
-    ? h('div', { class: 'card-list' }, data.items.map((it) => cardRow(it, { showScore: !!st.q })))
+    ? h('div', { class: 'card-list' }, data.items.map((it) => cardRow(it, { showScore: !!st.q, select: bulkActions ? selection.checkbox(it.path, it.title) : null })))
     : empty('没有符合条件的卡片', '换个关键词，或放宽过滤条件')
 
   return h('div', { class: 'page' }, [
     h('div', { class: 'page-head' }, [h('h1', null, '卡片'), h('p', { class: 'sub' }, `共 ${fmtNum(data.total)} 张${active.length ? ' · ' + active.join(' · ') : ''}`)]),
     panel(null, form, { cls: 'panel-filters' }),
+    bar,
     list,
     data.total > limit ? pager(data, (offset) => go({ offset })) : null,
   ])

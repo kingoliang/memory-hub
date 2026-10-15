@@ -142,3 +142,41 @@ test('卡片详情页渲染 XSS 卡：标题 / 标签 / 正文都只是文本', 
     assert.ok(text.includes('<script>1</script>'))
   })
 })
+
+test('全部前端模块可被解析并加载（语法/重复声明/导入名错误在这里暴露，不用等到浏览器）', async () => {
+  const dir = path.join(WEB, 'js')
+  const files = jsFiles().filter((f) => f.startsWith(dir)).sort()
+  assert.ok(files.length >= 18, '应有 M3 新增的 dialogs/bulk 与各视图')
+  for (const f of files) await import(f)
+  await import(path.join(WEB, 'app.js')).then(() => assert.fail('app.js 入口依赖 document，不应在 Node 里直接加载成功'), () => {})
+})
+
+test('M3：带 ctx 渲染卡片详情（出现编辑/软删/批准等写按钮）后，XSS 卡仍只产生文本节点', async () => {
+  await withFakeDom(async () => {
+    const { renderCardDetail } = await import('../../web/js/views/card.js')
+    const mk = (status) => ({
+      path: '03-Knowledge/x.md', title: XSS_TITLE, kind: 'knowledge', tags: ['<b>x</b>'], status, body: XSS_BODY, submittedBy: '<i>a</i>', agent: '<i>a</i>', source: '<u>s</u>',
+      createdAt: '2026-09-01T00:00:00.000Z', updatedAt: '2026-09-02T00:00:00.000Z', deletedAt: null, signedByToken: null, updates: [],
+      revisions: [{ id: 3, title: '<img onerror=1>', body: '<script>r</script>', editedBy: '<b>', editedAt: '2026-09-02', tags: ['<i>'], kind: 'knowledge' }],
+      history: [], redacted: false, secretTypes: [], quarantine: null, retention: status === 'deleted' ? { days: 30, daysLeft: 3, expiresAt: '2026-10-01T00:00:00Z' } : null, writes: [],
+    })
+    for (const st of ['approved', 'pending', 'deleted']) {
+      const root = renderCardDetail(mk(st), { reload() {}, go() {} })
+      const nodes = [...walkNodes(root)]
+      const tags = new Set(nodes.map((n) => n.tagName?.toLowerCase()).filter(Boolean))
+      for (const bad of ['script', 'img', 'iframe', 'style']) assert.ok(!tags.has(bad), `${st} 渲染产生了 <${bad}>`)
+      const buttons = nodes.filter((n) => n.tagName === 'BUTTON').map((n) => n.textContent)
+      if (st === 'approved') assert.ok(buttons.includes('编辑') && buttons.includes('软删'), buttons.join('|'))
+      if (st === 'pending') assert.ok(buttons.includes('批准') && buttons.includes('驳回…'))
+      if (st === 'deleted') assert.ok(buttons.includes('恢复') && buttons.includes('永久删除…') && !buttons.includes('编辑'))
+      for (const n of nodes) for (const [k, v] of Object.entries(n.attributes || {})) { assert.ok(!/^on/i.test(k), k); assert.ok(!/onerror|<script|javascript:/i.test(String(v)), `${k}=${v}`) }
+    }
+  })
+})
+
+test('M3 前端不放宽 CSP：服务端 CSP 头不含 unsafe-*，前端无内联 <script>/<style>/style 属性', async () => {
+  const handler = fs.readFileSync(path.join(ROOT, 'src/admin/handler.js'), 'utf8')
+  assert.ok(!/unsafe-inline|unsafe-eval/.test(handler), 'CSP 不得出现 unsafe-*')
+  const html = fs.readFileSync(path.join(WEB, 'index.html'), 'utf8')
+  assert.ok(!/<script(?![^>]*\bsrc=)[^>]*>/i.test(html) && !/<style/i.test(html) && !/\sstyle=/i.test(html))
+})
