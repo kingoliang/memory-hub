@@ -379,10 +379,10 @@ test('整理预览：与 tidyPlan 一致、纯只读（库指纹不变）、密�
     assert.ok(lim.noise.length <= 1 && lim.duplicates.length <= 1 && lim.secrets.length <= 1)
     assert.equal(lim.truncated.noise, lim.counts.noise > 1)
     for (const bad of ['threshold=abc', 'threshold=5', 'limit=0', 'limit=9999']) assert.equal((await c.get('/admin/api/tidy/preview?' + bad)).status, 400, bad)
-    // 没有任何 apply 入口
+    // 预览端点本身没有写能力（M3 起 apply 在独立的 POST /tidy/apply，须 planId + confirm，见 tests/admin-write/tidy.test.mjs；这里只验证预览路径不接受写方法）
     for (const m of ['POST', 'PUT', 'DELETE', 'PATCH']) {
-      const w = await c.req(m, '/admin/api/tidy/apply', { body: {}, withCsrf: true })
-      assert.ok([404, 405].includes(w.status), `${m} apply 应不存在`)
+      const w = await c.req(m, '/admin/api/tidy/preview', { body: {}, withCsrf: true })
+      assert.ok([404, 405].includes(w.status), `${m} preview 不应接受写方法`)
     }
   })
 })
@@ -549,10 +549,10 @@ test('所有只读端点不改库（指纹不变，仅允许 admin_sessions / wr
   })
 })
 
-test('写方法一律不可用（M3 才有写接口）：POST/PUT/PATCH/DELETE 卡片与批准等 → 404/405', async () => {
+test('不存在的写路径仍是 404/405（M3 起 card / queue / tokens / tidy/apply 的写接口已存在，由 tests/admin-write 覆盖；这里只验证从未设计过的路径）', async () => {
   await withAdminHub(async (h) => {
     const c = await logged(h)
-    for (const [m, p] of [['POST', 'cards'], ['PATCH', 'card?path=x'], ['DELETE', 'card?path=x'], ['POST', 'queue/approve'], ['POST', 'recycle/restore'], ['POST', 'tokens'], ['DELETE', 'tokens'], ['POST', 'tidy/apply']]) {
+    for (const [m, p] of [['POST', 'cards'], ['PUT', 'card?path=x'], ['POST', 'recycle/restore'], ['POST', 'recycle/purge'], ['PUT', 'tokens'], ['POST', 'overview'], ['DELETE', 'queue']]) {
       const r = await c.req(m, '/admin/api/' + p, { body: {}, withCsrf: true })
       assert.ok([404, 405].includes(r.status), `${m} ${p} → ${r.status}`)
     }

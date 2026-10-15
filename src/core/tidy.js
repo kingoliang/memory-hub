@@ -323,11 +323,11 @@ export async function tidyPlan(root, opts = {}) {
 const tsStamp = () => new Date().toISOString().replace(/[:.]/g, '-')
 
 /** VACUUM INTO 一致性备份并校验（integrity_check + 行数与整理前一致）。失败则抛错，调用方不得继续改库。 */
-export function backupBeforeTidy(root, log = () => {}) {
+export function backupBeforeTidy(root, log = () => {}, { prefix = 'pre-tidy' } = {}) {
   const db = getDb(root)
   const dir = path.join(path.resolve(root), 'backups')
   fs.mkdirSync(dir, { recursive: true })
-  const file = path.join(dir, `pre-tidy-${tsStamp()}.db`)
+  const file = path.join(dir, `${prefix}-${tsStamp()}.db`)
   const count = () => ({ cards: db.prepare('SELECT COUNT(*) n FROM cards').get().n, quarantine: db.prepare('SELECT COUNT(*) n FROM quarantine').get().n })
   const b0 = count()
   db.exec(`VACUUM INTO '${file.replace(/'/g, "''")}'`)
@@ -347,13 +347,13 @@ export function backupBeforeTidy(root, log = () => {}) {
   } finally { bk.close() }
 }
 
-function snapshotCounts(db) {
+export function snapshotCounts(db) {
   const q = Object.fromEntries(db.prepare('SELECT status, COUNT(*) n FROM quarantine GROUP BY status').all().map((r) => [r.status, r.n]))
   return { cards: db.prepare('SELECT COUNT(*) n FROM cards').get().n, deleted: q.deleted || 0, pending: q.pending || 0, rejected: q.rejected || 0 }
 }
 
 /** 批次后自检；返回 {ok, failures[], checks}。 */
-function selfCheck(db, root, before, expectRemoved) {
+export function selfCheck(db, root, before, expectRemoved) {
   const failures = []
   const now = snapshotCounts(db)
   if (now.cards !== before.cards - expectRemoved) failures.push(`总数对账失败：cards ${before.cards} → ${now.cards}，预期 ${before.cards - expectRemoved}`)
@@ -386,7 +386,7 @@ export async function tidyApply(root, opts = {}) {
   const o = resolveOptions(opts)
   const batches = Array.isArray(opts.batches) && opts.batches.length ? opts.batches : TIDY_BATCHES
   const unknown = batches.filter((b) => !TIDY_BATCHES.includes(b))
-  if (unknown.length) return { ok: false, dryRun: true, error: `未知批次：${unknown.join(',')}（可选 ${TIDY_BATCHES.join('/')}）` }
+  if (unknown.length) return { ok: false, dryRun: true, code: 'unknown_batch', error: `未知批次：${unknown.join(',')}（可选 ${TIDY_BATCHES.join('/')}）` }
   const confirm = opts.confirm === true
   // planId 由 noise/duplicates/tags 三类共同决定，所以不论只执行哪些批次，这里都按这三类生成计划，
   // 才能与 memory_tidy_plan 返回的 planId 对得上。
@@ -396,11 +396,11 @@ export async function tidyApply(root, opts = {}) {
 
   if (opts.planId && opts.planId !== plan.planId) {
     log('WARN', `planId 不匹配（给定 ${opts.planId}，当前 ${plan.planId}）：库在 plan 之后变化，拒绝执行`)
-    return { ok: false, dryRun: !confirm, ...base, error: `planId 不匹配：计划已过期（库在 plan 之后变化），请重新运行 memory_tidy_plan 并核对后再执行` }
+    return { ok: false, dryRun: !confirm, code: 'plan_stale', ...base, error: `planId 不匹配：计划已过期（库在 plan 之后变化），请重新运行 memory_tidy_plan 并核对后再执行` }
   }
   if (plannedDeletes > o.maxDelete) {
     log('WARN', `计划软删 ${plannedDeletes} 张，超过 maxDelete=${o.maxDelete}，拒绝执行`)
-    return { ok: false, dryRun: !confirm, ...base, error: `计划软删 ${plannedDeletes} 张，超过 maxDelete=${o.maxDelete}；确认无误后请显式调大 maxDelete 再执行` }
+    return { ok: false, dryRun: !confirm, code: 'max_delete_exceeded', ...base, error: `计划软删 ${plannedDeletes} 张，超过 maxDelete=${o.maxDelete}；确认无误后请显式调大 maxDelete 再执行` }
   }
   if (!confirm) {
     log('INFO', `dry-run：批次=${batches.join(',')} 预计软删 ${plannedDeletes} 张（未传 confirm=true，库未改动）`)
@@ -417,7 +417,7 @@ export async function tidyApply(root, opts = {}) {
   let backup
   try { backup = backupBeforeTidy(root, log) } catch (e) {
     log('ERROR', `备份失败，未改动任何数据：${e.message}`)
-    return { ok: false, dryRun: false, ...base, error: `备份失败，未改动任何数据：${e.message}` }
+    return { ok: false, dryRun: false, code: 'backup_failed', ...base, error: `备份失败，未改动任何数据：${e.message}` }
   }
   const rollback = { version: 1, tool: 'memory-eternal-tidy', createdAt: new Date().toISOString(), vault: path.resolve(root), backup: backup.path, removed: [], merged: [], tags: [] }
   const rollbackFile = backup.path.replace(/pre-tidy-/, 'tidy-').replace(/\.db$/, '.rollback.json')
@@ -548,7 +548,12 @@ export async function tidyRollback(root, file, opts = {}) {
     let restored = 0; let reverted = 0
     // 必须按「后做的先撤」：标签批次(最后) → 合并批次 → 噪声/被吸收卡恢复。
     // 反过来会让标签批次记录的「合并后标签」盖掉合并前的原标签。
-    for (const t of [...rb.tags].reverse()) { db.prepare('UPDATE cards SET tags = ? WHERE path = ?').run(t.before, t.path); reverted++ }
+    // 标签批次/标签管理只改 tags；path 在两张表里唯一，所以两张表各试一次（管理界面的标签操作也覆盖隔离区的卡）
+    for (const t of [...rb.tags].reverse()) {
+      const a = db.prepare('UPDATE cards SET tags = ? WHERE path = ?').run(t.before, t.path)
+      if (!a.changes) db.prepare('UPDATE quarantine SET tags = ? WHERE path = ?').run(t.before, t.path)
+      reverted++
+    }
     for (const m of [...rb.merged].reverse()) {
       db.prepare('UPDATE cards SET body = ?, summary = ?, tags = ?, updated_at = ? WHERE path = ?').run(m.before.body, m.before.summary, m.before.tags, m.before.updated_at, m.path); reverted++
     }

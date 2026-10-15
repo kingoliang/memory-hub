@@ -12,7 +12,7 @@ const { DatabaseSync } = sqlite
 const DB_FILE = 'memory-eternal.db'
 export const DB_FILENAME = DB_FILE
 /** 当前 schema 版本（PRAGMA user_version）。0 = 旧版 memory-eternal 库。 */
-export const SCHEMA_VERSION = 1
+export const SCHEMA_VERSION = 2
 export const BUSY_TIMEOUT_MS = 5000
 
 /** 获取或创建 SQLite 数据库连接（单例 per root）。 */
@@ -161,6 +161,10 @@ function initTables(db) {
 /**
  * schema 迁移（PRAGMA user_version）。幂等、只增不删。
  *   0 → 1：追加 agent_tokens / write_log / card_revisions / admin_sessions（旧 7 张表一列不改）。
+ *   1 → 2：agent_tokens 去掉 name 列的整列 UNIQUE，改成「仅未撤销令牌名唯一」的部分唯一索引（已撤销的名字可复用）。
+ *          重建表（SQLite 无法直接删列约束）：同一事务内建新表 → 拷贝全部行 → 删旧表 → 改名 → 建索引；数据与哈希原样保留。
+ *          旧代码（SCHEMA_VERSION=1）打开 v2 库时 user_version 已 ≥1 不再迁移，照常读写（它的"令牌名已存在"检查只是少了一道约束，不会坏）。
+ *          回滚代码版本无需回滚库；真要还原库用升级前的备份。
  * 多进程同时启动时：BEGIN IMMEDIATE 串行化，拿到锁后重新读一次 user_version，已迁移则直接返回。
  */
 export function migrateSchema(db) {
@@ -215,6 +219,25 @@ export function migrateSchema(db) {
           expires_at TEXT NOT NULL,
           last_seen TEXT NOT NULL
         );
+      `)
+    }
+    if (current() < 2) {
+      db.exec(`
+        CREATE TABLE agent_tokens_v2 (
+          token_id TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          secret_hash TEXT NOT NULL,
+          scopes TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          last_used_at TEXT,
+          expires_at TEXT,
+          revoked_at TEXT
+        );
+        INSERT INTO agent_tokens_v2 (token_id, name, secret_hash, scopes, created_at, last_used_at, expires_at, revoked_at)
+          SELECT token_id, name, secret_hash, scopes, created_at, last_used_at, expires_at, revoked_at FROM agent_tokens;
+        DROP TABLE agent_tokens;
+        ALTER TABLE agent_tokens_v2 RENAME TO agent_tokens;
+        CREATE UNIQUE INDEX idx_agent_tokens_active_name ON agent_tokens(name) WHERE revoked_at IS NULL;
       `)
     }
     db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`)

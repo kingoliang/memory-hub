@@ -68,6 +68,11 @@ export function loadConfig(env = process.env, { warn = () => {} } = {}) {
   const trustProxy = env.MEMORY_HUB_TRUST_PROXY !== undefined ? truthy(env.MEMORY_HUB_TRUST_PROXY) : truthy(file.trustProxy)
   const exposeTidyApply = env.MEMORY_HUB_MCP_EXPOSE_TIDY_APPLY !== undefined ? truthy(env.MEMORY_HUB_MCP_EXPOSE_TIDY_APPLY) : truthy(file.exposeTidyApply ?? file.mcp?.exposeTidyApply)
 
+  // 管理界面批量操作（批量软删/恢复/审批）单次上限；超限整批拒绝
+  const maxBatchRaw = env.MEMORY_HUB_ADMIN_MAX_BATCH ?? file.admin?.maxBatch ?? file.adminMaxBatch ?? 50
+  const adminMaxBatch = Number(maxBatchRaw)
+  if (!Number.isInteger(adminMaxBatch) || adminMaxBatch < 1 || adminMaxBatch > 1000) throw new ConfigError(`MEMORY_HUB_ADMIN_MAX_BATCH 必须是 1~1000 的整数：${maxBatchRaw}`)
+
   // 蒸馏 LLM：通用 OpenAI 兼容端点。BASE_URL 与 MODEL 缺一即视为未配置（降级为原文卡）；不回退到 OPENAI_* 变量。
   const baseUrl = String(env.MEMORY_LLM_BASE_URL ?? file.llm?.baseUrl ?? '').trim()
   const model = String(env.MEMORY_LLM_MODEL ?? file.llm?.model ?? '').trim()
@@ -89,6 +94,7 @@ export function loadConfig(env = process.env, { warn = () => {} } = {}) {
     extraHosts,
     extraOrigins,
     exposeTidyApply,
+    adminMaxBatch,
     trustProxy,
     llm,
     instructions,

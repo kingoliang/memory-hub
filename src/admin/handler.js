@@ -1,7 +1,7 @@
-// memory-hub · 管理界面 HTTP 处理：静态文件 + /admin/api/*（M2 只读 + 登录/登出）。
+// memory-hub · 管理界面 HTTP 处理：静态文件 + /admin/api/*（M2 只读 + M3 写接口 + 登录/登出）。
 //
 // 与 /mcp 完全独立的认证：管理 API 只认会话 cookie（mh_sid），Agent 令牌在这里一律 401；
-// 非 GET 请求（目前只有 login / logout，M3 的写接口也走这里）必须通过 Origin 校验 + CSRF token。
+// 非 GET 请求（logout 与全部 M3 写接口）必须通过 Origin 校验 + CSRF token；写接口只收 application/json。
 
 import fs from 'node:fs'
 import path from 'node:path'
@@ -13,9 +13,14 @@ import {
 } from './auth.js'
 import * as Q from './queries.js'
 import { writeLog } from '../core/writelog.js'
+import { HttpError } from './errors.js'
+import * as Ops from './ops.js'
 
 const WEB_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../web')
 const MAX_LOGIN_BODY = 8 * 1024
+/** 写接口请求体上限（编辑正文最多 20 万字符，按 UTF-8 最坏 3 字节 + JSON 开销留余量）。 */
+export const MAX_WRITE_BODY = 2 * 1024 * 1024
+const DRAIN_LIMIT = 16 * 1024 * 1024
 const MIME = {
   '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8',
   '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon', '.json': 'application/json; charset=utf-8', '.woff2': 'font/woff2',
@@ -25,10 +30,6 @@ const CSP = [
   "default-src 'self'", "script-src 'self'", "style-src 'self'", "img-src 'self' data:", "font-src 'self'",
   "connect-src 'self'", "frame-ancestors 'none'", "base-uri 'none'", "form-action 'self'", "object-src 'none'",
 ].join('; ')
-
-class HttpError extends Error {
-  constructor(status, code, message, headers) { super(message); this.status = status; this.code = code; this.headers = headers }
-}
 
 export function createAdminHandler({ config, log }) {
   const base = config.basePath
@@ -82,11 +83,15 @@ export function createAdminHandler({ config, log }) {
   async function readJson(req, max) {
     const chunks = []
     let size = 0
+    let tooLarge = false
     for await (const c of req) {
       size += c.length
-      if (size > max) { req.destroy(); throw new HttpError(413, 'payload_too_large', '请求体过大') }
+      if (size > DRAIN_LIMIT) { req.destroy(); throw new HttpError(413, 'payload_too_large', '请求体过大') }
+      if (tooLarge) continue
+      if (size > max) { tooLarge = true; chunks.length = 0; continue } // 有上限地排空，保证客户端收到 413 而不是连接被重置
       chunks.push(c)
     }
+    if (tooLarge) throw new HttpError(413, 'payload_too_large', '请求体过大')
     try { return JSON.parse(Buffer.concat(chunks).toString('utf8')) } catch { throw new HttpError(400, 'bad_request', '请求体不是合法 JSON') }
   }
 
@@ -124,7 +129,8 @@ export function createAdminHandler({ config, log }) {
   }
   const paging = (url, defLimit = 20) => ({ limit: intParam(url, 'limit', { def: defLimit, min: 1, max: 200, clamp: true }), offset: intParam(url, 'offset', { def: 0, min: 0, max: 10_000_000 }) })
 
-  // ---- 路由表（只读） ----
+  // ---- 路由表 ----
+  const deps = { config, log }
   const routes = {
     'GET /session': (ctx) => ({ authenticated: true, passwordSet: true, csrfToken: ctx.session.csrfToken, expiresAt: ctx.session.expiresAt, idleTimeoutMs: SESSION_IDLE_MS }),
     'GET /overview': async () => {
@@ -181,6 +187,29 @@ export function createAdminHandler({ config, log }) {
         outcome: enumParam(u, 'outcome', Q.WRITE_LOG_OUTCOMES, ''),
         from: dateParam(u, 'from', false), to: dateParam(u, 'to', true),
       })
+    },
+    // ---- M3 写接口（会话 + Origin + CSRF 已在 api() 里统一校验）----
+    'PATCH /card': async (ctx) => Ops.editCard(root, Ops.actorOf(ctx.session, ctx.ip), await ctx.json(), deps),
+    'DELETE /card': (ctx) => Ops.softDelete(root, Ops.actorOf(ctx.session, ctx.ip), strParam(ctx.url, 'path', 500), deps),
+    'POST /card/restore': async (ctx) => Ops.restore(root, Ops.actorOf(ctx.session, ctx.ip), await ctx.json(), deps),
+    'POST /card/purge': async (ctx) => Ops.purge(root, Ops.actorOf(ctx.session, ctx.ip), await ctx.json(), deps),
+    'POST /card/rollback': async (ctx) => Ops.rollbackCard(root, Ops.actorOf(ctx.session, ctx.ip), await ctx.json(), deps),
+    'POST /cards/batch': async (ctx) => Ops.batchCards(root, Ops.actorOf(ctx.session, ctx.ip), await ctx.json(), deps),
+    'POST /queue/approve': async (ctx) => Ops.moderate(root, Ops.actorOf(ctx.session, ctx.ip), 'approve', await ctx.json(), deps),
+    'POST /queue/reject': async (ctx) => Ops.moderate(root, Ops.actorOf(ctx.session, ctx.ip), 'reject', await ctx.json(), deps),
+    'GET /tags/preview': (ctx) => Ops.previewTagOp(root, { op: strParam(ctx.url, 'op', 20), from: strParam(ctx.url, 'from', 2000), to: strParam(ctx.url, 'to', 200) }),
+    'POST /tags/rename': async (ctx) => Ops.applyTagOp(root, Ops.actorOf(ctx.session, ctx.ip), 'rename', await ctx.json(), deps),
+    'POST /tags/merge': async (ctx) => Ops.applyTagOp(root, Ops.actorOf(ctx.session, ctx.ip), 'merge', await ctx.json(), deps),
+    'POST /tags/delete': async (ctx) => Ops.applyTagOp(root, Ops.actorOf(ctx.session, ctx.ip), 'delete', await ctx.json(), deps),
+    'POST /tidy/apply': async (ctx) => Ops.tidyApplyAdmin(root, Ops.actorOf(ctx.session, ctx.ip), await ctx.json(), deps),
+    'GET /tidy/rollbacks': () => Ops.listRollbacks(root),
+    'POST /tidy/rollback': async (ctx) => Ops.rollbackAdmin(root, Ops.actorOf(ctx.session, ctx.ip), await ctx.json(), deps),
+    'POST /tokens': async (ctx) => Ops.createTokenAdmin(root, Ops.actorOf(ctx.session, ctx.ip), await ctx.json(), deps),
+    'PATCH /tokens': async (ctx) => Ops.updateTokenAdmin(root, Ops.actorOf(ctx.session, ctx.ip), await ctx.json(), deps),
+    'DELETE /tokens': (ctx) => Ops.revokeTokenAdmin(root, Ops.actorOf(ctx.session, ctx.ip), strParam(ctx.url, 'tokenId', 100), deps),
+    'POST /password': async (ctx) => {
+      const out = await Ops.changePassword(root, Ops.actorOf(ctx.session, ctx.ip), await ctx.json(), { ...deps, limiter })
+      return { ...out, __headers: { 'set-cookie': `${SESSION_COOKIE}=; ${cookieAttrs(ctx.req, 0)}` } }
     },
     'POST /logout': (ctx) => {
       destroySession(root, ctx.sid)
@@ -242,10 +271,14 @@ export function createAdminHandler({ config, log }) {
       const key = `${method === 'HEAD' ? 'GET' : method} ${rel}`
       const fn = routes[key]
       if (!fn) {
-        if (knownPaths.has(rel)) throw new HttpError(405, 'method_not_allowed', '不支持的方法（M2 只读）')
+        if (knownPaths.has(rel)) throw new HttpError(405, 'method_not_allowed', '该接口不支持此方法')
         throw new HttpError(404, 'not_found', '接口不存在')
       }
-      const out = await fn({ req, url, session, sid, ip })
+      const json = async () => {
+        if (!/^application\/json\b/i.test(String(req.headers['content-type'] || ''))) throw new HttpError(415, 'unsupported_media_type', '写请求必须是 application/json')
+        return readJson(req, MAX_WRITE_BODY)
+      }
+      const out = await fn({ req, url, session, sid, ip, json })
       const { __headers, ...payload } = out && typeof out === 'object' ? out : { value: out }
       return sendJson(req, res, 200, payload, __headers || {})
     } catch (e) {

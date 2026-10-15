@@ -280,7 +280,7 @@ function multiStoreQuery(sel, stores, { kind = '', agent = '', tail = 'ORDER BY 
 }
 
 /** 在两张表里按 path 找一行（跨存储读取用，返回 { table, row }）。 */
-function findCardRow(db, rel) {
+export function findCardRow(db, rel) {
   const inMain = db.prepare('SELECT * FROM cards WHERE path = ?').get(rel)
   if (inMain) return { table: 'cards', row: inMain }
   const inQuarantine = db.prepare('SELECT * FROM quarantine WHERE path = ?').get(rel)
@@ -289,7 +289,7 @@ function findCardRow(db, rel) {
 }
 
 /** 某个 path 是否已被占用（两张表任意一张里有，就算占用）。 */
-function pathTaken(db, rel) {
+export function pathTaken(db, rel) {
   if (db.prepare('SELECT 1 FROM cards WHERE path = ?').get(rel)) return true
   return !!db.prepare('SELECT 1 FROM quarantine WHERE path = ?').get(rel)
 }
@@ -364,7 +364,7 @@ export async function auditQueue(root) {
 
 /** 同一个事务里执行 fn（失败自动回滚）。跨表搬家必须原子，否则会丢卡。 */
 let savepointSeq = 0
-function inTransaction(db, fn) {
+export function inTransaction(db, fn) {
   // 已在外层事务里（例如整理批次 tidyApply 把多次软删包进同一个事务）→ 用 SAVEPOINT 嵌套，
   // 内层失败只回滚内层、异常继续上抛由外层决定整体回滚。外层没有事务时行为与原来完全一致。
   if (db.isTransaction) {
@@ -555,8 +555,12 @@ export function restoreCardSync(db, rel, { changedBy = 'restore', reason = '回�
  * 两套存储的关键点：status 决定这张卡**住在哪张表**。
  * → approved：搬进主库（agent 可召回）；pending/rejected/deleted：留在/搬进隔离区。
  */
-export async function setCardStatus(root, rel, status, { changedBy = 'system', reason = '' } = {}) {
-  const db = getDb(root)
+export async function setCardStatus(root, rel, status, opts = {}) {
+  return setCardStatusSync(getDb(root), rel, status, opts)
+}
+
+/** setCardStatus 的同步实现（管理界面批量审批用：可嵌套进外层事务）。 */
+export function setCardStatusSync(db, rel, status, { changedBy = 'system', reason = '' } = {}) {
   const target = String(status)
   const existing = findCardRow(db, rel)
   if (!existing) throw new Error('卡片不存在: ' + rel)

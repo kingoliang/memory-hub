@@ -205,9 +205,9 @@ export function cardDetail(root, cardPath) {
     const r = red(u.content); r.types.forEach((t) => types.add(t))
     return { content: r.text, createdAt: isoOrNull(u.created_at) }
   })
-  const revisions = db.prepare('SELECT title, body, tags, kind, edited_by, edited_at FROM card_revisions WHERE card_path = ? ORDER BY id DESC LIMIT 20').all(cardPath).map((v) => {
+  const revisions = db.prepare('SELECT id, title, body, tags, kind, edited_by, edited_at FROM card_revisions WHERE card_path = ? ORDER BY id DESC LIMIT 50').all(cardPath).map((v) => {
     const r = red(v.body); r.types.forEach((t) => types.add(t))
-    return { title: red(v.title).text, body: r.text, tags: parseTags(v.tags), kind: v.kind, editedBy: v.edited_by, editedAt: isoOrNull(v.edited_at) }
+    return { id: v.id, title: red(v.title).text, body: r.text, tags: parseTags(v.tags), kind: v.kind, editedBy: v.edited_by, editedAt: isoOrNull(v.edited_at) }
   })
   const history = db.prepare('SELECT old_status, new_status, changed_by, reason, created_at FROM audit_log WHERE card_path = ? ORDER BY id DESC LIMIT 50').all(cardPath)
     .map((h) => ({ oldStatus: h.old_status, newStatus: h.new_status, changedBy: h.changed_by, reason: red(h.reason || '').text, createdAt: isoOrNull(h.created_at) }))
@@ -216,7 +216,7 @@ export function cardDetail(root, cardPath) {
 
   let signedByToken = null
   if (row.submitted_by) {
-    const t = db.prepare('SELECT name, revoked_at, expires_at FROM agent_tokens WHERE name = ?').get(row.submitted_by)
+    const t = db.prepare('SELECT name, revoked_at, expires_at FROM agent_tokens WHERE name = ? ORDER BY revoked_at IS NOT NULL, created_at DESC LIMIT 1').get(row.submitted_by)
     signedByToken = t
       ? { name: t.name, exists: true, revoked: !!t.revoked_at, expired: !!t.expires_at && tsMs(t.expires_at) <= Date.now() }
       : { name: row.submitted_by, exists: false, revoked: false, expired: false }

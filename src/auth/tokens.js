@@ -13,7 +13,8 @@ const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._:@-]{0,63}$/
 export const LAST_USED_THROTTLE_MS = 60_000
 
 export class TokenError extends Error {
-  constructor(message) { super(message); this.name = 'TokenError' }
+  /** @param {'bad_request'|'conflict'|'not_found'} [kind] 供管理 API 映射 HTTP 状态；CLI 不用 */
+  constructor(message, kind = 'bad_request') { super(message); this.name = 'TokenError'; this.kind = kind }
 }
 
 const sha256hex = (s) => crypto.createHash('sha256').update(s).digest('hex')
@@ -65,7 +66,7 @@ export function createToken(root, { name, scopes, expiresAt = null }) {
     db.prepare('INSERT INTO agent_tokens (token_id, name, secret_hash, scopes, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)')
       .run(tokenId, n, sha256hex(secret), JSON.stringify(sc), new Date().toISOString(), exp)
   } catch (e) {
-    if (/UNIQUE/i.test(String(e?.message))) throw new TokenError(`令牌名已存在：${n}（含已撤销的；请换一个名字）`)
+    if (/UNIQUE/i.test(String(e?.message))) throw new TokenError(`令牌名已存在：${n}（被一枚未撤销的令牌使用；已撤销令牌的名字可以复用）`, 'conflict')
     throw e
   }
   return { tokenId, name: n, scopes: sc, expiresAt: exp, token: `mh_${tokenId}_${secret}` }
@@ -90,11 +91,45 @@ export function listTokens(root) {
 export function revokeToken(root, nameOrId) {
   const db = getDb(root)
   const key = String(nameOrId ?? '').trim()
-  const row = db.prepare('SELECT token_id, name, revoked_at FROM agent_tokens WHERE name = ? OR token_id = ?').get(key, key)
-  if (!row) throw new TokenError(`令牌不存在：${key}`)
-  if (row.revoked_at) throw new TokenError(`令牌已撤销：${row.name}`)
+  // 名字可复用（schema v2）：同名时优先命中未撤销的那枚
+  const row = db.prepare('SELECT token_id, name, revoked_at FROM agent_tokens WHERE name = ? OR token_id = ? ORDER BY revoked_at IS NOT NULL, created_at DESC LIMIT 1').get(key, key)
+  if (!row) throw new TokenError(`令牌不存在：${key}`, 'not_found')
+  if (row.revoked_at) throw new TokenError(`令牌已撤销：${row.name}`, 'conflict')
   db.prepare('UPDATE agent_tokens SET revoked_at = ? WHERE token_id = ? AND revoked_at IS NULL').run(new Date().toISOString(), row.token_id)
   return { tokenId: row.token_id, name: row.name }
+}
+
+/** 修改令牌名 / 过期时间（明文与哈希不变）。expiresAt: undefined = 不改，null = 清除过期，字符串 = 设为该时间（须为将来）。已撤销的令牌不可改。 */
+export function updateToken(root, tokenId, { name, expiresAt } = {}) {
+  const db = getDb(root)
+  const row = db.prepare('SELECT token_id, name, revoked_at, expires_at FROM agent_tokens WHERE token_id = ?').get(String(tokenId ?? ''))
+  if (!row) throw new TokenError(`令牌不存在：${tokenId}`, 'not_found')
+  if (row.revoked_at) throw new TokenError(`令牌已撤销，不能再修改：${row.name}`, 'conflict')
+  const sets = []
+  const args = []
+  const changed = []
+  if (name !== undefined) {
+    const n = validateName(name)
+    if (n !== row.name) { sets.push('name = ?'); args.push(n); changed.push('name') }
+  }
+  if (expiresAt !== undefined) {
+    let exp = null
+    if (expiresAt !== null) {
+      const t = Date.parse(expiresAt)
+      if (Number.isNaN(t)) throw new TokenError(`expiresAt 不是合法时间：${expiresAt}`)
+      if (t <= Date.now()) throw new TokenError('expiresAt 必须是将来的时间（想让它立刻失效请用"撤销"）')
+      exp = new Date(t).toISOString()
+    }
+    sets.push('expires_at = ?'); args.push(exp); changed.push('expiresAt')
+  }
+  if (!sets.length) return { tokenId: row.token_id, name: row.name, changed: [] }
+  try {
+    db.prepare(`UPDATE agent_tokens SET ${sets.join(', ')} WHERE token_id = ? AND revoked_at IS NULL`).run(...args, row.token_id)
+  } catch (e) {
+    if (/UNIQUE/i.test(String(e?.message))) throw new TokenError(`令牌名已存在：${name}（被一枚未撤销的令牌使用）`, 'conflict')
+    throw e
+  }
+  return { tokenId: row.token_id, name: name !== undefined ? String(name).trim() : row.name, changed }
 }
 
 /**
