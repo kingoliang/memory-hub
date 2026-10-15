@@ -12,7 +12,7 @@ import os from 'node:os'
 import path from 'node:path'
 import {
   stripRuntimeNoise, looksTruncated, hasUsableContent, deriveTitle, isUsableTitle,
-  looksDurable, extractLastTurn, parseCaptureJson,
+  looksDurable, parseCaptureJson,
 } from '../../src/core/capture.js'
 import { runStandaloneCapture } from '../../src/core/capture-run.js'
 import { listCards } from '../../src/core/vault.js'
@@ -125,18 +125,6 @@ test('parseCaptureJson：标题糊掉时从正文派生，正文也派生不出�
 })
 
 // -- 事件级剥离 -------------------------------------------------------------
-
-test('extractLastTurn 丢掉纯注入的 user 消息，保留真实 user/assistant', () => {
-  const events = [
-    { type: 'user/message', data: { role: 'user', content: '<system-reminder>You are teammate "c" in an Agent Team.</system-reminder>' } },
-    { type: 'user/message', data: { role: 'user', content: '把审核中心的待审卡清理一下。' } },
-    { type: 'assistant/message', data: { role: 'assistant', content: '好的，我先列出 pending 列表再逐张判断。' } },
-  ]
-  const text = extractLastTurn(events)
-  assert.ok(!text.includes('teammate'))
-  assert.ok(text.includes('用户：把审核中心的待审卡清理一下。'))
-  assert.ok(text.includes('助手：好的，我先列出 pending 列表'))
-})
 
 // -- 降级原文卡闸门（无 LLM 路径，MCP / CLI / hooks 共用） -------------------
 

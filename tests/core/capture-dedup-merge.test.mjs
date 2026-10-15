@@ -4,12 +4,13 @@ import assert from 'node:assert/strict'
 import { tmpDir, line, cjk } from './tidy-fixture.mjs'
 import { runStandaloneCapture } from '../../src/core/capture-run.js'
 import { ensureVault } from '../../src/core/vault.js'
-import { getDb, closeAllDb } from '../../src/core/db.js'
+import { getDb, closeAllDb, setAuditConfig } from '../../src/core/db.js'
 
 after(() => closeAllDb())
 
-const baseEnv = async (extra = {}) => ({ DSH_HOME: await tmpDir('mc-dshhome-'), MEMORY_AUDIT_MODE: 'none', ...extra })
-const fresh = async () => { const root = await tmpDir('mc-capdup-'); await ensureVault(root); return root }
+// 审核规则只认 DB config 表（auditMode），不再读环境变量 / DSH 共享配置
+const baseEnv = async (extra = {}) => ({ ...extra })
+const fresh = async () => { const root = await tmpDir('mc-capdup-'); await ensureVault(root); setAuditConfig(root, { auditMode: 'none' }); return root }
 const rows = (root) => getDb(root).prepare('SELECT path, title, body, tags FROM cards').all()
 
 const shared = Array.from({ length: 5 }, line)
@@ -74,7 +75,7 @@ test('MEMORY_DEDUP_MERGE=0：命中后退回旧的「追加更新记录」行为
 })
 
 test('待审队列里已有近似卡：不再堆新的待审卡（跳过并说明）', async () => {
-  const root = await fresh(); const env = await baseEnv({ MEMORY_AUDIT_MODE: 'all' })
+  const root = await fresh(); const env = await baseEnv(); setAuditConfig(root, { auditMode: 'all' })
   const a = await runStandaloneCapture(root, textA, { source: 't', env })
   assert.equal(a.action, 'created')
   assert.equal(getDb(root).prepare("SELECT COUNT(*) n FROM quarantine WHERE status='pending'").get().n, 1)
@@ -90,7 +91,8 @@ test('需要审核的沉淀命中已批准卡：不改正文，只追加更新�
   const a = await runStandaloneCapture(root, textA, { source: 't', env: await baseEnv() })
   assert.equal(a.action, 'created')
   const bodyBefore = rows(root)[0].body
-  const b = await runStandaloneCapture(root, textB, { source: 't', env: await baseEnv({ MEMORY_AUDIT_MODE: 'all' }) })
+  setAuditConfig(root, { auditMode: 'all' })
+  const b = await runStandaloneCapture(root, textB, { source: 't', env: await baseEnv() })
   assert.equal(b.action, 'appended'); assert.equal(b.path, a.path)
   assert.equal(rows(root).length, 1)
   assert.equal(rows(root)[0].body, bodyBefore, '正文不被未审核内容改写')

@@ -15,7 +15,7 @@ import os from 'node:os'
 import path from 'node:path'
 import {
   ensureVault, writeCard, readCard, search, listCards, countCards, auditQueue, recycleList,
-  setCardStatus, deleteCard, restoreCard, appendUpdate, dedupCheck, exportCards,
+  setCardStatus, deleteCard, restoreCard, appendUpdate, dedupCheck,
   stats, overview, mergeCards, purgeExpired,
 } from '../../src/core/vault.js'
 import { getDb, closeAllDb, checkMainStoreInvariant, migrateToQuarantine, MAIN_STATUS } from '../../src/core/db.js'
@@ -114,16 +114,6 @@ test('去重只在主库内进行：隔离区里的待审卡不会吸走新知�
   assert.equal((await dedupCheck(root, nearDup)).path, fresh.path, '去重池里只应有主库卡')
   const preview = await readCard(root, junk.path, { allowUnapproved: true })
   assert.ok(!preview.text.includes('补充：这是主库里的正规内容'), '待审卡不该被追加内容')
-})
-
-test('导出含隔离区内容，但带 status / store 标记', async () => {
-  const root = await freshRoot()
-  await writeCard(root, { kind: 'knowledge', title: '主库卡', body: body('主库'), status: 'approved' })
-  await writeCard(root, { kind: 'knowledge', title: '待审卡', body: body('待审'), status: 'pending' })
-  const out = await exportCards(root)
-  assert.equal(out.length, 2, '用户备份不该只拿到主库')
-  const q = out.find((c) => c.store === 'quarantine')
-  assert.ok(q && q.status === 'pending')
 })
 
 // -- 3. 审核流转 = 跨表搬家 --------------------------------------------------

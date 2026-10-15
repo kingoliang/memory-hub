@@ -6,7 +6,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { ensureVault, listCards, readCard } from '../../src/core/vault.js'
 import { closeAllDb } from '../../src/core/db.js'
-import { summarizeTurn, extractLastTurn, sliceNewEvents, sessionEvents, sessionEventApi, createCaptureHealth, parseCaptureJson, captureCard, captureUpdate, makeDedupChecker, pickNeighbors, DEDUP_THRESHOLD, compressExcerpt } from '../../src/core/capture.js'
+import { summarizeTurn, parseCaptureJson, captureCard, captureUpdate, makeDedupChecker, pickNeighbors, DEDUP_THRESHOLD } from '../../src/core/capture.js'
 
 const tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'mc-cap-'))
 const root = path.join(tmpRoot, 'vault')
@@ -81,16 +81,6 @@ test('parseCaptureJson handles append_to form', () => {
   assert.equal(parseCaptureJson('{"append_to": "x.md", "update": "短"}'), null)
 })
 
-test('compressExcerpt keeps structured lines and caps length', () => {
-  const src = '# 标题\n- 要点一：数据库索引\n- 要点二：B+树加速\n普通的一句话，不讲结论。'
-  const out = compressExcerpt(src, 400)
-  assert.ok(out.includes('要点一'))
-  assert.ok(out.length <= 410)
-  const big = compressExcerpt('x'.repeat(5000), 100)
-  assert.ok(big.length <= 120)
-  assert.ok(big.includes('已压缩'))
-})
-
 test('pickNeighbors ranks existing cards by keyword overlap', async () => {
   const freshRoot = path.join(tmpRoot, 'vault-neighbors')
   await ensureVault(freshRoot)
@@ -117,136 +107,6 @@ test('summarizeTurn with existing index can decide append_to', async () => {
     existing: [{ path: '03-Knowledge/缓存策略.md', title: 'Redis缓存策略', summary: 'Redis缓存热点数据TTL与穿透处理' }],
   })
   assert.equal(result.append_to, '03-Knowledge/缓存策略.md')
-})
-
-test('extractLastTurn pulls all user + assistant text in the given slice', () => {
-  const events = [
-    { type: 'user/message', data: { turn: 1, role: 'user', content: [{ type: 'text', text: '第一轮问题' }] } },
-    { type: 'assistant/message', data: { turn: 1, role: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: '第一轮回答' }] } } },
-    { type: 'user/message', data: { turn: 2, role: 'user', content: [{ type: 'text', text: '第二轮问题' }] } },
-    { type: 'assistant/message', data: { turn: 2, role: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: '第二轮回答' }] } } },
-  ]
-  const text = extractLastTurn(events)
-  assert.ok(text.includes('第一轮问题'))
-  assert.ok(text.includes('第一轮回答'))
-  assert.ok(text.includes('第二轮问题'))
-  assert.ok(text.includes('第二轮回答'))
-  // 工具结果等非消息事件不进入文本
-  const withTool = [
-    ...events,
-    { type: 'tool/result', data: { message: { role: 'tool', content: [{ type: 'text', text: '工具输出' }] } } },
-  ]
-  const text2 = extractLastTurn(withTool)
-  assert.ok(!text2.includes('工具输出'))
-})
-
-test('sliceNewEvents returns only user/assistant events after lastSeq', () => {
-  const events = [
-    { type: 'turn/start', data: { turn: 1 }, seq: 0 },
-    { type: 'user/message', data: { role: 'user', content: [{ type: 'text', text: '问题1' }] }, seq: 1 },
-    { type: 'assistant/message', data: { message: { role: 'assistant', content: [{ type: 'text', text: '回答1' }] } }, seq: 2 },
-    { type: 'tool/result', data: { message: { role: 'tool', content: [{ type: 'text', text: '结果' }] } }, seq: 3 },
-    { type: 'user/message', data: { role: 'user', content: [{ type: 'text', text: '问题2' }] }, seq: 4 },
-    { type: 'assistant/message', data: { message: { role: 'assistant', content: [{ type: 'text', text: '回答2' }] } }, seq: 5 },
-  ]
-  const fresh = sliceNewEvents(events, 0)
-  assert.equal(fresh.length, 4) // 4 条消息事件（1,2,4,5）
-  const incremental = sliceNewEvents(events, 2)
-  assert.equal(incremental.length, 2) // 只含 4,5
-  assert.ok(incremental[0].data.content[0].text.includes('问题2'))
-  // 空增量
-  assert.equal(sliceNewEvents(events, 99).length, 0)
-})
-
-test('sessionEvents reads DSH Session (ownEvents/snapshotEvents fallback + legacy events)', () => {
-  const a = { type: 'user/message', seq: 0, data: { role: 'user', content: [{ type: 'text', text: '甲' }] } }
-  const b = { type: 'assistant/message', seq: 1, data: { message: { role: 'assistant', content: [{ type: 'text', text: '乙' }] } } }
-  // DSH 真实 Session：只有 ownEvents()/snapshotEvents()，没有 events 属性
-  assert.deepEqual(sessionEvents({ ownEvents: () => [a, b] }), [a, b])
-  assert.deepEqual(sessionEvents({ snapshotEvents: () => [a] }), [a])
-  // 老结构（带 events 数组）仍兼容
-  assert.deepEqual(sessionEvents({ events: [b] }), [b])
-  // 都取不到 → 空数组（而不是抛错）
-  assert.deepEqual(sessionEvents({}), [])
-  assert.deepEqual(sessionEvents(undefined), [])
-  // ownEvents 抛错时退回 snapshotEvents
-  assert.deepEqual(sessionEvents({ ownEvents: () => { throw new Error('boom') }, snapshotEvents: () => [a] }), [a])
-})
-
-test('sessionEventApi 报出用到的接口名（供日志自证；接口不认识时为空）', () => {
-  assert.equal(sessionEventApi({ ownEvents: () => [], snapshotEvents: () => [] }), 'ownEvents')
-  assert.equal(sessionEventApi({ snapshotEvents: () => [] }), 'snapshotEvents')
-  assert.equal(sessionEventApi({ events: [] }), 'events')
-  // DSH 又改接口：既不报错也不静默，而是返回 '' 让调用方记一行 fail
-  assert.equal(sessionEventApi({ nothing: 1 }), '')
-  assert.equal(sessionEventApi(null), '')
-})
-
-test('createCaptureHealth 记录故障/复原（异常必须可被提示）', () => {
-  const h = createCaptureHealth()
-  assert.equal(h.snapshot().ok, true, '初始应是健康')
-  h.fail('会话对象没有事件接口')
-  const bad = h.snapshot()
-  assert.equal(bad.ok, false)
-  assert.ok(bad.reason.includes('事件接口'))
-  assert.ok(bad.since > 0, '故障要有起始时间，供 UI 显示')
-  h.fail('取不到模型路由')
-  assert.ok(h.snapshot().reason.includes('模型路由'), '新故障覆盖旧原因')
-  h.succeed()
-  const good = h.snapshot()
-  assert.equal(good.ok, true)
-  assert.equal(good.reason, '')
-  assert.ok(good.lastOkAt > 0)
-})
-
-test('端到端：真实 Session + 水位 → 只沉淀本回合新内容（自动沉淀回归）', async () => {
-  const { Session } = await import('@deepseek-ai/dsh-session')
-  const freshRoot = path.join(tmpRoot, 'vault-e2e')
-  await ensureVault(freshRoot)
-  const s = Session.create('mc-e2e')
-
-  const turn = (n, q, a) => {
-    s.append('turn/start', { turn: n }, {})
-    s.append('user/message', { role: 'user', content: [{ type: 'text', text: q }], source: { kind: 'user' } }, { surfaceOp: 'append' })
-    s.append('assistant/message', { turn: n, step: 1, message: { id: `m${n}`, role: 'assistant', content: [{ type: 'text', text: a }], source: { kind: 'model', provider: 'p', model: 'm' } }, stream: [] }, { surfaceOp: 'append' })
-  }
-  const LONG_A = '缓存雪崩的根因是大量 key 同时过期：解决方案是给 TTL 加随机抖动、用互斥锁重建、加兜底限流；数据库索引方面 B+ 树更利于范围查询。'.repeat(3)
-  turn(1, '第一轮：缓存雪崩怎么解决？', LONG_A)
-
-  // 监听器等价逻辑：读会话事件 → 按水位切片 → 提取文本
-  const all1 = sessionEvents(s)
-  const text1 = extractLastTurn(sliceNewEvents(all1, 0))
-  assert.ok(text1.includes('缓存雪崩'), '第一轮应含第一轮内容')
-
-  // 第二轮：水位推进到第一轮末尾（监听器写在 lastSeqs 里的值）
-  const watermark = all1[all1.length - 1].seq
-  turn(2, '第二轮：那缓存穿透呢？', '缓存穿透用空值缓存或布隆过滤器解决。')
-  const fresh2 = sliceNewEvents(sessionEvents(s), watermark)
-  const text2 = extractLastTurn(fresh2)
-  assert.ok(text2.includes('缓存穿透'))
-  assert.ok(!text2.includes('缓存雪崩'), '水位生效：第二轮不应重复沉淀第一轮')
-
-  // 走写卡路径：模型返回新卡 → 落库
-  const llm = fakeLlm(JSON.stringify({
-    save: true, title: '缓存三大问题处理', kind: 'knowledge', tags: ['缓存'],
-    body: '# 缓存三大问题处理\n\n- 雪崩：TTL 随机抖动 + 互斥锁重建 + 限流兜底\n- 穿透：空值缓存 / 布隆过滤器',
-  }))
-  const result = await summarizeTurn(llm, { provider: 'p', model: 'm' }, text1)
-  assert.equal(result.save, true)
-  const out = await captureCard(freshRoot, { ...result, status: 'approved', submittedBy: 'deepseek-harness' }, { threshold: 0.62 })
-  assert.equal(out.ok, true)
-  const cards = await listCards(freshRoot)
-  assert.equal(cards.length, 1)
-  assert.equal(cards[0].title, '缓存三大问题处理')
-})
-
-test('sliceNewEvents tolerates events without seq', () => {
-  const events = [
-    { type: 'user/message', data: { role: 'user', content: [{ type: 'text', text: '无 seq 消息' }] } },
-    { type: 'assistant/message', seq: 7, data: { message: { role: 'assistant', content: [{ type: 'text', text: '有 seq' }] } } },
-  ]
-  assert.equal(sliceNewEvents(events, 5).length, 2, '无 seq 的事件不应被水位过滤掉')
-  assert.equal(sliceNewEvents(events, 7).length, 1)
 })
 
 test('captureCard writes with dedup; duplicate appends update instead', async () => {

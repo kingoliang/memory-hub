@@ -1,18 +1,14 @@
-// 记忆核心 · OpenAI 兼容 LLM 适配器（独立进程用）。
+// memory-hub · OpenAI 兼容 LLM 适配器（蒸馏用）。
 //
-// 在没有 DSH llm 服务的环境（MCP server / CLI / web / hooks）里，为
-// lib/capture.js 的 summarizeTurn 提供同形状的 llm 对象：
-//   - listProviders() / listModels() → 供 resolveRoute 解析路由
-//   - stream(options) → async iterable，yield 纯文本 chunk（由 capture.js
-//     fallback BlockAssembler 拼装）
+// 为 capture.js 的 summarizeTurn 提供同形状的 llm 对象：
+//   - listProviders() / listModels() → 供 routeCandidates 解析路由
+//   - stream(options) → async iterable，yield 纯文本 chunk
 //
-// 配置（环境变量，或显式传参覆盖）：
-//   MEMORY_LLM_BASE_URL  OpenAI 兼容端点，如 https://api.deepseek.com、
-//                        http://127.0.0.1:11434/v1（Ollama）等
-//   MEMORY_LLM_KEY       API key（本地端点可留空）
-//   MEMORY_LLM_MODEL     模型名，如 deepseek-chat
-// 未配置时 createLlmFromEnv() 返回 null：调用方应降级（recall 不受影响，
-// capture 退化为存原文卡）。
+// 配置（环境变量或 memory-hub.json，见 src/config.js）：
+//   MEMORY_LLM_BASE_URL  OpenAI 兼容端点（不含 /chat/completions）
+//   MEMORY_LLM_MODEL     模型名
+//   MEMORY_LLM_KEY       API key（本地端点可留空；只从环境变量或 0600 配置文件读取，不写日志）
+// 缺 BASE_URL 或 MODEL 时 createLlmFromEnv() 返回 null：capture 降级为存原文卡，recall 不受影响。
 
 function flatContent(content) {
   if (typeof content === 'string') return content
@@ -66,7 +62,7 @@ export function createOpenAiLlm({ baseUrl, apiKey = '', model, purpose = 'memory
       })
       if (!res.ok) {
         const detail = await res.text().catch(() => '')
-        throw new Error(`[memory-eternal] LLM ${res.status}: ${detail.slice(0, 300)}`)
+        throw new Error(`LLM ${res.status}: ${detail.slice(0, 300)}`)
       }
       const data = await res.json()
       const text = data?.choices?.[0]?.message?.content ?? ''
@@ -76,8 +72,9 @@ export function createOpenAiLlm({ baseUrl, apiKey = '', model, purpose = 'memory
 }
 
 export function createLlmFromEnv(env = process.env) {
-  const baseUrl = env.MEMORY_LLM_BASE_URL || env.OPENAI_BASE_URL || ''
-  const apiKey = env.MEMORY_LLM_KEY || env.OPENAI_API_KEY || ''
+  // 只认 MEMORY_LLM_*：不回退到 OPENAI_* 之类的通用变量，避免误把无关 key 发给不相干的端点
+  const baseUrl = env.MEMORY_LLM_BASE_URL || ''
+  const apiKey = env.MEMORY_LLM_KEY || ''
   const model = env.MEMORY_LLM_MODEL || ''
   if (!baseUrl || !model) return null
   return createOpenAiLlm({ baseUrl, apiKey, model })

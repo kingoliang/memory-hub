@@ -42,15 +42,6 @@ test('routeCandidates：显式配置优先，其余按注册顺序兜底（不�
   assert.equal(await resolveRoute(fakeLlm({})), null, '无 provider 时返回 null')
 })
 
-test('finish 里的适配器错误必须暴露成 failure，而不是「蒸馏无输出」', async () => {
-  const llm = fakeLlm({ providers: [{ id: 'deepseek-official' }], models: { 'deepseek-official': [{ id: 'deepseek-flash' }] }, chunks: errorChunks('MISSING_CREDENTIAL', '缺少 DEEPSEEK_API_KEY') })
-  const r = await summarizeTurnDetailed(llm, { provider: 'deepseek-official', model: 'deepseek-flash' }, CONV)
-  assert.equal(r.card, undefined)
-  assert.equal(r.failure.code, 'MISSING_CREDENTIAL')
-  assert.ok(r.failure.message.includes('DEEPSEEK_API_KEY'), '失败原因要带出原始 message')
-  assert.equal(await summarizeTurn(llm, { provider: 'p', model: 'm' }, CONV), null, '兼容包装仍返回 null')
-})
-
 test('正常输出解析成卡；空输出 / 非 JSON 归为 UNPARSEABLE_OUTPUT', async () => {
   const ok = fakeLlm({ providers: [{ id: 'p' }], models: { p: [{ id: 'm' }] }, chunks: textChunks('{"save":true,"title":"缓存失效策略","kind":"knowledge","tags":["sqlite"],"body":"# 缓存失效策略：写卡或审核后立即失效指纹，服务端再加 60 秒 TTL 兜底"}') })
   const good = await summarizeTurnDetailed(ok, { provider: 'p', model: 'm' }, CONV)
@@ -65,22 +56,6 @@ test('正常输出解析成卡；空输出 / 非 JSON 归为 UNPARSEABLE_OUTPUT'
 })
 
 // -- issue #18：输出被 max-tokens 截断不该伪装成「解析失败」 ----------------------
-test('finish.kind=max-tokens → 独立错误码 MAX_TOKENS（不是 UNPARSEABLE_OUTPUT），且带上实际上限', async () => {
-  const llm = fakeLlm({
-    providers: [{ id: 'p' }], models: { p: [{ id: 'm' }] },
-    chunks: [
-      { type: 'block-start', index: 0, blockType: 'text' },
-      { type: 'text-delta', index: 0, text: '{"save": true, "titl' }, // 被截断的半截 JSON
-      { type: 'finish', reason: { kind: 'max-tokens' } },
-    ],
-  })
-  const r = await summarizeTurnDetailed(llm, { provider: 'p', model: 'm' }, CONV, { maxTokens: 1234 })
-  assert.equal(r.card, undefined)
-  assert.equal(r.failure.code, 'MAX_TOKENS')
-  assert.match(r.failure.message, /1234/, 'message 要带上实际 maxTokens，便于用户调大「蒸馏输出上限」')
-  assert.doesNotMatch(r.failure.message, /UNPARSEABLE/, '不得再伪装成解析失败')
-})
-
 test('没给 finish 的截断输出 → 仍报 UNPARSEABLE_OUTPUT，但提示「疑似被截断」', async () => {
   const llm = fakeLlm({
     providers: [{ id: 'p' }], models: { p: [{ id: 'm' }] },

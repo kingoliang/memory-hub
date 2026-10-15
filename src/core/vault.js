@@ -1,10 +1,8 @@
-// 记忆核心 · SQLite Vault 存储层
+// memory-hub · SQLite Vault 存储层（源自 memory-eternal lib/vault.js；已去除图谱 / 多库 / optimize / 导出）
 //
 // 纯工具函数保持不变；IO 函数全部改用 SQL。
 // 底层依赖 lib/db.js 的 getDb(root) → DatabaseSync 实例。
 
-import path from 'node:path'
-import fs from 'node:fs'
 import { getDb, enforceAudit, nextCardId, MAIN_STATUS, QUARANTINE_STATUSES, tableForStatus } from './db.js'
 import { minhashSignature, lshCandidates } from './minhash.js'
 
@@ -381,7 +379,8 @@ function inTransaction(db, fn) {
       throw e
     }
   }
-  db.exec('BEGIN')
+  // IMMEDIATE：一开始就拿写锁（受 busy_timeout 约束）。deferred 事务在读后升级写锁时 WAL 下会直接 BUSY 而不等待
+  db.exec('BEGIN IMMEDIATE')
   try {
     const out = fn()
     db.exec('COMMIT')
@@ -600,36 +599,39 @@ export async function writeCard(root, { kind, title, tags = [], body, source = '
     if (hit) return { ok: false, duplicate: { ...hit, path: hit.path } }
   }
 
-  const slug = safeSlug(title)
-  let rel = `${kindRoot}/${slug}.md`
-  let index = 2
-  while (pathTaken(db, rel)) {
-    rel = `${kindRoot}/${slug}-${index}.md`
-    index++
-  }
+  // 选 path + 发号 + 插入必须在同一个写事务里：否则多进程并发写时会选中同一个 path，或在查重与插入之间被抢先
+  return inTransaction(db, () => {
+    const slug = safeSlug(title)
+    let rel = `${kindRoot}/${slug}.md`
+    let index = 2
+    while (pathTaken(db, rel)) {
+      rel = `${kindRoot}/${slug}-${index}.md`
+      index++
+    }
 
-  const now = new Date().toISOString()
-  const summary = body.trim().slice(0, 200)
-  const id = nextCardId(db) // 跨两张表唯一的 id，由 card_sequence 单一发号器分配
-  if (targetTable === 'cards') {
-    db.prepare(`
-      INSERT INTO cards (id, path, kind, title, tags, body, summary, status, source, submitted_by, severity, reason, created_at, updated_at, deleted_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      id, rel, kind, title, JSON.stringify(tags), body.trim(), summary,
-      enforcedStatus, source, submittedBy, severity, reason, now, now, deletedAt || null,
-    )
-  } else {
-    db.prepare(`
-      INSERT INTO quarantine (id, path, kind, title, tags, body, summary, status, source, submitted_by, severity, reason, created_at, updated_at, deleted_at, quarantined_at, quarantine_reason)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?)
-    `).run(
-      id, rel, kind, title, JSON.stringify(tags), body.trim(), summary,
-      enforcedStatus, source, submittedBy, severity, reason, now, now, deletedAt || null,
-      '新卡待审核',
-    )
-  }
-  return { ok: true, path: rel, kind, status: enforcedStatus, store: targetTable }
+    const now = new Date().toISOString()
+    const summary = body.trim().slice(0, 200)
+    const id = nextCardId(db) // 跨两张表唯一的 id，由 card_sequence 单一发号器分配
+    if (targetTable === 'cards') {
+      db.prepare(`
+        INSERT INTO cards (id, path, kind, title, tags, body, summary, status, source, submitted_by, severity, reason, created_at, updated_at, deleted_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        id, rel, kind, title, JSON.stringify(tags), body.trim(), summary,
+        enforcedStatus, source, submittedBy, severity, reason, now, now, deletedAt || null,
+      )
+    } else {
+      db.prepare(`
+        INSERT INTO quarantine (id, path, kind, title, tags, body, summary, status, source, submitted_by, severity, reason, created_at, updated_at, deleted_at, quarantined_at, quarantine_reason)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?)
+      `).run(
+        id, rel, kind, title, JSON.stringify(tags), body.trim(), summary,
+        enforcedStatus, source, submittedBy, severity, reason, now, now, deletedAt || null,
+        '新卡待审核',
+      )
+    }
+    return { ok: true, path: rel, kind, status: enforcedStatus, store: targetTable }
+  })
 }
 
 /**
@@ -639,13 +641,15 @@ export async function writeCard(root, { kind, title, tags = [], body, source = '
  */
 export async function appendUpdate(root, rel, updateText) {
   const db = getDb(root)
-  const found = findCardRow(db, rel)
-  if (!found) throw new Error('卡片不存在: ' + rel)
-  const row = found.row
-  const now = new Date().toISOString()
-  db.prepare('INSERT INTO card_updates (card_id, content, created_at) VALUES (?, ?, ?)').run(row.id, updateText.trim(), now)
-  db.prepare(`UPDATE ${found.table} SET updated_at = ? WHERE id = ?`).run(now, row.id)
-  return { ok: true, path: rel, updated: now, store: found.table }
+  return inTransaction(db, () => {
+    const found = findCardRow(db, rel)
+    if (!found) throw new Error('卡片不存在: ' + rel)
+    const row = found.row
+    const now = new Date().toISOString()
+    db.prepare('INSERT INTO card_updates (card_id, content, created_at) VALUES (?, ?, ?)').run(row.id, updateText.trim(), now)
+    db.prepare(`UPDATE ${found.table} SET updated_at = ? WHERE id = ?`).run(now, row.id)
+    return { ok: true, path: rel, updated: now, store: found.table }
+  })
 }
 
 /** 合并补充小节标题：整理（tidy）与捕获去重合并共用，二次合并时据此识别并续写同一小节。 */
@@ -687,6 +691,11 @@ export function withMergeSection(body, lines) {
  */
 export async function mergeIntoCard(root, rel, text, { max = 15, sectionCap = 60 } = {}) {
   const db = getDb(root)
+  // 读-改-写放进同一个写事务，避免两个进程同时合并同一张卡时丢更新
+  return inTransaction(db, () => mergeIntoCardTx(db, rel, text, { max, sectionCap }))
+}
+
+function mergeIntoCardTx(db, rel, text, { max, sectionCap }) {
   const row = db.prepare('SELECT id, body FROM cards WHERE path = ?').get(rel)
   if (!row) throw new Error('卡片不在主库: ' + rel)
   const now = new Date().toISOString()
@@ -762,7 +771,7 @@ export async function search(root, query, { limit = 30, minScore = 0, semantic =
   for (const f of fb) {
     if (!f.path) continue
     const fq = String(f.query || '').toLowerCase()
-    const overlap = fq && (fq === ql || ql.includes(fq) || fq.includes(ql) || queryTerms(f.query).some((term) => wanted.includes(term)))
+    const overlap = fq && (fq === ql || ql.includes(fq) || fq.includes(ql) || [...queryTerms(f.query)].some((term) => wanted.has(term)))
     if (!overlap) continue
     const rec = fbByPath[f.path] = fbByPath[f.path] || { useful: 0, irr: 0 }
     if (f.useful) rec.useful += 1; else rec.irr += 1
@@ -788,268 +797,6 @@ export async function dailyCounts(root, days = 30) {
     out.push({ date: key, count: map.get(key) || 0 })
   }
   return out
-}
-
-/**
- * 导出全部卡片原始 Markdown（**含隔离区**：用户做备份/迁移时不应该只拿到主库）。
- * 顺带给出 store 字段，导入方可以据此判断这张卡该回主库还是回隔离区。
- */
-export async function exportCards(root) {
-  const db = getDb(root)
-  const main = db.prepare('SELECT * FROM cards ORDER BY updated_at DESC').all().map((r) => ({ ...r, __store: 'main' }))
-  const quarantined = db.prepare('SELECT * FROM quarantine ORDER BY updated_at DESC').all().map((r) => ({ ...r, __store: 'quarantine' }))
-  return [...main, ...quarantined].map((row) => {
-    const { text } = rowToMarkdown(row)
-    return { path: row.path, title: row.title, kind: row.kind, status: row.status, store: row.__store, text }
-  })
-}
-
-// 图谱缓存：一次生成约 300ms（301 卡），重复请求（多客户端/切页重开）直接命中。
-// 失效用「指纹」而不是 TTL 兜底：卡数 + 更新时间 + 状态直方图 + 审计日志/更新记录水位，
-// 任何写卡、审核、删卡、追加更新都会改变指纹 → 不存在脏读。
-const GRAPH_CACHE_MAX = 4
-const GRAPH_CACHE_TTL_MS = 5 * 60 * 1000
-const graphCache = new Map() // root -> { fp, value, at }
-
-// ---- P0-1：建图结果落盘 ------------------------------------------------------
-// 指纹一变就失效，命中直接读文件 —— 免掉整条建图管线（596 卡实测 ~600ms → ~25ms）。
-// 文件放 vault 根目录、原子写（tmp + rename），写失败/超限都只是「下次重建」，不影响功能。
-const GRAPH_CACHE_FILE = 'memory-eternal-graph-cache.json'
-const GRAPH_CACHE_MAX_BYTES = 8 * 1024 * 1024
-const graphCachePath = (root) => path.join(root, GRAPH_CACHE_FILE)
-
-function readGraphCache(root, fp) {
-  try {
-    const data = JSON.parse(fs.readFileSync(graphCachePath(root), 'utf8'))
-    if (!data || data.fp !== fp) return null
-    const v = data.value
-    if (!v || !Array.isArray(v.nodes) || !Array.isArray(v.edges)) return null
-    return v
-  } catch { return null }
-}
-
-function writeGraphCache(root, fp, value) {
-  try {
-    const payload = JSON.stringify({ fp, at: Date.now(), value })
-    if (payload.length > GRAPH_CACHE_MAX_BYTES) return
-    const file = graphCachePath(root)
-    const tmp = file + '.' + process.pid + '.tmp'
-    fs.writeFileSync(tmp, payload)
-    fs.renameSync(tmp, file)
-  } catch { /* 缓存写失败不影响功能 */ }
-}
-
-function graphFingerprint(db) {
-  const c = db.prepare('SELECT COUNT(*) n, MAX(updated_at) m, SUM(id) s FROM cards').get()
-  const st = db.prepare('SELECT status, COUNT(*) n FROM cards GROUP BY status').all()
-  const log = db.prepare('SELECT MAX(id) id FROM audit_log').get()
-  let upd = 0
-  try { upd = db.prepare('SELECT MAX(id) id FROM card_updates').get().id || 0 } catch { /* 老库无此表 */ }
-  return [c.n, c.m || '', c.s || 0, st.map((r) => `${r.status}:${r.n}`).join(','), log.id || 0, upd].join('|')
-}
-
-/** 图谱：节点 = 卡片；边 = [[wikilink]] 或共享标签。 */
-export async function graph(root) {
-  const db = getDb(root)
-  const fp = graphFingerprint(db)
-  const hit = graphCache.get(root)
-  if (hit && hit.fp === fp && Date.now() - hit.at < GRAPH_CACHE_TTL_MS) return hit.value
-  // P0-1：内存未命中就查磁盘缓存（指纹一致即视为有效）
-  const onDisk = readGraphCache(root, fp)
-  if (onDisk) {
-    graphCache.set(root, { fp, value: onDisk, at: Date.now() })
-    if (process.env.MEMORY_GRAPH_PROFILE === '1') console.error('[memory-eternal] graph: 命中磁盘缓存')
-    return onDisk
-  }
-  // 只选图谱需要的列，不读 body（大幅减少内存和传输量）。主库即 approved，无需状态条件。
-  const rows = db.prepare('SELECT id, path, kind, title, tags, summary, status, updated_at FROM cards ORDER BY updated_at DESC').all()
-  // body 单独按需读取（只在需要 wikilink 匹配时）
-  const bodyRows = db.prepare('SELECT path, body FROM cards').all()
-  const bodyMap = new Map(bodyRows.map((r) => [r.path, r.body]))
-  const cards = rows.map((r) => ({
-    path: r.path, kind: r.kind, title: r.title, tags: JSON.parse(r.tags || '[]'),
-    summary: r.summary || '', updated: r.updated_at, mtime: new Date(r.updated_at).getTime(), status: r.status,
-  }))
-
-  const byPath = new Map(cards.map((c) => [c.path, c]))
-
-  const nodes = cards.map((c) => ({
-    id: c.path,
-    title: c.title,
-    kind: c.kind,
-    tags: c.tags,
-    summary: c.summary.slice(0, 80),
-    updated: c.updated,
-    mtime: c.mtime,
-    linkCount: 0,
-  }))
-  const nodeById = new Map(nodes.map((n) => [n.id, n]))
-  const addDegree = (p) => { const n = nodeById.get(p); if (n) n.linkCount++ }
-  const edges = []
-  const seen = new Set()
-  const addEdge = (a, b, type) => {
-    const key = [a, b].sort().join('|') + '|' + type
-    if (seen.has(key)) return
-    seen.add(key)
-    edges.push({ source: a, target: b, type })
-  }
-
-  for (const card of cards) {
-    const text = bodyMap.get(card.path) || ''
-    for (const m of text.matchAll(/\[\[([^\]|]+)(?:\|[^\]]+)?\]\]/g)) {
-      const raw = m[1].trim().replace(/\.md$/, '')
-      const candidates = [
-        `${card.kind === 'knowledge' ? KIND_ROOTS.knowledge : KIND_ROOTS[card.kind]}/${raw}.md`,
-        `${KIND_ROOTS.knowledge}/${raw}.md`,
-        `${raw}.md`,
-      ]
-      for (const cand of candidates) {
-        if (cand !== card.path && byPath.has(cand)) {
-          addEdge(card.path, cand, 'link'); addDegree(card.path); addDegree(cand)
-          break
-        }
-      }
-      for (const other of cards) {
-        if (other.path !== card.path && (other.title === raw || other.path.endsWith(`/${raw}.md`))) {
-          addEdge(card.path, other.path, 'link'); addDegree(card.path); addDegree(other.path)
-          break
-        }
-      }
-    }
-  }
-  // 标签倒排（tag → paths，按 cards 顺序）：原先每个标签都要全表扫一遍，是 O(卡数²)
-  const tagIndex = new Map()
-  for (const c of cards) for (const t of c.tags) {
-    const arr = tagIndex.get(t)
-    if (arr) arr.push(c.path)
-    else tagIndex.set(t, [c.path])
-  }
-  // 标签边：同标签「全连接」会爆炸 —— 593 卡时 2.4 万条边，占总 payload 的 99%，前端每帧都要遍历。
-  // 改为「按共享标签数取 Top-K」：语义仍是「靠共享标签相邻」，但边数降一个数量级。
-  // 对每张卡用标签倒排收集候选与其共享标签数，只保留权重最高的 K 个（双向去重后约 n*K/2 条）。
-  const TAG_TOPK = 6
-  const pairWeight = new Map() // `a\u0000b`（排序后）-> 已加边的共享标签数
-  for (const card of cards) {
-    const weights = new Map()
-    for (const tag of card.tags) {
-      for (const other of tagIndex.get(tag) || []) {
-        if (other === card.path) continue
-        weights.set(other, (weights.get(other) || 0) + 1)
-      }
-    }
-    // 候选不超过 K 时全连（小库/小标签簇），超过才截断 Top-K
-    const ranked = [...weights.entries()].sort((x, y) => y[1] - x[1])
-    const top = weights.size <= TAG_TOPK ? ranked : ranked.slice(0, TAG_TOPK)
-    for (const [other, w] of top) {
-      const [x, y] = [card.path, other].sort()
-      const key = `${x}\u0000${y}`
-      if ((pairWeight.get(key) || 0) >= w) continue // 已按更高权重加过这条边
-      pairWeight.set(key, w)
-      const xc = byPath.get(x)
-      const yc = byPath.get(y)
-      const shared = xc && yc ? xc.tags.find((t) => yc.tags.includes(t)) : ''
-      addEdge(x, y, shared ? `tag:${shared}` : 'tag')
-    }
-  }
-
-  // 相似度关联（P0-3 + P1-1）：
-  //   · bigram 一律用 32 位哈希入集合（构建与求交都比字符串快数倍，碰撞率可忽略）；
-  //   · 候选来自两个互补来源：① 稀有 gram 倒排（按 df 计数排序，免每卡 sort 比较器）
-  //     ② MinHash + LSH 分桶（补足「共享 gram 都很常见」的近重复对）；
-  //   · 只对候选做**精确** Jaccard —— 判定语义与旧实现一致，只是不再全量配对。
-  const SIM_THRESHOLD = 0.42
-  const DF_CAP = 24
-  const RARE_CAP = 120
-  const CAND_CAP = 40
-  const MH_K = 48
-  const MH_BANDS = 24
-  const MH_ROWS = 2
-  const prof = process.env.MEMORY_GRAPH_PROFILE === '1'
-  let tStage = Date.now()
-  const hashesByPath = new Map()
-  const gramDf = new Map()
-  for (const c of cards) {
-    const s = bigramHashSet(bodyMap.get(c.path) || '')
-    hashesByPath.set(c.path, s)
-    for (const g of s) gramDf.set(g, (gramDf.get(g) || 0) + 1)
-  }
-  const tHash = Date.now() - tStage
-  // ① 稀有 gram 倒排：df ∈ [1, DF_CAP] 直接进桶（计数排序），再按桶取最稀的 RARE_CAP 个
-  tStage = Date.now()
-  const rareByPath = new Map()
-  for (const c of cards) {
-    const buckets = []
-    for (let df = 0; df <= DF_CAP; df++) buckets.push(null)
-    for (const g of hashesByPath.get(c.path)) {
-      const df = gramDf.get(g) || 0
-      if (df > DF_CAP) continue
-      if (!buckets[df]) buckets[df] = []
-      buckets[df].push(g)
-    }
-    const rare = []
-    for (let df = 1; df <= DF_CAP && rare.length < RARE_CAP; df++) {
-      const b = buckets[df]
-      if (!b) continue
-      for (const g of b) { rare.push(g); if (rare.length >= RARE_CAP) break }
-    }
-    rareByPath.set(c.path, rare)
-  }
-  const rareIndex = new Map()
-  for (const c of cards) {
-    for (const g of rareByPath.get(c.path)) {
-      const arr = rareIndex.get(g)
-      if (arr) arr.push(c.path)
-      else rareIndex.set(g, [c.path])
-    }
-  }
-  const tRare = Date.now() - tStage
-  // ② MinHash + LSH：签名只跑「稀有 gram」（≤120/卡），成本可控且正好覆盖近重复场景
-  tStage = Date.now()
-  const signatures = new Map()
-  for (const c of cards) signatures.set(c.path, minhashSignature(rareByPath.get(c.path), MH_K))
-  const lshCands = lshCandidates(signatures, { bands: MH_BANDS, rows: MH_ROWS, maxPerCard: CAND_CAP })
-  const tSig = Date.now() - tStage
-  tStage = Date.now()
-  const similarCount = {}
-  const tagSetByPath = new Map(cards.map((c) => [c.path, new Set(c.tags)]))
-  const merged = new Map()
-  let jaccardCalls = 0
-  for (const card of cards) {
-    merged.clear()
-    for (const gram of rareByPath.get(card.path)) {
-      for (const other of rareIndex.get(gram) || []) {
-        if (other !== card.path) merged.set(other, (merged.get(other) || 0) + 1)
-      }
-    }
-    for (const other of lshCands.get(card.path) || []) {
-      if (other !== card.path) merged.set(other, (merged.get(other) || 0) + 2)
-    }
-    if (!merged.size) continue
-    const ranked = [...merged.entries()].sort((x, y) => y[1] - x[1])
-    const cands = ranked.length <= CAND_CAP ? ranked : ranked.slice(0, CAND_CAP)
-    const A = hashesByPath.get(card.path)
-    for (const [other] of cands) {
-      if ((similarCount[card.path] || 0) >= 1) break
-      if ((similarCount[other] || 0) >= 1) continue
-      const b = byPath.get(other)
-      if (!b) continue
-      if (b.kind !== card.kind && !card.tags.some((t) => tagSetByPath.get(other).has(t))) continue
-      const B = hashesByPath.get(other)
-      const lo = Math.min(A.size, B.size)
-      const hi = Math.max(A.size, B.size)
-      if (!hi || lo / hi < SIM_THRESHOLD) continue // 无损上界：J ≤ min/max
-      jaccardCalls++
-      const sim = jaccardSets(A, B, SIM_THRESHOLD)
-      if (sim >= SIM_THRESHOLD) { addEdge(card.path, other, 'similar'); addDegree(card.path); addDegree(other); similarCount[card.path] = 1; similarCount[other] = 1; break }
-    }
-  }
-  const tCand = Date.now() - tStage
-  if (prof) console.error('[memory-eternal] graph profile: hash=' + tHash + 'ms rare=' + tRare + 'ms sig=' + tSig + 'ms cand=' + tCand + 'ms jaccardCalls=' + jaccardCalls)
-  const value = { nodes, edges }
-  graphCache.set(root, { fp, value, at: Date.now() })
-  writeGraphCache(root, fp, value)
-  if (graphCache.size > GRAPH_CACHE_MAX) graphCache.delete(graphCache.keys().next().value)
-  return value
 }
 
 /** 统计（主库用量 + 隔离区计数，供侧栏徽标用）。 */
@@ -1084,103 +831,6 @@ export async function stats(root) {
     byKind,
     todayCards,
     quarantine,
-  }
-}
-
-/** 跨库聚合图谱。 */
-export async function graphAll(roots) {
-  const nodes = []; const edges = []; const idSet = new Set()
-  for (const r of roots) {
-    let g
-    try { g = await graph(r.root) } catch { continue }
-    const pref = r.name ? `${r.name}::` : ''
-    const map = new Map()
-    for (const n of g.nodes) { const id = pref + n.id; if (!idSet.has(id)) { idSet.add(id); map.set(n.id, id); nodes.push({ ...n, id }) } else map.set(n.id, id) }
-    for (const e of g.edges) { const s = map.get(e.source) || (pref + e.source), t = map.get(e.target) || (pref + e.target); if (s && t) edges.push({ source: s, target: t, type: e.type }) }
-  }
-  return { nodes, edges }
-}
-
-/** 跨库聚合检索。 */
-export async function searchAll(roots, query, opts = {}) {
-  const out = []
-  for (const r of roots) {
-    let hits
-    try { hits = await search(r.root, query, opts) } catch { continue }
-    const pref = r.name ? `${r.name}::` : ''
-    for (const h of hits) out.push({ ...h, path: pref + h.path, score: (h.score || 0) + (r.name ? 0 : 0), profile: r.name || '' })
-  }
-  out.sort((a, b) => b.score - a.score || b.mtime - a.mtime)
-  return out.slice(0, opts.limit || 30)
-}
-
-/** 整理建议（非破坏性预览）。 */
-export async function optimizeCandidates(root) {
-  const db = getDb(root)
-  const rows = db.prepare("SELECT * FROM cards WHERE status = 'approved' ORDER BY updated_at DESC").all()
-  const cards = rows.map(rowToCard)
-  const bodyMap = new Map(rows.map((r) => [r.path, (r.body || '').slice(0, 4000)]))
-
-  const merge = []
-  for (let i = 0; i < cards.length; i++) for (let j = i + 1; j < cards.length; j++) {
-    const a = cards[i], b = cards[j]
-    if (a.kind !== b.kind) continue
-    const sim = textSimilarity(bodyMap.get(a.path) || '', bodyMap.get(b.path) || '')
-    if (sim >= 0.55) merge.push({ a: { path: a.path, title: a.title }, b: { path: b.path, title: b.title }, sim: Math.round(sim * 100) / 100 })
-  }
-  merge.sort((x, y) => y.sim - x.sim)
-  const old = Date.now() - 90 * 86400000
-  const stale = cards.filter((c) => c.mtime < old).slice(0, 30).map((c) => ({ path: c.path, title: c.title, updated: c.updated }))
-  return { merge: merge.slice(0, 40), stale }
-}
-
-/** 一键优化执行。 */
-export async function optimizeApply(root, opts = {}) {
-  const simThreshold = Number(opts.simThreshold ?? 0.55)
-  const staleDays = Number(opts.staleDays ?? 90)
-  const cleanupStale = Boolean(opts.cleanupStale)
-  const dryRun = Boolean(opts.dryRun)
-  const cands = await optimizeCandidates(root)
-  const merge = cands.merge
-  const stale = cands.stale
-  const merged = []
-  const staleDeleted = []
-  const staleSkipped = []
-  const errors = []
-  const used = new Set()
-  for (const pair of merge) {
-    if (used.has(pair.a.path) || used.has(pair.b.path)) continue
-    if (pair.sim < simThreshold) continue
-    if (!dryRun) {
-      try {
-        const r = await mergeCards(root, [pair.a.path, pair.b.path])
-        if (r && r.ok) {
-          merged.push({ from: [pair.a.path, pair.b.path], to: r.path, sim: pair.sim })
-          used.add(pair.a.path); used.add(pair.b.path)
-        } else { errors.push(`merge ${pair.a.path}+${pair.b.path}: ${r?.error || '失败'}`) }
-      } catch (e) { errors.push(`merge ${pair.a.path}+${pair.b.path}: ${e?.message || e}`) }
-    } else {
-      merged.push({ from: [pair.a.path, pair.b.path], to: '(dry-run)', sim: pair.sim })
-      used.add(pair.a.path); used.add(pair.b.path)
-    }
-  }
-  if (cleanupStale) {
-    for (const s of stale) {
-      if (!dryRun) {
-        try { await deleteCard(root, s.path); staleDeleted.push(s.path) } catch (e) { errors.push(`delete ${s.path}: ${e?.message || e}`); staleSkipped.push(s.path) }
-      } else { staleDeleted.push(s.path) }
-    }
-  } else {
-    for (const s of stale) staleSkipped.push(s.path)
-  }
-  return {
-    ok: true,
-    dryRun,
-    plan: { merged: merged.length, staleDeleted: staleDeleted.length, staleSkipped: staleSkipped.length },
-    merged,
-    staleDeleted,
-    staleSkipped,
-    errors,
   }
 }
 
@@ -1237,25 +887,6 @@ export async function overview(root) {
     quarantine,
     quarantineByKind,
     roots: Object.fromEntries(Object.entries(KIND_ROOTS).map(([k, v]) => [k, `${v}/`])),
-  }
-}
-
-// -- helpers ---------------------------------------------------------------
-
-function resolveInside(root, rel) {
-  const target = path.resolve(root, rel)
-  const rootResolved = path.resolve(root)
-  if (target !== rootResolved && !target.startsWith(rootResolved + path.sep)) return null
-  return target
-}
-
-async function exists(p) {
-  try {
-    const { promises: fs } = await import('node:fs')
-    await fs.access(p)
-    return true
-  } catch {
-    return false
   }
 }
 

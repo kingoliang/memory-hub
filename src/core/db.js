@@ -1,14 +1,19 @@
-// 记忆核心 · SQLite 存储层（node:sqlite 内置，零依赖）
+// memory-hub · SQLite 存储层（node:sqlite 内置，零依赖）
 //
-// 4 张表：config / cards / card_updates / feedback
-// 首次启动自动从 .md 文件迁移（幂等）
+// 旧 7 张表（config / cards / quarantine / card_updates / feedback / audit_log / card_sequence）一列不改；
+// 新表走 PRAGMA user_version 增量迁移（只增不删，旧版本代码打开新库不会坏）。
+// 并发：busy_timeout（PRAGMA，兼容 Node 22）+ 写事务 BEGIN IMMEDIATE + 单语句原子发号。
 
-import { DatabaseSync } from 'node:sqlite'
-import { promises as fs, mkdirSync } from 'node:fs'
+import * as sqlite from 'node:sqlite'
+import { promises as fs, mkdirSync, chmodSync, statSync } from 'node:fs'
 import path from 'node:path'
-import { parseCard, KIND_ROOTS } from './vault.js'
 
+const { DatabaseSync } = sqlite
 const DB_FILE = 'memory-eternal.db'
+export const DB_FILENAME = DB_FILE
+/** 当前 schema 版本（PRAGMA user_version）。0 = 旧版 memory-eternal 库。 */
+export const SCHEMA_VERSION = 1
+export const BUSY_TIMEOUT_MS = 5000
 
 /** 获取或创建 SQLite 数据库连接（单例 per root）。 */
 const instances = new Map()
@@ -19,9 +24,14 @@ export function getDb(root) {
   mkdirSync(resolved, { recursive: true })
   const dbPath = path.join(resolved, DB_FILE)
   const db = new DatabaseSync(dbPath)
+  // 必须最先设置：后面的 journal_mode / 建表在多进程并发启动时都可能遇到写锁
+  db.exec(`PRAGMA busy_timeout=${BUSY_TIMEOUT_MS}`)
   db.exec('PRAGMA journal_mode=WAL')
+  db.exec('PRAGMA synchronous=NORMAL')
   db.exec('PRAGMA foreign_keys=ON')
   initTables(db)
+  migrateSchema(db)
+  try { chmodSync(dbPath, 0o600) } catch { /* 非 POSIX 文件系统 */ }
   instances.set(resolved, db)
   return db
 }
@@ -148,10 +158,77 @@ function initTables(db) {
   migrateToQuarantine(db)
 }
 
+/**
+ * schema 迁移（PRAGMA user_version）。幂等、只增不删。
+ *   0 → 1：追加 agent_tokens / write_log / card_revisions / admin_sessions（旧 7 张表一列不改）。
+ * 多进程同时启动时：BEGIN IMMEDIATE 串行化，拿到锁后重新读一次 user_version，已迁移则直接返回。
+ */
+export function migrateSchema(db) {
+  const current = () => db.prepare('PRAGMA user_version').get().user_version
+  if (current() >= SCHEMA_VERSION) return
+  db.exec('BEGIN IMMEDIATE')
+  try {
+    if (current() < 1) {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS agent_tokens (
+          token_id TEXT PRIMARY KEY,
+          name TEXT NOT NULL UNIQUE,
+          secret_hash TEXT NOT NULL,
+          scopes TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          last_used_at TEXT,
+          expires_at TEXT,
+          revoked_at TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS write_log (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          ts TEXT NOT NULL,
+          actor_type TEXT NOT NULL,
+          actor_id TEXT NOT NULL DEFAULT '',
+          actor_name TEXT NOT NULL DEFAULT '',
+          tool TEXT NOT NULL DEFAULT '',
+          action TEXT NOT NULL DEFAULT '',
+          card_path TEXT NOT NULL DEFAULT '',
+          outcome TEXT NOT NULL,
+          ip TEXT NOT NULL DEFAULT '',
+          args_digest TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_write_log_ts ON write_log(ts);
+        CREATE INDEX IF NOT EXISTS idx_write_log_actor ON write_log(actor_name);
+
+        CREATE TABLE IF NOT EXISTS card_revisions (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          card_path TEXT NOT NULL,
+          title TEXT NOT NULL DEFAULT '',
+          body TEXT NOT NULL DEFAULT '',
+          tags TEXT NOT NULL DEFAULT '[]',
+          kind TEXT NOT NULL DEFAULT '',
+          edited_by TEXT NOT NULL DEFAULT '',
+          edited_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_card_revisions_path ON card_revisions(card_path);
+
+        CREATE TABLE IF NOT EXISTS admin_sessions (
+          sid_hash TEXT PRIMARY KEY,
+          created_at TEXT NOT NULL,
+          expires_at TEXT NOT NULL,
+          last_seen TEXT NOT NULL
+        );
+      `)
+    }
+    db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`)
+    db.exec('COMMIT')
+  } catch (e) {
+    try { db.exec('ROLLBACK') } catch { /* 已回滚 */ }
+    throw e
+  }
+}
+
 /** 分配一个新的卡片 id（跨两张表唯一、单调递增）。 */
 export function nextCardId(db) {
-  db.prepare("UPDATE card_sequence SET seq = seq + 1 WHERE name = 'card'").run()
-  const row = db.prepare("SELECT seq FROM card_sequence WHERE name = 'card'").get()
+  // 单语句 UPDATE ... RETURNING：取号与自增在同一个原子写里完成（SQLite >= 3.35），多进程不会拿到同一个 id
+  const row = db.prepare("UPDATE card_sequence SET seq = seq + 1 WHERE name = 'card' RETURNING seq").get()
   if (!row) throw new Error('card_sequence 未初始化')
   return row.seq
 }
@@ -199,7 +276,7 @@ export function migrateToQuarantine(db) {
   let moved = 0
   for (const row of pending) {
     try {
-      db.exec('BEGIN')
+      db.exec('BEGIN IMMEDIATE')
       const info = insertQuarantine.run(row.id)
       // card_updates 按 card_id 关联，id 不变 → 更新记录跟着卡一起走，无需改写
       if (info.changes) moved++
@@ -207,11 +284,11 @@ export function migrateToQuarantine(db) {
       db.exec('COMMIT')
     } catch (e) {
       try { db.exec('ROLLBACK') } catch { /* 已回滚 */ }
-      process.stderr.write(`[memory-eternal] 隔离迁移失败（${row.path}）：${e?.message || e}\n`)
+      process.stderr.write(`[memory-hub] 隔离迁移失败（${row.path}）：${e?.message || e}\n`)
     }
   }
   if (fkWasOn) { try { db.exec('PRAGMA foreign_keys = ON') } catch { /* 恢复失败：下次 getDb 会再设一次 */ } }
-  if (moved) process.stderr.write(`[memory-eternal] 已把 ${moved} 张未审核卡搬进隔离区（主库只留 approved）\n`)
+  if (moved) process.stderr.write(`[memory-hub] 已把 ${moved} 张未审核卡搬进隔离区（主库只留 approved）\n`)
   return moved
 }
 
@@ -272,52 +349,6 @@ export function setAuditConfig(root, { auditMode, auditExemptAgents, auditExempt
   if (auditExemptKinds !== undefined) upsert.run('auditExemptKinds', JSON.stringify(auditExemptKinds))
 }
 
-/** 从 .md 文件迁移到 SQLite（幂等：已存在的卡跳过）。 */
-export async function migrateFromMarkdown(root) {
-  const db = getDb(root)
-  const existing = db.prepare('SELECT COUNT(*) as cnt FROM cards').get()
-  if (existing.cnt > 0) return { migrated: 0, skipped: existing.cnt }
-
-  let migrated = 0
-  const walk = async (dir, base) => {
-    let ents = []
-    try { ents = await fs.readdir(dir, { withFileTypes: true }) } catch { return }
-    for (const ent of ents) {
-      const full = path.join(dir, ent.name)
-      if (ent.isDirectory()) { await walk(full, base); continue }
-      if (!ent.name.endsWith('.md')) continue
-      try {
-        const text = await fs.readFile(full, 'utf8')
-        const { meta, body, summary } = parseCard(text)
-        const rel = path.relative(base, full).split(path.sep).join('/')
-        const stat = await fs.stat(full)
-        db.prepare(`
-          INSERT OR IGNORE INTO cards (path, kind, title, tags, body, summary, status, source, submitted_by, severity, reason, created_at, updated_at, deleted_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `).run(
-          rel,
-          meta.kind || 'knowledge',
-          meta.title || rel.replace(/\.[^.]*$/, '').replace(/^[^/]*\//, ''),
-          JSON.stringify(meta.tags || []),
-          body.trim(),
-          summary,
-          meta.status || 'pending',
-          meta.source || '',
-          meta.submittedBy || '',
-          meta.severity || 'info',
-          meta.reason || '',
-          meta.created || stat.mtime.toISOString(),
-          meta.updated || stat.mtime.toISOString(),
-          meta.deletedAt || null,
-        )
-        migrated++
-      } catch { /* 跳过坏文件 */ }
-    }
-  }
-  await walk(root, root)
-  return { migrated, skipped: 0 }
-}
-
 export function closeDb(root) {
   const resolved = path.resolve(root)
   const db = instances.get(resolved)
@@ -331,28 +362,42 @@ export function closeAllDb() {
 }
 
 /**
- * SQLite 备份：用 VACUUM INTO 创建紧凑副本。
- * 保留最近 maxKeep 个备份，自动清理旧的。
+ * 本机 SQLite 备份：用 node:sqlite 的 backup API 生成一致性副本（不阻塞读写），
+ * 备份后对副本做 integrity_check，权限 0600，保留最近 maxKeep 份。
  */
 export async function backupDb(root, { maxKeep = 7 } = {}) {
   const resolved = path.resolve(root)
-  const dbPath = path.join(resolved, DB_FILE)
   const backupDir = path.join(resolved, 'backups')
-  await fs.mkdir(backupDir, { recursive: true })
+  await fs.mkdir(backupDir, { recursive: true, mode: 0o700 })
   const now = new Date()
-  const date = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`
-  const time = `${String(now.getHours()).padStart(2, '0')}${String(now.getMinutes()).padStart(2, '0')}`
-  const backupPath = path.join(backupDir, `memory-eternal-${date}_${time}.db`)
+  const p2 = (n) => String(n).padStart(2, '0')
+  const stamp = `${now.getFullYear()}-${p2(now.getMonth() + 1)}-${p2(now.getDate())}_${p2(now.getHours())}${p2(now.getMinutes())}${p2(now.getSeconds())}`
+  const backupPath = path.join(backupDir, `memory-eternal-${stamp}.db`)
   try {
     const db = getDb(root)
-    db.exec(`VACUUM INTO '${backupPath.replace(/'/g, "''")}'`)
-    // 清理旧备份：保留最近 maxKeep 个
-    const files = await fs.readdir(backupDir)
-    const dbBackups = files.filter(f => f.startsWith('memory-eternal-') && f.endsWith('.db')).sort().reverse()
-    for (const old of dbBackups.slice(maxKeep)) {
-      try { await fs.unlink(path.join(backupDir, old)) } catch {}
+    // backup API 自 Node 22.16 / 23.8 起可用；更老的 22.x 回退为 VACUUM INTO（同样产出一致性副本）
+    if (typeof sqlite.backup === 'function') await sqlite.backup(db, backupPath)
+    else db.exec(`VACUUM INTO '${backupPath.replace(/'/g, "''")}'`)
+    chmodSync(backupPath, 0o600)
+    // 非只读打开：做完检查后切回 DELETE 日志模式，这样副本是单文件、关闭时不留 -wal/-shm 旁路文件
+    const copy = new DatabaseSync(backupPath)
+    let integrity
+    try {
+      integrity = copy.prepare('PRAGMA integrity_check').get().integrity_check
+      copy.exec('PRAGMA journal_mode=DELETE')
+    } finally { copy.close() }
+    if (integrity !== 'ok') {
+      await fs.unlink(backupPath).catch(() => {})
+      return { ok: false, error: `备份 integrity_check 失败：${integrity}` }
     }
-    return { ok: true, path: backupPath, kept: Math.min(dbBackups.length, maxKeep) }
+    const files = await fs.readdir(backupDir)
+    const dbBackups = files.filter((f) => f.startsWith('memory-eternal-') && f.endsWith('.db')).sort().reverse()
+    for (const old of dbBackups.slice(maxKeep)) {
+      for (const suffix of ['', '-wal', '-shm']) {
+        try { await fs.unlink(path.join(backupDir, old + suffix)) } catch { /* 忽略 */ }
+      }
+    }
+    return { ok: true, path: backupPath, bytes: statSync(backupPath).size, kept: Math.min(dbBackups.length, maxKeep) }
   } catch (e) {
     return { ok: false, error: String(e.message || e) }
   }

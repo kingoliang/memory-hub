@@ -39,7 +39,7 @@ const DEFAULTS = { maxTags: 4, rawMaxChars: 6000, maxDelete: 50, simBodyLimit: 8
 
 function makeLogger(opts) {
   if (typeof opts?.logger === 'function') return opts.logger
-  return (level, msg) => process.stderr.write(`[memory-eternal] ${level} tidy ${msg}\n`)
+  return (level, msg) => process.stderr.write(`[memory-hub] ${level} tidy ${msg}\n`)
 }
 
 // ---------------------------------------------------------------------------
@@ -636,7 +636,7 @@ export function formatTidyApply(res, { limit = 15 } = {}) {
     L.push(`  - 批次 ${b.name}：${{ applied: '已提交', rolled_back: '失败，已整批回滚', skipped: '跳过' }[b.status] || b.status} ${JSON.stringify(b.counts || {})}${b.error ? ' · ' + b.error : ''}`)
   }
   if (res.after) L.push(`整理后：主库 ${res.after.cards} 张，回收站 ${res.after.deleted} 张`)
-  if (res.rollbackFile) L.push(`回滚文件：${res.rollbackFile}（dsh-memory tidy rollback <文件> 可还原；回收站内的卡 30 天内可恢复）`)
+  if (res.rollbackFile) L.push(`回滚文件：${res.rollbackFile}（memory-hub tidy rollback <文件> 可还原；回收站内的卡 30 天内可恢复）`)
   return L.join('\n')
 }
 

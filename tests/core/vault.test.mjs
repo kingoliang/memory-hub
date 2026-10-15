@@ -6,8 +6,8 @@ import os from 'node:os'
 import path from 'node:path'
 import {
   parseCard, safeSlug, textSimilarity, queryTerms, ensureVault, listCards,
-  writeCard, readCard, appendUpdate, search, graph, overview, dedupCheck,
-  stats, optimizeCandidates, searchAll, graphAll, readFeedback, addFeedback, mergeCards, countCards,
+  writeCard, readCard, appendUpdate, search, overview, TITLE_COLLATOR, dedupCheck,
+  stats, readFeedback, addFeedback, mergeCards, countCards,
 } from '../../src/core/vault.js'
 import { closeAllDb } from '../../src/core/db.js'
 
@@ -115,18 +115,6 @@ test('search: CJK fragment finds cards', async () => {
   assert.equal(miss.length, 0)
 })
 
-test('graph: wikilink + shared tag edges', async () => {
-  const root = await freshRoot()
-  await writeCard(root, { kind: 'knowledge', title: '强化学习基础', tags: ['rl'], body: '策略梯度是核心。参考 [[数据库选型]]', source: 'session:x', status: 'approved' })
-  await writeCard(root, { kind: 'knowledge', title: '数据库选型', tags: ['rl'], body: 'PostgreSQL 优于 MySQL。', source: 'session:x', status: 'approved' })
-  const g = await graph(root)
-  assert.equal(g.nodes.length, 2)
-  const linkEdges = g.edges.filter((e) => e.type === 'link')
-  assert.ok(linkEdges.length >= 1, 'wikilink 应产生连线')
-  const tagEdges = g.edges.filter((e) => e.type.startsWith('tag:'))
-  assert.ok(tagEdges.length >= 1, '共享标签应产生连线')
-})
-
 test('overview aggregates counts', async () => {
   const root = await freshRoot()
   await writeCard(root, { kind: 'knowledge', title: 'A', body: '内容A足够长以便写入知识库文件。这是关于知识卡片的内容，用于验证数据形状。', status: 'approved' })
@@ -157,18 +145,6 @@ test('stats returns overview + todayCards', async () => {
   assert.equal(typeof s.week, 'number')
 })
 
-test('optimizeCandidates returns merge/stale (non-destructive)', async () => {
-  const root = await freshRoot()
-  const a = '数据库索引B+树的原理与加速机制，索引是数据库为加速查找而额外维护的数据结构。索引加速查询性能。'
-  const b = '数据库索引B+树的原理与加速机制，索引是数据库为加速查找而额外维护的数据结构。索引提升查询速度。'
-  await writeCard(root, { kind: 'knowledge', title: '索引A', tags: [], body: a, status: 'approved' }, { dedup: false })
-  await writeCard(root, { kind: 'knowledge', title: '索引B', tags: [], body: b, status: 'approved' }, { dedup: false })
-  const o = await optimizeCandidates(root)
-  assert.ok(Array.isArray(o.merge))
-  assert.ok(Array.isArray(o.stale))
-  assert.ok(o.merge.length >= 1, '相似卡应进入合并建议')
-})
-
 test('search semantic + minScore + feedback roundtrip', async () => {
   const root = await freshRoot()
   await writeCard(root, { kind: 'knowledge', title: 'React性能', tags: [], body: 'React memo 和 useMemo 优化重渲染性能。', status: 'approved' })
@@ -178,18 +154,6 @@ test('search semantic + minScore + feedback roundtrip', async () => {
   const fb = await readFeedback(root)
   assert.ok(fb.length >= 1)
   assert.equal(fb[0].useful, 1)
-})
-
-test('cross-vault searchAll + graphAll aggregate multiple roots', async () => {
-  const a = await freshRoot(); const b = await freshRoot()
-  await writeCard(a, { kind: 'knowledge', title: 'A卡', tags: [], body: '跨库内容一件大事。', status: 'approved' })
-  await writeCard(b, { kind: 'knowledge', title: 'B卡', tags: [], body: '跨库内容另一件大事。', status: 'approved' })
-  const roots = [{ name: '', root: a }, { name: 'v2', root: b }]
-  const hits = await searchAll(roots, '跨库内容', { limit: 10 })
-  assert.ok(hits.length >= 1)
-  const g = await graphAll(roots)
-  assert.ok(Array.isArray(g.nodes))
-  assert.ok(g.nodes.length >= 1)
 })
 
 test('listCards 真分页：offset/limit/total 一致、无重叠、标题排序跨页全局有序', async () => {
@@ -207,7 +171,7 @@ test('listCards 真分页：offset/limit/total 一致、无重叠、标题排序
 
   const byTitle = await listCards(root, { sort: 'title' })
   const sorted = byTitle.map((c) => c.title)
-  assert.deepEqual(sorted, [...sorted].sort((a, b) => a.localeCompare(b)), '标题排序应全局有序')
+  assert.deepEqual(sorted, [...sorted].sort(TITLE_COLLATOR.compare), '标题排序应全局有序（R13：原用例依赖进程 locale 的 localeCompare，与实现固定的 zh-Hans-CN 拼音序不一致）')
 
   // 服务端署名过滤：session:* / 空署名 归入 deepseek-harness
   await writeCard(root, { kind: 'knowledge', title: '宿主卡', tags: ['p'], body: '宿主自动沉淀的卡片正文内容足够长以便入库。', status: 'approved', submittedBy: 'deepseek-harness' }, { dedup: false })
@@ -216,18 +180,6 @@ test('listCards 真分页：offset/limit/total 一致、无重叠、标题排序
   assert.equal(await countCards(root, { agent: 'deepseek-harness' }), 6)
   assert.equal(await countCards(root, { agent: 'claude' }), 1)
   assert.equal(await countCards(root, { agent: 'codex' }), 0)
-})
-
-test('graph 缓存：指纹失效（写卡/审核后必须重建，不给陈旧数据）', async () => {
-  const root = await freshRoot()
-  await writeCard(root, { kind: 'knowledge', title: '甲', tags: ['t1'], body: '甲卡正文，内容与乙卡不同，用于验证图谱缓存失效。', status: 'approved' }, { dedup: false })
-  const g1 = await graph(root)
-  assert.equal(g1.nodes.length, 1)
-  assert.equal((await graph(root)).nodes.length, 1, '重复调用命中缓存，结果一致')
-  await writeCard(root, { kind: 'knowledge', title: '乙', tags: ['t1'], body: '乙卡正文，与甲卡内容完全不同，写完应立即可见。', status: 'approved' }, { dedup: false })
-  const g2 = await graph(root)
-  assert.equal(g2.nodes.length, 2, '写卡后必须重建（不能返回陈旧图谱）')
-  assert.ok(g2.edges.some((e) => e.type === 'tag:t1'), '共享标签应产生标签边')
 })
 
 test('mergeCards: 合并两张同 kind 卡为一张（保留 kind/并集标签/删除原卡）', async () => {

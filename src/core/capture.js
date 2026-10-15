@@ -370,14 +370,9 @@ export async function captureUpdate(root, rel, text, opts = {}) {
 // -- helpers ---------------------------------------------------------------
 
 async function importLlmHelpers() {
-  // 延迟加载，避免在无 llm 服务时拉高启动成本；dsh-llm 是 peerDependency。
-  // 独立进程（MCP server / CLI / web）没有 DSH 环境，import 失败时退回本地
-  // 极简 shim：只实现 summarizeTurn 用到的最小面（push text chunk / blocks /
-  // 构造 user message），供 lib/llm-openai.js 的 OpenAI 兼容适配器配合使用。
-  try {
-    const { BlockAssembler, createUserMessage } = await import('@deepseek-ai/dsh-llm')
-    return { BlockAssembler, createUserMessage }
-  } catch {
+  // 独立服务没有 DSH 环境：只实现 summarizeTurn 用到的最小面（push text chunk / blocks / 构造 user message），
+  // 供 llm-openai.js 的 OpenAI 兼容适配器配合使用。
+  {
     return {
       BlockAssembler: class {
         constructor() { this.parts = [] }
@@ -578,144 +573,6 @@ function finishCard(parsed, title, body) {
     ? parsed.tags.map((t) => String(t).trim().slice(0, 30)).filter(Boolean).slice(0, 8)
     : []
   return { save: true, title, kind, tags, body }
-}
-
-/**
- * 从会话事件里提取「增量片段」的可读对话文本（用户 + 助手）。
- *
- * 每条消息先过 `stripRuntimeNoise`：DSH 注入的环境快照 / team 广播 / teammate 原文 /
- * 工具说明都不是用户的真实表达，混进来会变成垃圾卡（P0 修复）。剥离后为空的消息直接丢。
- */
-export function extractLastTurn(events, _turn) {
-  const lines = []
-  const push = (role, raw) => {
-    const text = stripRuntimeNoise(raw)
-    if (!text) return
-    lines.push(`${role}：${text}`)
-  }
-  const pushMessage = (event) => {
-    const data = event.data || event
-    const message = data.message || data
-    const role = message.role === 'user' ? '用户' : '助手'
-    const content = message.content
-    if (Array.isArray(content)) {
-      for (const block of content) {
-        if (block.type === 'text' && block.text) push(role, block.text)
-      }
-    } else if (typeof content === 'string' && content) {
-      push(role, content)
-    }
-  }
-  for (const event of events) {
-    const type = event.type
-    const data = event.data || event
-    if (type === 'user/message' || (type === 'message' && data.role === 'user')) {
-      pushMessage(data)
-    } else if (type === 'assistant/message' || type === 'assistant/chunk') {
-      if (type === 'assistant/message') pushMessage(data)
-      else if (data.chunk?.content) {
-        const content = data.chunk.content
-        if (typeof content === 'string') push('助手', content)
-        else if (Array.isArray(content)) {
-          for (const block of content) {
-            if (block.type === 'text' && block.text) push('助手', block.text)
-          }
-        }
-      }
-    }
-  }
-  return lines.join('\n').trim()
-}
-
-/**
- * 读会话事件快照。
- *
- * 优先 `ownEvents()`（DSH 公开 API）：只取本会话自身事件，恢复/分叉会话不会把
- * 继承来的历史前缀重复沉淀；`snapshotEvents()` 次之，老结构里的 `events` 兜底。
- * 三条路都取不到时返回空数组，而不是让监听器抛异常（抛异常 = 管线静默死亡，
- * 页面只表现为「一直不写卡」）。
- */
-export function sessionEvents(session) {
-  if (!session) return []
-  // 逐个试：某个取法报了错就换下一个，不要让监听器跟着挂掉。
-  for (const pick of ['ownEvents', 'snapshotEvents']) {
-    if (typeof session[pick] === 'function') {
-      try {
-        const out = session[pick]()
-        if (Array.isArray(out)) return out
-      } catch { /* 换下一个取法 */ }
-    }
-  }
-  return Array.isArray(session.events) ? session.events : []
-}
-
-/**
- * 自动沉淀健康状态（进程内）。
- *
- * 目的：任何一条失败路径都必须留下「坏消息」，供 systemPrompt 段和 UI 横幅提示用户——
- * 沉淀是后台静默管线，坏了不能只写日志等人来看。`fail()` 记录当前故障与起始时间，
- * `succeed()` 表示一次真实写卡成功（故障自动清除）。
- */
-export function createCaptureHealth() {
-  let ok = true
-  let reason = ''
-  let since = 0
-  let lastOkAt = 0
-  let lastFailAt = 0
-  return {
-    fail(why) {
-      ok = false
-      reason = String(why || '未知原因').replace(/\s+/g, ' ').slice(0, 160)
-      since = Date.now()
-      lastFailAt = since
-    },
-    succeed() {
-      ok = true
-      reason = ''
-      since = 0
-      lastOkAt = Date.now()
-    },
-    snapshot() { return { ok, reason, since, lastOkAt, lastFailAt } },
-  }
-}
-
-/**
- * 探测会话对象认识哪种「取事件」方式，返回用到的成员名（'' = 一个都不认识）。
- *
- * 这个返回值会写进自动沉淀日志：一旦 DSH 再改接口，日志第一行就会显示
- * 「没有事件接口」，而不是继续静默无输出。
- */
-export function sessionEventApi(session) {
-  if (!session) return ''
-  // 顺序即优先级：ownEvents() 只含本会话自身事件（恢复/分叉不会重复沉淀历史）。
-  for (const pick of ['ownEvents', 'snapshotEvents']) {
-    if (typeof session[pick] === 'function') return pick
-  }
-  return Array.isArray(session.events) ? 'events' : ''
-}
-
-/** 取增量事件：seq 大于 lastSeq 的 user/assistant 消息事件。 */
-export function sliceNewEvents(events, lastSeq) {
-  const out = []
-  for (const event of events) {
-    const seq = event.seq
-    // 无 seq 的事件（非常规日志）也收，避免漏掉消息；有 seq 则按水位过滤。
-    if (typeof seq === 'number' && typeof lastSeq === 'number' && seq <= lastSeq) continue
-    const type = event.type
-    if (type === 'user/message' || type === 'assistant/message') out.push(event)
-  }
-  return out
-}
-
-/** 解析当前模型路由：取第一个 provider 的旗舰模型（与驯兽师一致）。 */
-/** 记忆侧「压缩产物」接口：确定性（无 LLM）从一段文本抽出结构化关键内容，供 harness 会话内压缩旧轮次时注入。 */
-export function compressExcerpt(text, maxChars = 2400) {
-  const lines = String(text || '').split(/\r?\n/).map((L) => L.trim()).filter(Boolean)
-  const structured = lines.filter((L) => /^(#{1,6}\s|[-*]\s|\d+[.、)]\s|>|`|\[x\]|\[ \])/.test(L))
-  const src = structured.length ? structured : lines
-  let out = src.join('\n')
-  if (out.length > maxChars) out = out.slice(0, maxChars).replace(/\n+$/, '') + '\n…（已压缩，细节见记忆库）'
-  return out
 }
 
 /**

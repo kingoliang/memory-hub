@@ -6,10 +6,10 @@
   "license": "MIT",
   "type": "module",
   "engines": {
-    "node": ">=22"
+    "node": ">=22.16"
   },
   "scripts": {
-    "test": "node --test --test-concurrency=1 tests/"
+    "test": "node --test --test-concurrency=1 \"tests/**/*.test.mjs\""
   },
   "dependencies": {
     "@modelcontextprotocol/node": "2.1.1",

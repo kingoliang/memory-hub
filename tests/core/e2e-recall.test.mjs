@@ -30,7 +30,7 @@ import crypto from 'node:crypto'
 import os from 'node:os'
 import path from 'node:path'
 import {
-  ensureVault, writeCard, setCardStatus, deleteCard, search, listCards, readCard, searchAll,
+  ensureVault, writeCard, setCardStatus, deleteCard, search, listCards, readCard,
 } from '../../src/core/vault.js'
 import { runStandaloneCapture } from '../../src/core/capture-run.js'
 import { closeAllDb } from '../../src/core/db.js'
@@ -143,48 +143,6 @@ test('e2e 三步骤：写入 approved 卡 → search 召回 → 召回内容可�
 // ---------------------------------------------------------------------------
 // 步骤 4：跨库聚合
 // ---------------------------------------------------------------------------
-test('e2e 跨库聚合：searchAll([vaultA, vaultB]) 同时命中两个库', async (t) => {
-  const vaultA = await freshVault('agg-a')
-  const vaultB = await freshVault('agg-b')
-  cleanup(t, vaultA)
-  cleanup(t, vaultB)
-
-  const uniqA = unique('agga')
-  const uniqB = unique('aggb')
-  const shared = '跨库聚合关键词'
-
-  const a = await writeCardOrRetry(vaultA, {
-    kind: 'knowledge',
-    title: `A 库记忆-${uniqA}`,
-    body: `${shared}：这是 A 库独有的正文。唯一标记 ${uniqA}，用于确认命中来自 A 库。`,
-    status: 'approved',
-  })
-  const b = await writeCardOrRetry(vaultB, {
-    kind: 'knowledge',
-    title: `B 库记忆-${uniqB}`,
-    body: `${shared}：这是 B 库独有的正文。唯一标记 ${uniqB}，用于确认命中来自 B 库。`,
-    status: 'approved',
-  })
-  assert.equal(a.ok, true)
-  assert.equal(b.ok, true)
-
-  // 形状按 lib/vault.js searchAll 实现：name 非空时 path 会被加上 `${name}::` 前缀，并附加 profile 字段。
-  const roots = [{ name: '', root: vaultA }, { name: 'profile-b', root: vaultB }]
-  const hits = await searchAll(roots, shared, { limit: 10 })
-
-  const hitA = hits.find((h) => h.path === a.path && h.profile === '')
-  const hitB = hits.find((h) => h.path === `profile-b::${b.path}` && h.profile === 'profile-b')
-  assert.ok(hitA, 'searchAll 必须返回 A 库命中（无名库 path 不加前缀，profile 为空串）')
-  assert.ok(hitB, 'searchAll 必须返回 B 库命中（有名库 path 加 `profile-b::` 前缀，profile=名称）')
-  assert.ok(hitA.excerpt.includes(uniqA), 'A 库命中的 excerpt 应含 A 的唯一标记')
-  assert.ok(hitB.excerpt.includes(uniqB), 'B 库命中的 excerpt 应含 B 的唯一标记')
-  assert.ok(hitB.path.startsWith('profile-b::'), '跨库 path 前缀是区分来源的唯一依据')
-
-  // 各库自身的 search 不应串库（聚合是叠加，不是混库）
-  assert.equal((await search(vaultA, uniqB)).length, 0, 'A 库不应召回 B 库内容')
-  assert.equal((await search(vaultB, uniqA)).length, 0, 'B 库不应召回 A 库内容')
-})
-
 // ---------------------------------------------------------------------------
 // 步骤 5：未审核卡隔离（重点）
 // ---------------------------------------------------------------------------
@@ -373,7 +331,7 @@ test('e2e 降级沉淀：runStandaloneCapture 默认落 pending，不进入召�
   const text = `本轮讨论围绕记忆三步骤验证展开，唯一标记 ${uniq}。结论：写入 step 走 captureCard，召回 step 只认 approved，使用 step 由 agent 引用召回文本完成推断。`.repeat(2)
   const out = await runStandaloneCapture(root, text, {
     source: 'e2e-test',
-    env: { DSH_HOME: path.join(root, 'no-such-dsh-home'), MEMORY_AUDIT_MODE: 'all' },
+    env: {},
   })
 
   assert.equal(out.ok, true, '降级路径应写入成功')

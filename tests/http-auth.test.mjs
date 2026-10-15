@@ -2,6 +2,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
+import http from 'node:http'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { rpc, toolText, durableText } from './helpers.mjs'
@@ -77,8 +78,13 @@ test('Origin 非法 → 403；Host 非法 → 403；本机 Origin 放行', async
     const tok = h.token('a', ['read'])
     assert.equal((await rpc(h.url, tok, 'tools/list', {}, { headers: { origin: 'https://evil.example' } })).status, 403)
     assert.equal((await rpc(h.url, tok, 'tools/list', {}, { headers: { origin: 'http://localhost:3000' } })).status, 200)
-    const res = await fetch(h.url + '/mcp', { method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream', authorization: `Bearer ${tok}`, host: 'evil.example' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }) })
-    assert.equal(res.status, 403)
+    // fetch 不允许改 Host 头，用原生 http 请求
+    const status = await new Promise((resolve, reject) => {
+      const req = http.request({ host: '127.0.0.1', port: h.port, path: '/mcp', method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream', authorization: `Bearer ${tok}`, host: 'evil.example' } }, (r) => { r.resume(); resolve(r.statusCode) })
+      req.on('error', reject)
+      req.end(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }))
+    })
+    assert.equal(status, 403)
   })
 })
 
@@ -234,13 +240,16 @@ test('exposeTidyApply=true：需同时具备 tidy:apply scope 才出现；调用
   }, { env: { MEMORY_HUB_MCP_EXPOSE_TIDY_APPLY: '1' } })
 })
 
-test('基线兼容：全权限 + 开关开的 tools/list 与 v0.10.8 基线的 8 个工具名 / 必填参数一致', async () => {
+test('基线兼容：v0.10.8 基线的 4 个原有工具名 / 必填参数 / 属性不变，另含 4 个整理工具（共 8 个，全权限 + 开关开）', async () => {
   const baseline = JSON.parse(fs.readFileSync(path.join(here, 'fixtures/mcp-tools-baseline-v0.10.8.json'), 'utf8'))
   const baseTools = Array.isArray(baseline) ? baseline : baseline.tools
   await withHub(async (h) => {
     const tok = h.token('all', ['read', 'write', 'tidy:apply'])
     const tools = (await rpc(h.url, tok, 'tools/list')).body.result.tools
-    assert.deepEqual(tools.map((t) => t.name).sort(), baseTools.map((t) => t.name).sort())
+    // 注：PLAN 第 7 节写作"基线 8 个工具"，实际 v0.10.8 基线 fixture 只有 4 个，另 4 个整理工具来自 fork（tidy）
+    assert.equal(baseTools.length, 4)
+    const extra = ['memory_tidy_plan', 'memory_tidy_apply', 'memory_lint', 'memory_tag_normalize']
+    assert.deepEqual(tools.map((t) => t.name).sort(), [...baseTools.map((t) => t.name), ...extra].sort())
     for (const bt of baseTools) {
       const t = tools.find((x) => x.name === bt.name)
       assert.deepEqual([...(t.inputSchema.required || [])].sort(), [...(bt.inputSchema.required || [])].sort(), bt.name)
