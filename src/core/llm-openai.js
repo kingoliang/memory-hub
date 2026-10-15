@@ -21,6 +21,18 @@ function flatContent(content) {
   return String(content ?? '')
 }
 
+/**
+ * 上游错误体进日志前先脱敏：有的网关会回显/掩码 key（如 "Your api key: ****dLtw is invalid"），
+ * 连尾号也不应进入我们的日志。去掉本 key 的原文、星号掩码片段、以及常见 key 形状（sk-…/mh_…）。
+ */
+export function scrubUpstream(text, apiKey = '') {
+  let t = String(text ?? '')
+  if (apiKey) t = t.split(apiKey).join('[key]')
+  return t
+    .replace(/\*{2,}[A-Za-z0-9_-]{2,}/g, '[masked]')
+    .replace(/\b(?:sk|mh)[-_][A-Za-z0-9_-]{8,}/g, '[key]')
+}
+
 export function createOpenAiLlm({ baseUrl, apiKey = '', model, purpose = 'memory-capture' } = {}) {
   if (!baseUrl || !model) return null
   const endpoint = baseUrl.replace(/\/+$/, '') + '/chat/completions'
@@ -62,7 +74,7 @@ export function createOpenAiLlm({ baseUrl, apiKey = '', model, purpose = 'memory
       })
       if (!res.ok) {
         const detail = await res.text().catch(() => '')
-        throw new Error(`LLM ${res.status}: ${detail.slice(0, 300)}`)
+        throw new Error(`LLM ${res.status}: ${scrubUpstream(detail, apiKey).slice(0, 300)}`)
       }
       const data = await res.json()
       const text = data?.choices?.[0]?.message?.content ?? ''

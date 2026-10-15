@@ -85,3 +85,27 @@ test('模型输出无法解析 / 端点不可达：降级为原文卡，不丢�
     assertNoKeyLeak(h, r)
   }, { env: { MEMORY_LLM_BASE_URL: 'http://127.0.0.1:9/v1', MEMORY_LLM_MODEL: 'mock-model', MEMORY_LLM_KEY: KEY } })
 })
+
+test('上游 401 的错误体带有掩码/回显的 key 片段 → 降级为原文卡，且日志 / 响应 / 库里不得出现这些片段', async () => {
+  const http = await import('node:http')
+  const MASKED = '****ZQ9d'
+  const srv = http.createServer((req, res) => {
+    req.resume()
+    res.statusCode = 401
+    res.setHeader('content-type', 'application/json')
+    res.end(JSON.stringify({ error: { message: `Authentication Fails, Your api key: ${MASKED} is invalid; got ${KEY}`, type: 'authentication_error' } }))
+  }).listen(0, '127.0.0.1')
+  await new Promise((r) => srv.on('listening', r))
+  try {
+    await withHub(async (h) => {
+      const tok = h.token('a', ['write'])
+      const r = await capture(h, tok, durableText('上游401'))
+      const out = JSON.parse(toolText(r))
+      assert.equal(out.degraded, true)
+      const dump = [r.raw, h.logs.text(), JSON.stringify(h.db().prepare('SELECT * FROM write_log').all())].join('\n')
+      assert.ok(h.logs.text().includes('蒸馏调用异常'), '应有降级告警日志')
+      assert.ok(!dump.includes(MASKED), '上游掩码 key 片段不得进日志 / 响应')
+      assert.ok(!dump.includes(KEY), '回显的 key 不得进日志 / 响应')
+    }, { env: { MEMORY_LLM_BASE_URL: `http://127.0.0.1:${srv.address().port}/v1`, MEMORY_LLM_MODEL: 'm', MEMORY_LLM_KEY: KEY } })
+  } finally { await new Promise((r) => srv.close(r)) }
+})
