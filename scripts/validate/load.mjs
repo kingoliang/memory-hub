@@ -33,7 +33,7 @@ async function call(u, t, name, args) {
     let outcome = isErr ? `err-${r.status}` : 'ok'
     if (!isErr && name === 'memory_capture') { try { outcome = JSON.parse(j.result.content[0].text).action || 'ok' } catch { /* keep ok */ } }
     return { ms, err: !!isErr, outcome }
-  } catch (e) { return { ms: performance.now() - t0, err: true, outcome: 'exc-' + String(e.code || e.name) } }
+  } catch (e) { return { ms: performance.now() - t0, err: true, outcome: 'exc-' + String(e.cause?.code || e.code || e.name) } }
 }
 const pct = (arr, p) => { if (!arr.length) return null; const s = [...arr].sort((a, b) => a - b); return Math.round(s[Math.min(s.length - 1, Math.ceil(p / 100 * s.length) - 1)] * 10) / 10 }
 const stat = (rs) => ({ n: rs.length, err: rs.filter((x) => x.err).length, p50: pct(rs.map((x) => x.ms), 50), p95: pct(rs.map((x) => x.ms), 95), max: pct(rs.map((x) => x.ms), 100) })
@@ -73,6 +73,7 @@ console.log(JSON.stringify({
   elapsedSec: Math.round(elapsed * 10) / 10,
   total: { requests: all.length, errors: all.filter((x) => x.err).length, errorRatePct: Math.round(all.filter((x) => x.err).length / all.length * 10000) / 100, rps: Math.round(all.length / elapsed) },
   recall: stat(recalls), capture: stat(captures), captureOutcomes: outcomes,
+  recallErrors: recalls.filter((x) => x.err).reduce((m, x) => { m[x.outcome] = (m[x.outcome] || 0) + 1; return m }, {}),
   rssMB: { before: rs[0] && Math.round(rs[0] / 1024), peak: Math.round(Math.max(...rs) / 1024), after: Math.round(rs[rs.length - 1] / 1024) },
   oldService: oldUrl ? { before: stat(oldBefore), during: stat(oldDuring), after: stat(oldAfter) } : null,
 }, null, 1))
