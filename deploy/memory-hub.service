@@ -1,0 +1,15 @@
+[Unit]
+Description=memory-hub (shared memory MCP + admin UI) on 127.0.0.1:7990, nginx serves /memory/
+After=network-online.target tailscaled.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/memory-hub
+EnvironmentFile=@ENV_FILE@
+ExecStart=%h/.local/bin/node %h/memory-hub/bin/memory-hub.mjs serve
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

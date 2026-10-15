@@ -1,0 +1,15 @@
+[Unit]
+Description=memory-hub (staging, parallel validation instance) on 127.0.0.1:7991
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/memory-hub
+EnvironmentFile=%h/.config/memory-hub/staging.env
+ExecStart=%h/.local/bin/node %h/memory-hub/bin/memory-hub.mjs serve
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target
