@@ -132,7 +132,7 @@ export function createAdminHandler({ config, log }) {
   // ---- 路由表 ----
   const deps = { config, log }
   const routes = {
-    'GET /session': (ctx) => ({ authenticated: true, passwordSet: true, csrfToken: ctx.session.csrfToken, expiresAt: ctx.session.expiresAt, idleTimeoutMs: SESSION_IDLE_MS }),
+    'GET /session': (ctx) => ({ authenticated: true, passwordSet: true, readOnly: !!config.adminReadOnly, csrfToken: ctx.session.csrfToken, expiresAt: ctx.session.expiresAt, idleTimeoutMs: SESSION_IDLE_MS }),
     'GET /overview': async () => {
       const act = Q.activity(root, { days: 30, silentDays: 7 })
       return Q.overview(root, { config, alerts: act.alerts.filter((a) => a.type === 'read-only' || (a.type === 'idle-token' && !a.neverUsed)) })
@@ -267,6 +267,10 @@ export function createAdminHandler({ config, log }) {
       if (!safeMethod) {
         if (!originOk(req)) throw new HttpError(403, 'forbidden_origin', '来源不被允许')
         if (!csrfValid(session, req.headers['x-csrf-token'])) throw new HttpError(403, 'csrf', 'CSRF token 缺失或无效')
+        if (config.adminReadOnly && rel !== '/logout') {
+          log.warn('只读模式：已拒绝写请求', { method, path: rel, ip })
+          throw new HttpError(403, 'read_only', '管理界面处于只读模式（MEMORY_HUB_ADMIN_READONLY=1），写操作已被禁用')
+        }
       }
       const key = `${method === 'HEAD' ? 'GET' : method} ${rel}`
       const fn = routes[key]

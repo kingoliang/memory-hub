@@ -73,6 +73,9 @@ export function loadConfig(env = process.env, { warn = () => {} } = {}) {
   const adminMaxBatch = Number(maxBatchRaw)
   if (!Number.isInteger(adminMaxBatch) || adminMaxBatch < 1 || adminMaxBatch > 1000) throw new ConfigError(`MEMORY_HUB_ADMIN_MAX_BATCH 必须是 1~1000 的整数：${maxBatchRaw}`)
 
+  // 管理界面只读保护：开启后所有写接口（登出除外）返回 403 read_only。用于"用真实数据快照看界面"的本机环境，防止误点危险按钮。
+  const adminReadOnly = env.MEMORY_HUB_ADMIN_READONLY !== undefined ? truthy(env.MEMORY_HUB_ADMIN_READONLY) : truthy(file.admin?.readOnly ?? file.adminReadOnly)
+
   // 蒸馏 LLM：通用 OpenAI 兼容端点。BASE_URL 与 MODEL 缺一即视为未配置（降级为原文卡）；不回退到 OPENAI_* 变量。
   const baseUrl = String(env.MEMORY_LLM_BASE_URL ?? file.llm?.baseUrl ?? '').trim()
   const model = String(env.MEMORY_LLM_MODEL ?? file.llm?.model ?? '').trim()
@@ -95,6 +98,7 @@ export function loadConfig(env = process.env, { warn = () => {} } = {}) {
     extraOrigins,
     exposeTidyApply,
     adminMaxBatch,
+    adminReadOnly,
     trustProxy,
     llm,
     instructions,

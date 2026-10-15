@@ -21,6 +21,7 @@ const VIEWS = {
 
 const root = document.getElementById('app')
 let shell = null
+let readOnly = false
 let navBadges = {}
 let renderToken = 0
 
@@ -73,7 +74,7 @@ function buildShell() {
     h('aside', { class: 'sidebar' }, [
       h('a', { class: 'brand', href: '#/overview' }, [h('span', { class: 'brand-mark' }, 'M'), h('div', null, [h('strong', null, '记忆中枢'), h('span', null, 'Memory Hub')])]),
       nav,
-      h('div', { class: 'sidebar-foot' }, [h('span', { class: 'chip-rw' }, '管理模式 · M3')]),
+      h('div', { class: 'sidebar-foot' }, [h('span', { class: readOnly ? 'chip-ro' : 'chip-rw', title: readOnly ? '服务端已禁用所有写操作（MEMORY_HUB_ADMIN_READONLY=1）' : '' }, readOnly ? '只读模式' : '管理模式 · M3')]),
     ]),
     h('div', { class: 'scrim', on: { click: () => root.classList.remove('nav-open') } }),
     h('div', { class: 'main' }, [h('header', { class: 'topbar' }, [menu, title, logout]), view]),
@@ -120,6 +121,7 @@ async function start() {
   try {
     const s = await api.get('session')
     api.setCsrf(s.csrfToken)
+    readOnly = !!s.readOnly
   } catch (e) {
     if (e.status === 401) return showLogin({ passwordSet: e.extra?.passwordSet !== false })
     root.className = ''
