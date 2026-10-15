@@ -202,7 +202,7 @@ test('reverse：新行 id 恰与旧库另一张卡的 id 相同 → 改领旧库
   try {
     const oldMaxId = count(oldDir, 'SELECT MAX(id) m FROM cards').m
     const d = new DatabaseSync(path.join(newDir, 'memory-eternal.db'))
-    d.exec('PRAGMA user_version = 0')
+    d.prepare('DELETE FROM cards WHERE id = ?').run(oldMaxId) // 新库里那张卡已被永久删除（旧库仍有），新卡"恰好"占了同一个 id
     d.prepare("INSERT INTO cards (id, path, kind, title, tags, body, summary, status, source, submitted_by, severity, reason, created_at, updated_at) VALUES (?, 'knowledge/撞号.md', 'knowledge', '撞号', '[]', 'b', 's', 'approved', '', 'x', 'info', '', ?, ?)").run(oldMaxId, '2026-10-15T00:00:00.000Z', '2026-10-15T00:00:00.000Z')
     d.close()
     const res = await applyReverse({ from: newDir, target: oldDir, execute: true })

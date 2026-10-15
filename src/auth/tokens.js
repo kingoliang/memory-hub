@@ -72,6 +72,48 @@ export function createToken(root, { name, scopes, expiresAt = null }) {
   return { tokenId, name: n, scopes: sc, expiresAt: exp, token: `mh_${tokenId}_${secret}` }
 }
 
+/** 旧共享令牌最短长度（旧服务 server.mjs 同款要求：<32 字符拒绝启动）。 */
+export const LEGACY_MIN_LENGTH = 32
+const LEGACY_ID_PREFIX = 'legacy'
+const HEX64_RE = /^[0-9a-f]{64}$/
+
+/**
+ * 导入旧服务的共享令牌（PLAN 9.1 #2）：旧服务只存明文、令牌格式不是 mh_*，
+ * 所以这里存 sha256(整串)，token_id = legacy + 哈希前 10 位；校验走 verifyToken 的 legacy 通道。
+ * 明文（token）只在本函数内哈希，不落库、不返回、不写日志；也可直接给 hash（64 位十六进制）。
+ * @returns {{tokenId:string, name:string, scopes:string[], expiresAt:string|null}}
+ */
+export function importLegacyToken(root, { name, token, hash, scopes, expiresAt = null }) {
+  const n = validateName(name)
+  const sc = parseScopes(scopes)
+  if ((token === undefined) === (hash === undefined)) throw new TokenError('需要 token（明文，立即哈希）或 hash（sha256 十六进制）二选一')
+  let h
+  if (hash !== undefined) {
+    h = String(hash).trim().toLowerCase()
+    if (!HEX64_RE.test(h)) throw new TokenError('hash 必须是 64 位十六进制（sha256）')
+  } else {
+    const t = String(token).trim()
+    if (t.length < LEGACY_MIN_LENGTH) throw new TokenError(`旧令牌长度不足 ${LEGACY_MIN_LENGTH} 字符，拒绝导入（旧服务本身也不接受这种令牌）`)
+    h = sha256hex(t)
+  }
+  let exp = null
+  if (expiresAt) {
+    const t = Date.parse(expiresAt)
+    if (Number.isNaN(t)) throw new TokenError(`expiresAt 不是合法时间：${expiresAt}`)
+    exp = new Date(t).toISOString()
+  }
+  const db = getDb(root)
+  const tokenId = LEGACY_ID_PREFIX + h.slice(0, 10)
+  try {
+    db.prepare('INSERT INTO agent_tokens (token_id, name, secret_hash, scopes, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(tokenId, n, h, JSON.stringify(sc), new Date().toISOString(), exp)
+  } catch (e) {
+    if (/UNIQUE/i.test(String(e?.message))) throw new TokenError(`令牌名或该旧令牌已存在：${n}（名字被一枚未撤销的令牌使用，或这枚旧令牌已导入过）`, 'conflict')
+    throw e
+  }
+  return { tokenId, name: n, scopes: sc, expiresAt: exp }
+}
+
 const toPublic = (r) => ({
   tokenId: r.token_id,
   name: r.name,
@@ -139,9 +181,18 @@ export function updateToken(root, tokenId, { name, expiresAt } = {}) {
  */
 export function verifyToken(root, bearer) {
   const m = typeof bearer === 'string' ? TOKEN_RE.exec(bearer) : null
-  if (!m) return { ok: false, reason: 'malformed' }
-  const [, tokenId, secret] = m
-  const row = getDb(root).prepare('SELECT * FROM agent_tokens WHERE token_id = ?').get(tokenId)
+  if (typeof bearer !== 'string' || !bearer) return { ok: false, reason: 'malformed' }
+  let tokenId, secret, row
+  if (m) {
+    ;[, tokenId, secret] = m
+    row = getDb(root).prepare('SELECT * FROM agent_tokens WHERE token_id = ?').get(tokenId)
+  } else {
+    // legacy 通道：整串 sha256 → 只在 token_id 以 legacy 开头的行里找（mh_ 格式的串永远走不到这里）
+    if (bearer.length < LEGACY_MIN_LENGTH || bearer.length > 512) return { ok: false, reason: 'malformed' }
+    secret = bearer
+    row = getDb(root).prepare("SELECT * FROM agent_tokens WHERE token_id LIKE 'legacy%' AND secret_hash = ?").get(sha256hex(bearer))
+    tokenId = row?.token_id
+  }
   const given = Buffer.from(sha256hex(secret), 'hex')
   const stored = row ? Buffer.from(row.secret_hash, 'hex') : DUMMY_HASH
   const same = stored.length === given.length && crypto.timingSafeEqual(stored, given)

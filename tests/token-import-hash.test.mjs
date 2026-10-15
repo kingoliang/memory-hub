@@ -7,7 +7,7 @@ import path from 'node:path'
 import crypto from 'node:crypto'
 import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
-import { tmpHome, rmrf, rpc, toolText } from './helpers.mjs'
+import { tmpHome, rmrf, rpc, toolText, durableText } from './helpers.mjs'
 import { withHub } from './hub-helpers.mjs'
 import { verifyToken, createToken, importLegacyToken, listTokens, revokeToken } from '../src/auth/tokens.js'
 import { closeAllDb } from '../src/core/db.js'
@@ -95,10 +95,10 @@ test('CLI token import-hash --from-file：不打印明文，--expires 14d，--sc
     assert.equal(rec.status, 200)
     assert.ok(!ctx.logs.text().includes(plain), '服务日志不得含旧令牌明文')
     // 署名 = 令牌名
-    const cap = await rpc(ctx.url, plain, 'tools/call', { name: 'memory_capture', arguments: { text: '# 旧令牌署名验证\n\n这是一段用于验证署名的合成文本，长度需要足够，所以多写一些：结论是配置走环境变量，原因是部署时不改代码，步骤是先备份再重启。', title: '旧令牌署名验证' } })
+    const cap = await rpc(ctx.url, plain, 'tools/call', { name: 'memory_capture', arguments: { text: durableText('旧令牌署名验证', 7) } })
     assert.equal(cap.status, 200, toolText(cap))
-    const sub = ctx.db().prepare("SELECT submitted_by FROM quarantine WHERE title LIKE '%署名验证%' UNION ALL SELECT submitted_by FROM cards WHERE title LIKE '%署名验证%'").all()
-    assert.ok(sub.every((s) => s.submitted_by === 'legacy-shared') && sub.length >= 1, JSON.stringify(sub))
+    const sub = ctx.db().prepare('SELECT submitted_by FROM quarantine UNION ALL SELECT submitted_by FROM cards').all()
+    assert.ok(sub.length >= 1 && sub.every((s) => s.submitted_by === 'legacy-shared'), JSON.stringify(sub) + toolText(cap))
     // 撤销后立即 401
     assert.equal(run(ctx.home, ['token', 'revoke', 'legacy-shared']).status, 0)
     assert.equal((await rpc(ctx.url, plain, 'tools/list')).status, 401)
