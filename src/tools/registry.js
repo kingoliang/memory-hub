@@ -4,6 +4,7 @@
 // 权限矩阵见 PLAN.md 第 4 节：scope 字段是该工具所需的最低范围，判定见 auth/tokens.js scopeAllows。
 // memory_tidy_apply / memory_tag_normalize 默认不出现在 tools/list（exposeTidyApply=false），出现时仍须 tidy:apply scope 且 confirm===true。
 
+import path from 'node:path'
 import * as z from 'zod/v4'
 import { search, overview, stats, ensureVault, listCards, countCards } from '../core/vault.js'
 import { runStandaloneCapture } from '../core/capture-run.js'
@@ -205,6 +206,14 @@ export function toolsForScopes(scopes, config) {
   return TOOL_DEFS.filter((d) => toolEnabled(d, config) && scopeAllows(scopes, d.scope))
 }
 
+/** HTTP（远程 Agent）看不到服务器的绝对路径：把数据目录/家目录替换成固定标识。stdio 是本机进程，保持原样。 */
+export const DATA_DIR_LABEL = '<data-dir>'
+function scrubServerPaths(res, ctx) {
+  if (ctx.transport === 'stdio' || !Array.isArray(res?.content)) return res
+  const roots = [...new Set([ctx.root, ctx.config?.home, ctx.config?.dbRoot].filter(Boolean).map((p) => path.resolve(p)))].sort((a, b) => b.length - a.length)
+  return { ...res, content: res.content.map((c) => (typeof c.text === 'string' ? { ...c, text: roots.reduce((t, r) => t.split(r).join(DATA_DIR_LABEL), c.text) } : c)) }
+}
+
 function result(text, isError = false) {
   return { content: [{ type: 'text', text: String(text) }], ...(isError ? { isError: true } : {}) }
 }
@@ -231,12 +240,12 @@ export async function callTool(def, args, ctx) {
   let res
   let audit
   try {
-    res = await def.handler(args, ctx)
+    res = scrubServerPaths(await def.handler(args, ctx), ctx)
     audit = ctx.audit || (def.scope === 'read' ? { action: 'read', outcome: 'ok' } : { action: 'write', outcome: 'ok' })
     if (res.isError && audit.outcome === 'ok') audit = { ...audit, outcome: 'error' }
   } catch (e) {
     ctx.log.error('工具执行失败', { tool: def.name, actor: identity.name, error: String(e?.message || e).slice(0, 300) })
-    res = result(String(e?.message || e), true)
+    res = scrubServerPaths(result(String(e?.message || e), true), ctx)
     audit = { action: def.scope === 'read' ? 'read' : 'write', outcome: 'error' }
   }
   try {

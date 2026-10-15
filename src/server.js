@@ -101,7 +101,7 @@ export async function startServer(config, { logger = getLogger(), scheduler = tr
     if (!a) throw new Error('missing authInfo') // 不可能：鉴权在 handler 之前
     return buildMcpServer({
       identity: { type: 'agent', id: String(a.extra?.tokenId || ''), name: a.clientId, ip: String(a.extra?.ip || '') },
-      scopes: a.scopes, config, log, llm,
+      scopes: a.scopes, config, log, llm, transport: 'http',
     })
   }
   const nodeHandler = toNodeHandler(createMcpHandler(factory), { onerror: (e) => log.error('MCP 适配层错误', { error: String(e?.message || e) }) })
@@ -113,10 +113,17 @@ export async function startServer(config, { logger = getLogger(), scheduler = tr
     return config.allowedOrigins.includes(u.origin.toLowerCase())
   }
 
+  // 没带凭据 = 标准的 Bearer 质询（RFC 6750 §3.1），不是猜测行为：回 401 + WWW-Authenticate 说明如何认证，不计入失败限流。
+  // （实测 Claude Code 对同一次连接会连发多个无令牌请求；如果每个都计失败，一次连接就会被误算成多次攻击，还会连累同机其它客户端。）
+  const challenge = (res, ip, method) => {
+    log.info('请求未带令牌，已质询', { ip, method })
+    sendJson(res, 401, { error: 'unauthorized', message: '需要 Bearer 令牌：请在请求头加 Authorization: Bearer <令牌>（令牌由管理员在管理界面或 memory-hub token create 创建）' }, { 'www-authenticate': 'Bearer realm="memory-hub"' })
+  }
+  // 带了凭据但无效（格式错 / 不存在 / 不匹配 / 过期 / 撤销）：每个请求恰好计一次失败；响应不区分具体原因，避免枚举。
   const denyAuth = (res, ip, reason) => {
     limiter.fail(ip)
     log.warn('鉴权失败', { ip, reason })
-    sendJson(res, 401, { error: 'unauthorized' }, { 'www-authenticate': 'Bearer realm="memory-hub"' })
+    sendJson(res, 401, { error: 'unauthorized', message: '令牌无效（不存在、已过期或已被撤销）' }, { 'www-authenticate': 'Bearer realm="memory-hub", error="invalid_token"' })
   }
 
   const handle = async (req, res) => {
@@ -143,8 +150,10 @@ export async function startServer(config, { logger = getLogger(), scheduler = tr
       log.warn('鉴权失败过多，已限流', { ip })
       return sendJson(res, 429, { error: 'too many failed attempts' }, { 'retry-after': '60' })
     }
-    const m = /^Bearer\s+(\S+)$/i.exec(String(req.headers.authorization || ''))
-    if (!m) return denyAuth(res, ip, 'missing-or-malformed-header')
+    const authHeader = String(req.headers.authorization || '').trim()
+    if (!authHeader || /^Bearer$/i.test(authHeader)) return challenge(res, ip, req.method)
+    const m = /^Bearer\s+(\S+)$/i.exec(authHeader)
+    if (!m) return denyAuth(res, ip, 'malformed-header')
     const v = verifyToken(config.dbRoot, m[1])
     if (!v.ok) return denyAuth(res, ip, v.reason)
     const tok = v.token

@@ -25,7 +25,7 @@ export function runStdio(config, { log, env = process.env }) {
       const n = String(cv?.name || '').replace(/[^A-Za-z0-9._:@-]/g, '-').slice(0, 50)
       return n ? `stdio:${n}` : 'stdio'
     }
-    currentServer = buildMcpServer({ identity, scopes, config, log, llm, resolveName })
+    currentServer = buildMcpServer({ identity, scopes, config, log, llm, resolveName, transport: 'stdio' })
     return currentServer
   }, { legacy: 'serve', onerror: (e) => log.error('stdio 传输错误', { error: String(e?.message || e) }) })
   log.info('MCP stdio 已启动', { agent: agent || '(clientInfo)', identity: 'self-asserted', exposeTidyApply: config.exposeTidyApply, llmConfigured: !!llm })

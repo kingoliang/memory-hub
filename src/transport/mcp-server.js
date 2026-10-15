@@ -16,9 +16,9 @@ export function llmFromConfig(config) {
 }
 
 /**
- * @param {{ identity: {type:string,id:string,name:string,ip?:string}, scopes: string[], config: object, log: object, llm?: object|null, resolveName?: () => string }} p
+ * @param {{ transport?: 'http'|'stdio', identity: {type:string,id:string,name:string,ip?:string}, scopes: string[], config: object, log: object, llm?: object|null, resolveName?: () => string }} p
  */
-export function buildMcpServer({ identity, scopes, config, log, llm = null, resolveName }) {
+export function buildMcpServer({ identity, scopes, config, log, llm = null, resolveName, transport = 'http' }) {
   const server = new McpServer(
     { name: SERVER_NAME, version: SERVER_VERSION },
     { instructions: config.instructions || DEFAULT_INSTRUCTIONS, capabilities: { tools: {} } },
@@ -26,7 +26,7 @@ export function buildMcpServer({ identity, scopes, config, log, llm = null, reso
   for (const def of toolsForScopes(scopes, config)) {
     server.registerTool(def.name, { description: def.description, inputSchema: schemaOf(def) }, async (args) => {
       const id = resolveName ? { ...identity, name: resolveName() } : identity
-      return callTool(def, args ?? {}, { root: config.dbRoot, identity: id, config, llm, log })
+      return callTool(def, args ?? {}, { root: config.dbRoot, identity: id, config, llm, log, transport })
     })
   }
   return server
