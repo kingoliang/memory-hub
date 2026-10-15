@@ -44,6 +44,13 @@ old_recall_has() { # <marker>
   printf '%s' "$out" | /usr/bin/grep -qF -- "$1"
 }
 
+old_schema_untouched() {
+  "$NODE" -e '
+const {DatabaseSync}=require("node:sqlite");const d=new DatabaseSync(process.argv[1],{readOnly:true});
+const t=d.prepare("select count(*) n from sqlite_master where name in (?,?,?,?)").get("agent_tokens","write_log","card_revisions","admin_sessions").n;
+process.exit(d.prepare("PRAGMA user_version").get().user_version===0&&t===0?0:1)' "$R/old-vault/memory-eternal.db"
+}
+
 do_run() {
   [ -d "$HUB/node_modules" ] || { echo "$HUB 未部署" >&2; exit 1; }
   [ "$(ss -ltnH "sport = :$PORT" | wc -l | tr -d ' ')" = 0 ] || { echo "演练端口 $PORT 已被占用" >&2; exit 1; }
@@ -102,7 +109,9 @@ const pend = db.prepare("SELECT path FROM quarantine WHERE status = ? AND body N
 if (pend) { await v.setCardStatus(process.env.DATA, pend.path, "approved", { changedBy: "rehearsal", reason: "演练批准" }); console.log("    已批准 1 张原待审卡") }
 const app = db.prepare("SELECT path FROM cards WHERE body NOT LIKE ? ORDER BY id DESC LIMIT 1").get("%ZZSYN-%")
 if (app) { await v.appendUpdate(process.env.DATA, app.path, "演练追加的更新记录"); await v.deleteCard(process.env.DATA, app.path); console.log("    已对 1 张已批准卡追加更新并软删") }
-await v.writeCard(process.env.DATA, { kind: "project", title: "回放演练新增卡", body: "回放演练新增卡的正文：ZZSYN-rehearsal-approved，用于验证回滚后旧服务能读到新库期间新增的已批准卡。", status: "approved", submittedBy: "rehearsal" }, { dedup: false })
+// 库的审核模式是 all：writeCard 传 approved 也会先进待审，须再批准一次才算"已批准的新增卡"
+const nw = await v.writeCard(process.env.DATA, { kind: "project", title: "回放演练新增卡", body: "回放演练新增卡的正文：ZZSYN-rehearsal-approved，用于验证回滚后旧服务能读到新库期间新增的已批准卡。", status: "approved", submittedBy: "rehearsal" }, { dedup: false })
+await v.setCardStatus(process.env.DATA, nw.path, "approved", { changedBy: "rehearsal", reason: "演练批准" })
 d.closeAllDb()'
   cp -r "$R/data" "$R/data.before-rollback"   # 留一份"回滚前的新库"，供最后对账"没丢卡"
 
@@ -111,10 +120,7 @@ d.closeAllDb()'
   $C rollback --execute 2>&1 | sed 's/^/    /'
   ok "回滚后旧服务 healthz 不带 version（是旧服务）" bash -c "! curl -s -m 5 http://127.0.0.1:$PORT/memory/healthz | /usr/bin/grep -q '\"version\"'"
   ok "旧服务（线上旧代码）能 recall 到新库期间新增的已批准卡" old_recall_has "回放演练新增卡"
-  ok "旧库仍是旧 schema（user_version=0，无新表）" "$NODE" -e '
-const {DatabaseSync}=require("node:sqlite");const d=new DatabaseSync(process.argv[1],{readOnly:true});
-const t=d.prepare("select count(*) n from sqlite_master where name in (\"agent_tokens\",\"write_log\",\"card_revisions\",\"admin_sessions\")").get().n;
-process.exit(d.prepare("PRAGMA user_version").get().user_version===0&&t===0?0:1)' "$R/old-vault/memory-eternal.db"
+  ok "旧库仍是旧 schema（user_version=0，无新表）" old_schema_untouched
   ok "旧库对账：回滚前的新库 ⊆ 回滚后的旧库（verify --allow-target-extra）" "$NODE" "$HUB/bin/memory-hub.mjs" migrate verify --source "$R/data.before-rollback" --target "$R/old-vault/memory-eternal.db" --allow-target-extra
   ls "$R/old-vault" | /usr/bin/grep -c 'pre-reverse-' | sed 's/^/    pre-reverse 留底文件数：/'
 
