@@ -278,11 +278,12 @@ test('server instructions 与 capture / recall 工具描述存在且给出何时
   })
 })
 
-test('管理员 / Agent 令牌隔离的前提：非 MCP 路径一律 404（M1 不提供管理 API）', async () => {
+test('管理员 / Agent 令牌隔离：Agent 令牌访问管理 API 一律 401（M2 起 /admin/api 存在，认证独立于 /mcp；M1 时这里是 404）；未知非 MCP 路径仍是 404', async () => {
   await withHub(async (h) => {
     const tok = h.token('a', ['read'])
     const res = await fetch(h.url + '/admin/api/cards', { headers: { authorization: `Bearer ${tok}` } })
-    assert.equal(res.status, 404)
+    assert.equal(res.status, 401)
+    assert.equal((await fetch(h.url + '/nope', { headers: { authorization: `Bearer ${tok}` } })).status, 404)
   })
 })
 

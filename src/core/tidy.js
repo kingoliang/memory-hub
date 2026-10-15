@@ -78,6 +78,25 @@ export function detectSecrets(text) {
   return [...new Set(types)]
 }
 
+/**
+ * 把文本里的疑似明文密钥遮蔽成 `[已遮蔽:类型]`（管理界面展示卡片正文时用）。
+ * 与 detectSecrets 共用同一套规则；返回 { text, types }，types = detectSecrets(原文)。遮蔽后的文本再扫描应为空。
+ */
+export function redactSecrets(text) {
+  const original = String(text || '')
+  let s = original
+  s = s.replace(/-----BEGIN (?:[A-Z]+ )*PRIVATE KEY(?: BLOCK)?-----[\s\S]*?(?:-----END (?:[A-Z]+ )*PRIVATE KEY(?: BLOCK)?-----|$)/g, '[已遮蔽:private-key]')
+  for (const [name, re] of SECRET_PATTERNS) {
+    if (name === 'private-key') continue
+    s = s.replace(new RegExp(re.source, re.flags.includes('g') ? re.flags : re.flags + 'g'), `[已遮蔽:${name}]`)
+  }
+  s = s.replace(ASSIGN_RE, (m, v) => {
+    if (PLACEHOLDER_RE.test(v) || !/[A-Za-z]/.test(v) || !/\d/.test(v)) return m
+    return m.slice(0, m.length - v.length) + '[已遮蔽:credential-assignment]'
+  })
+  return { text: s, types: detectSecrets(original) }
+}
+
 // ---------------------------------------------------------------------------
 // 噪声
 // ---------------------------------------------------------------------------

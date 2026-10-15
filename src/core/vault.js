@@ -433,8 +433,11 @@ export async function recycleList(root) {
   return rows.map(rowToCard)
 }
 
+/** 回收站保留天数（定时清理与管理界面「剩余天数」共用同一个值）。 */
+export const RECYCLE_RETENTION_DAYS = 30
+
 /** 清理超过 retentionDays 天的回收卡（永久删除）。 */
-export async function purgeExpired(root, retentionDays = 30) {
+export async function purgeExpired(root, retentionDays = RECYCLE_RETENTION_DAYS) {
   const db = getDb(root)
   const cut = new Date(Date.now() - retentionDays * 86400000).toISOString()
   const rows = db.prepare('SELECT path FROM quarantine WHERE status = ? AND deleted_at IS NOT NULL AND deleted_at < ?').all('deleted', cut)

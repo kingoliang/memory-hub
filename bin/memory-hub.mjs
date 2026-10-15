@@ -6,11 +6,13 @@
 //   memory-hub token list [--json]
 //   memory-hub token revoke <name|tokenId>
 //   memory-hub backup now
+//   memory-hub admin set-password            设置/更换管理界面口令：从 stdin 读取（终端里交互输入不回显；管道则读第一行），绝不经命令行参数、不打印
 
 import { loadConfig, validateBind, ConfigError } from '../src/config.js'
 import { createLogger, setDefaultLogger } from '../src/logger.js'
 import { createToken, listTokens, revokeToken, TokenError } from '../src/auth/tokens.js'
 import { backupDb, closeAllDb } from '../src/core/db.js'
+import { setAdminPassword, AdminAuthError, MIN_PASSWORD_LENGTH } from '../src/admin/auth.js'
 
 const argv = process.argv.slice(2)
 const opt = (name) => { const i = argv.indexOf('--' + name); return i >= 0 ? argv[i + 1] : undefined }
@@ -26,6 +28,37 @@ function parseExpires(v) {
   return new Date(v).toISOString()
 }
 
+/** 读取口令：TTY 下交互输入（不回显、输入两次确认）；否则读 stdin 第一行。口令不进入 argv、日志或输出。 */
+async function readPassword() {
+  if (!process.stdin.isTTY) {
+    const chunks = []
+    for await (const c of process.stdin) chunks.push(c)
+    const first = Buffer.concat(chunks).toString('utf8').split(/\r?\n/)[0]
+    if (!first) throw new AdminAuthError('没有从 stdin 读到口令')
+    return first
+  }
+  const ask = (label) => new Promise((resolve, reject) => {
+    process.stderr.write(label)
+    const stdin = process.stdin
+    let buf = ''
+    stdin.setRawMode(true); stdin.resume(); stdin.setEncoding('utf8')
+    const done = (fn, v) => { stdin.setRawMode(false); stdin.pause(); stdin.off('data', onData); process.stderr.write('\n'); fn(v) }
+    const onData = (chunk) => {
+      for (const ch of chunk) {
+        if (ch === '\u0003') return done(reject, new AdminAuthError('已取消'))
+        if (ch === '\r' || ch === '\n') return done(resolve, buf)
+        if (ch === '\u007f' || ch === '\b') buf = [...buf].slice(0, -1).join('')
+        else buf += ch
+      }
+    }
+    stdin.on('data', onData)
+  })
+  const a = await ask(`新的管理员口令（至少 ${MIN_PASSWORD_LENGTH} 个字符，不回显）：`)
+  const b = await ask('再输入一次：')
+  if (a !== b) throw new AdminAuthError('两次输入不一致')
+  return a
+}
+
 function usage() {
   process.stderr.write(`用法：
   memory-hub serve
@@ -34,6 +67,7 @@ function usage() {
   memory-hub token list [--json]
   memory-hub token revoke <名字|tokenId>
   memory-hub backup now
+  memory-hub admin set-password          （口令从 stdin 读取；终端交互输入两次，不回显）
 环境变量：MEMORY_HUB_HOME MEMORY_HUB_DB MEMORY_HUB_HOST MEMORY_HUB_PORT MEMORY_HUB_BASE_PATH MEMORY_HUB_ALLOW_REMOTE
   MEMORY_HUB_ALLOWED_ORIGINS MEMORY_HUB_ALLOWED_HOSTS MEMORY_HUB_TRUST_PROXY MEMORY_HUB_MCP_EXPOSE_TIDY_APPLY MEMORY_HUB_AGENT
   MEMORY_LLM_BASE_URL MEMORY_LLM_MODEL MEMORY_LLM_KEY
@@ -109,11 +143,20 @@ async function main() {
     return 0
   }
 
+  if (cmd === 'admin' && sub === 'set-password') {
+    if (argv.length > 2) throw new AdminAuthError('口令不能通过命令行参数传入：请直接运行 `memory-hub admin set-password`（从 stdin 读取）')
+    const pw = await readPassword()
+    setAdminPassword(config.dbRoot, pw)
+    log.info('管理员口令已设置', { db: config.dbRoot, note: '既有管理会话已全部失效' })
+    process.stdout.write('管理员口令已设置；既有登录会话已全部失效。\n')
+    return 0
+  }
+
   usage(); return 1
 }
 
 main().then((code) => { if (code !== null) { closeAllDb(); process.exit(code) } }).catch((e) => {
-  const known = e instanceof ConfigError || e instanceof TokenError
+  const known = e instanceof ConfigError || e instanceof TokenError || e instanceof AdminAuthError
   bootLog.error(known ? e.message : '未预期的错误', known ? undefined : { error: String(e?.stack || e).slice(0, 800) })
   process.exit(1)
 })

@@ -1,14 +1,17 @@
 // memory-hub · HTTP 服务：单进程单端口，默认 127.0.0.1。
 //   POST {base}/mcp     MCP Streamable HTTP（无状态，dual-era：2025 年代 initialize 与 2026-07-28 server/discover 皆可）
 //   GET  {base}/healthz 存活探针（无需鉴权）
-// 管理界面 / 管理 API 属于 M2，不在此实现（一律 404）。
+//   {base}/admin/        管理界面静态文件（M2，只读）；{base}/admin/api/* 管理 API（会话 cookie 认证，与 /mcp 的令牌认证互相独立）
+//   GET  {base}/         302 → {base}/admin/
 
 import http from 'node:http'
 import { createMcpHandler } from '@modelcontextprotocol/server'
 import { toNodeHandler } from '@modelcontextprotocol/node'
 import { validateBind } from './config.js'
 import { getDb, backupDb, DB_FILENAME } from './core/db.js'
-import { purgeExpired } from './core/vault.js'
+import { purgeExpired, RECYCLE_RETENTION_DAYS } from './core/vault.js'
+import { createAdminHandler } from './admin/handler.js'
+import { hasAdminPassword, cleanupSessions } from './admin/auth.js'
 import { writeLog } from './core/writelog.js'
 import { verifyToken, scopeAllows } from './auth/tokens.js'
 import { findTool, toolEnabled } from './tools/registry.js'
@@ -91,6 +94,7 @@ export async function startServer(config, { logger = getLogger(), scheduler = tr
   const llm = llmFromConfig(config)
   const limiter = new FailureLimiter()
   const base = config.basePath
+  const admin = createAdminHandler({ config, log })
 
   const factory = (ctx) => {
     const a = ctx.authInfo
@@ -125,6 +129,7 @@ export async function startServer(config, { logger = getLogger(), scheduler = tr
     if (pathname === `${base}/healthz`) {
       return sendJson(res, 200, { ok: true, version: SERVER_VERSION, bind: req.socket.localAddress })
     }
+    if (admin.owns(pathname)) return admin.handle(req, res, url)
     if (pathname !== `${base}/mcp`) return sendJson(res, 404, { error: 'not found' })
 
     const origin = req.headers.origin
@@ -182,11 +187,12 @@ export async function startServer(config, { logger = getLogger(), scheduler = tr
     server.listen(config.port, config.host, () => { server.off('error', reject); resolve() })
   })
   const addr = server.address()
+  if (!hasAdminPassword(config.dbRoot)) log.warn('管理员口令未设置：管理界面无法登录。请运行 `memory-hub admin set-password` 设置（口令从 stdin 读取，不经命令行参数）')
   let stopScheduler = () => {}
   if (scheduler) stopScheduler = startScheduler(config, log)
   log.info('memory-hub listening', {
     host: addr.address, port: addr.port, basePath: base || '/', db: path.join(config.dbRoot, DB_FILENAME),
-    exposeTidyApply: config.exposeTidyApply, remote: config.allowRemote,
+    exposeTidyApply: config.exposeTidyApply, remote: config.allowRemote, adminUi: `${base}/admin/`, adminLoginReady: hasAdminPassword(config.dbRoot),
     llm: config.llm ? { configured: true, model: config.llm.model, keySet: !!config.llm.apiKey } : { configured: false, note: '蒸馏未配置：memory_capture 将降级为原文卡' },
   })
   return {
@@ -212,8 +218,10 @@ export function startScheduler(config, log) {
         if (r.ok) log.info('每日备份完成', { file: path.basename(r.path), bytes: r.bytes })
         else log.error('每日备份失败', { error: r.error })
       }
-      const p = await purgeExpired(config.dbRoot, 30)
+      const p = await purgeExpired(config.dbRoot, RECYCLE_RETENTION_DAYS)
       if (p.purged) log.info('回收站清理', { purged: p.purged })
+      const s = cleanupSessions(config.dbRoot)
+      if (s) log.info('清理过期管理会话', { removed: s })
     } catch (e) { log.error('定时任务异常', { error: String(e?.message || e) }) }
   }
   const first = setTimeout(tick, 30_000)
