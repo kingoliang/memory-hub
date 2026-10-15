@@ -1,0 +1,12 @@
+{
+  "name": "memory-hub",
+  "version": "0.1.0",
+  "private": true,
+  "description": "多 Agent 共用的记忆 MCP 服务（memory-eternal 衍生）",
+  "license": "MIT",
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "test": "node --test --test-concurrency=1 tests/"
+  }
+}
