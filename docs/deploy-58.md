@@ -1,6 +1,6 @@
 # memory-hub 部署到 58：并行验证实例、切换与回滚手册（M4 阶段一）
 
-日期：2026-10-15。依据 `PLAN.md` 6.3.1 / 6.3.3 / 7（M4）/ 9。本文所有"实测"均来自 2026-10-15 在 58 上的真实命令输出；**正式切换尚未执行**，旧服务（`memory-mcp-http.service`，7990）、nginx、DSH 及其插件、两台机器的客户端配置均未被改动。
+日期：2026-10-15。依据 `PLAN.md` 6.3.1 / 6.3.3 / 7（M4）/ 9。本文所有"实测"均来自 2026-10-15 在 58 上的真实命令输出；**正式切换已于 2026-10-15 执行，见第 13 节「切换记录」**；切换前的状态：旧服务（`memory-mcp-http.service`，7990）、nginx、DSH 及其插件、两台机器的客户端配置均未被改动。
 
 > 约定：命令里的 `<...>` 是占位（示例），不是真实值。本文不含任何口令 / 令牌 / 密钥。58 的 tailnet 名 `astra-ai-server-02.tail5357dc.ts.net` 与 IP `100.113.34.77` 沿用 PLAN 1.9 已有写法。
 
@@ -367,3 +367,33 @@ systemctl --user start memory-hub.service
 - 单元/集成测试：`npm test`（289 全绿；新增：`tests/token-import-hash.test.mjs`、`tests/migrate.test.mjs`、`tests/cutover-script.test.mjs`、`tests/capture-llm.test.mjs` 的脱敏用例）。
 - 在 58 上不碰线上地完整演练：`bash ~/memory-hub/scripts/rehearse-cutover.sh run`（端口 7993，约 1 分钟；结尾 `REHEARSAL PASS` 并自动清理；失败保留现场）。**正式切换前建议再跑一遍**。演练脚本里的"旧服务替身"是线上旧 `server.mjs` 的拷贝 + 副本库 + 随机令牌，用 systemd-run 临时 unit 运行，不碰线上目录。
 - 验证脚本：`scripts/validate/{recall-parity,mcp-clients,admin-shots,load}.mjs`。
+
+## 13. 切换记录
+
+**状态：切换已完成（2026-10-15，带 DSH 硬切）。** 新服务 `memory-hub.service`（enabled/active，127.0.0.1:7990，`/memory`）取代旧 `memory-mcp-http.service`（inactive/disabled，unit 与代码未卸载）。`memory-hub-staging.service` 已停止并 disable，数据 `~/memory-hub-data/staging/` 保留。nginx 未改，全程未用 sudo。
+
+**回滚（一条命令，在 58 上）：** `bash ~/memory-hub/scripts/cutover.sh rollback --execute`（新库增量会先 `migrate reverse` 回旧库；旧库原件切换期间只读打开，从未被新代码触碰）。
+
+**时间线与基线（UTC）**
+
+| 项 | 值 |
+|---|---|
+| 切换批次目录 | `~/memory-hub-data/cutover/20261015T131443Z`（`latest` 软链），快照 sha256 前缀 `d4fd862b0308b0f1`，5996544 字节 |
+| 新服务 PID | 切换时 2886913；验证中 `systemctl --user restart` 后 2887875，NRestarts=0 |
+| 切换前一刻旧库（13:14:42） | cards=662，MAX(id)=2038，quarantine deleted=253 / pending=21，`card_sequence.seq`=2109，旧库 WAL=4185952 字节（mtime 13:09:11） |
+| 最终快照（13:14:43，backup API） | cards=662，MAX(id)=2038，deleted=253 / pending=21，seq=2109，integrity ok |
+| 旧令牌 | 以 `legacy-shared`（read,write）仅存哈希导入，2026-10-29T13:15:03Z 过期 |
+
+**窗口期写入（DSH 未冻结，按 `--allow-holders --frozen-ack` 硬切）：** 切换时持有旧库的 DSH 主进程与 7999/8000 旧面板仍在运行。快照之后它们写入旧库的内容**不在新库**，仍留在旧库原件里，需事后补导。观察期（至 13:30）旧库变化：seq 2109→2110，pending 21→22（均为待审队列新增，cards 与 deleted 不变），WAL mtime 13:17:46。粗略速率：12:57→13:30 共 +4 张（约每 8 分钟 1 张，均落入 quarantine pending）。DSH 下线前每多拖一分钟约多 0.1~0.15 张卡落在新库之外。
+
+**验证摘要（均为 58 / Mac 上的真实命令输出）**
+- 切换脚本 9 步全部通过：快照 vs 旧库原件、快照 vs 新数据目录、新代码升级 schema 后再对账均 `RESULT: PASS`；旧令牌 tools/list 直连 / 带 Host 头 / 经 nginx(80) 均 200，无令牌 401，管理界面首页 200。
+- 经真实 nginx（Mac 经 tailnet 域名）：80 与 443 的 `/memory/healthz`=200、`/memory/admin/`=200、无令牌 tools/list=401、legacy-shared tools/list=200（6 个工具）、memory_recall=200。443 证书对 Mac 的 curl 校验通过（`ssl_verify_result=0`，未加 `-k`）。
+- 数据：新库 cards=662、deleted=253、pending=21、seq=2109，与快照逐项相同；新库 integrity_check=ok，`user_version`=2。
+- recall：30 条（取自旧库标题前缀）切换前旧服务 vs 切换后新服务（经 nginx 80）响应指纹 30/30 相同；重启后再比 30/30 相同。
+- 真实 Claude Code（`claude -p`，`--mcp-config` + `--strict-mcp-config` + `--setting-sources project`，令牌走环境变量）：memory_recall 调用成功，返回 5 条，无 permission denial。
+- 重启恢复：`systemctl --user restart` 后 PID 变化，数据、令牌、healthz、recall 均不变。未做 `kill -9`。
+- 管理界面：经 nginx 登录，7 页截图（总览/卡片/详情/待审/回收站/令牌/活跃度），控制台问题 0；截图只存本机仓库外目录。
+- 观察 15 分钟：新服务 journal ERROR=0、WARN=0；RSS 约 85MB 稳定；401 仅来自验证时的无令牌探测（Mac 与回环），无其它来源客户端的 401。
+
+**未完成（用户侧）：** 冻结/下线 DSH memory-eternal 插件与旧面板、Mac 与 58 的客户端配置、旧 SessionEnd hook 移除、`legacy-shared` 撤销、窗口期旧库新增卡的补导。
