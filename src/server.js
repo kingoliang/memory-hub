@@ -1,5 +1,6 @@
 // memory-hub · HTTP 服务：单进程单端口，默认 127.0.0.1。
 //   POST {base}/mcp     MCP Streamable HTTP（无状态，dual-era：2025 年代 initialize 与 2026-07-28 server/discover 皆可）
+//   POST {base}/api/ingest 会话文本摄入（Bearer 令牌，需 write scope；见 docs/ingest-api.md）
 //   GET  {base}/healthz 存活探针（无需鉴权）
 //   {base}/admin/        管理界面静态文件（M2，只读）；{base}/admin/api/* 管理 API（会话 cookie 认证，与 /mcp 的令牌认证互相独立）
 //   GET  {base}/         302 → {base}/admin/
@@ -15,6 +16,7 @@ import { hasAdminPassword, cleanupSessions } from './admin/auth.js'
 import { writeLog } from './core/writelog.js'
 import { verifyToken, scopeAllows } from './auth/tokens.js'
 import { findTool, toolEnabled } from './tools/registry.js'
+import { runIngest, validateIngestBody } from './core/ingest.js'
 import { buildMcpServer, llmFromConfig, SERVER_VERSION } from './transport/mcp-server.js'
 import { getLogger } from './logger.js'
 import fs from 'node:fs'
@@ -127,6 +129,57 @@ export async function startServer(config, { logger = getLogger(), scheduler = tr
     sendJson(res, 401, { error: 'unauthorized', message: '令牌无效（不存在、已过期或已被撤销）' }, { 'www-authenticate': 'Bearer realm="memory-hub", error="invalid_token"' })
   }
 
+  /** 公共鉴权（/mcp 与 /api/ingest 共用）：Origin → 失败限流 → Bearer 令牌。已写好响应时返回 null，否则 {tok, ip}。 */
+  const authenticate = (req, res) => {
+    const origin = req.headers.origin
+    if (origin !== undefined && !originAllowed(String(origin))) {
+      log.warn('Origin 校验失败', { origin: String(origin).slice(0, 200) })
+      sendJson(res, 403, { error: 'forbidden origin' })
+      return null
+    }
+
+    const ip = clientIp(req, config)
+    if (limiter.blocked(ip)) {
+      log.warn('鉴权失败过多，已限流', { ip })
+      sendJson(res, 429, { error: 'too many failed attempts' }, { 'retry-after': '60' })
+      return null
+    }
+    const authHeader = String(req.headers.authorization || '').trim()
+    if (!authHeader || /^Bearer$/i.test(authHeader)) { challenge(res, ip, req.method); return null }
+    const m = /^Bearer\s+(\S+)$/i.exec(authHeader)
+    if (!m) { denyAuth(res, ip, 'malformed-header'); return null }
+    const v = verifyToken(config.dbRoot, m[1])
+    if (!v.ok) { denyAuth(res, ip, v.reason); return null }
+    return { tok: v.token, ip }
+  }
+
+  /** POST {base}/api/ingest：会话文本摄入。鉴权 → write scope → 读 body（413）→ 校验（400）→ runIngest。 */
+  const handleIngest = async (req, res) => {
+    if (req.method !== 'POST') return sendJson(res, 405, { error: 'method not allowed' }, { allow: 'POST' })
+    const authed = authenticate(req, res)
+    if (!authed) return
+    const { tok, ip } = authed
+    if (!scopeAllows(tok.scopes, 'write')) {
+      log.warn('scope 不足，已拒绝', { actor: tok.name, tool: 'ingest', required: 'write' })
+      try { writeLog(config.dbRoot, { actorType: 'agent', actorId: tok.tokenId, actorName: tok.name, tool: 'ingest', action: 'deny', outcome: 'denied', ip }) } catch (e) { log.error('write_log 写入失败', { error: String(e?.message || e) }) }
+      return sendJson(res, 403, { status: 'forbidden', reason: 'insufficient scope: write required' }, { 'www-authenticate': 'Bearer error="insufficient_scope", scope="write"' })
+    }
+    let raw
+    try { raw = await readBody(req, config.ingest.maxBodyBytes) } catch (e) {
+      if (e.status === 413) return sendJson(res, 413, { status: 'invalid', reason: 'payload too large' }, { connection: 'close' })
+      throw e
+    }
+    let parsed
+    try { parsed = JSON.parse(raw) } catch { return sendJson(res, 400, { status: 'invalid', reason: 'body 不是合法 JSON' }) }
+    const v = validateIngestBody(parsed)
+    if (!v.ok) {
+      log.warn('ingest 请求校验失败', { actor: tok.name, reason: v.reason })
+      return sendJson(res, 400, { status: 'invalid', reason: v.reason })
+    }
+    const out = await runIngest({ config, identity: { tokenId: tok.tokenId, name: tok.name, ip }, llm, log, input: v.value })
+    return sendJson(res, out.http, out.body)
+  }
+
   const handle = async (req, res) => {
     const url = new URL(req.url, 'http://placeholder')
     const pathname = url.pathname
@@ -138,6 +191,7 @@ export async function startServer(config, { logger = getLogger(), scheduler = tr
       return sendJson(res, 200, { ok: true, version: SERVER_VERSION, bind: req.socket.localAddress })
     }
     if (admin.owns(pathname)) return admin.handle(req, res, url)
+    if (pathname === `${base}/api/ingest`) return handleIngest(req, res)
     if (pathname !== `${base}/mcp`) {
       // OAuth 发现/动态注册探测：客户端收到 401 后会去试这些路径，最后报"Dynamic Client Registration rejected (HTTP 404)"。
       // 本服务不做 OAuth（只认静态 Bearer 令牌），所以仍是 404，但把原因写进响应体——客户端会把响应体原样带进它的报错。
@@ -147,24 +201,9 @@ export async function startServer(config, { logger = getLogger(), scheduler = tr
       return sendJson(res, 404, { error: 'not found' })
     }
 
-    const origin = req.headers.origin
-    if (origin !== undefined && !originAllowed(String(origin))) {
-      log.warn('Origin 校验失败', { origin: String(origin).slice(0, 200) })
-      return sendJson(res, 403, { error: 'forbidden origin' })
-    }
-
-    const ip = clientIp(req, config)
-    if (limiter.blocked(ip)) {
-      log.warn('鉴权失败过多，已限流', { ip })
-      return sendJson(res, 429, { error: 'too many failed attempts' }, { 'retry-after': '60' })
-    }
-    const authHeader = String(req.headers.authorization || '').trim()
-    if (!authHeader || /^Bearer$/i.test(authHeader)) return challenge(res, ip, req.method)
-    const m = /^Bearer\s+(\S+)$/i.exec(authHeader)
-    if (!m) return denyAuth(res, ip, 'malformed-header')
-    const v = verifyToken(config.dbRoot, m[1])
-    if (!v.ok) return denyAuth(res, ip, v.reason)
-    const tok = v.token
+    const authed = authenticate(req, res)
+    if (!authed) return
+    const { tok, ip } = authed
 
     let parsed
     if (req.method === 'POST') {

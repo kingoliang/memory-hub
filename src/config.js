@@ -82,6 +82,20 @@ export function loadConfig(env = process.env, { warn = () => {} } = {}) {
   const apiKey = String(env.MEMORY_LLM_KEY ?? (fileKeyAllowed ? file.llm?.key : '') ?? '')
   const llm = baseUrl && model ? { baseUrl, model, apiKey } : null
 
+  // 会话文本摄入（POST {base}/api/ingest）闸门。均为非负整数；cooldownS=0 表示不设冷却。
+  const intOpt = (envName, fileVal, def, lo, hi) => {
+    const raw = env[envName] ?? fileVal ?? def
+    const n = Number(String(raw).trim())
+    if (!/^\d+$/.test(String(raw).trim()) || n < lo || n > hi) throw new ConfigError(`${envName} 必须是 ${lo}~${hi} 的整数：${raw}`)
+    return n
+  }
+  const ingest = {
+    minChars: intOpt('MEMORY_HUB_INGEST_MIN_CHARS', file.ingest?.minChars, 300, 60, 65536),
+    cooldownS: intOpt('MEMORY_HUB_INGEST_COOLDOWN_S', file.ingest?.cooldownS, 120, 0, 86400),
+    dailyQuota: intOpt('MEMORY_HUB_INGEST_DAILY_QUOTA', file.ingest?.dailyQuota, 200, 0, 100000),
+    maxBodyBytes: intOpt('MEMORY_HUB_INGEST_MAX_BODY_BYTES', file.ingest?.maxBodyBytes, 256 * 1024, 1024, 1024 * 1024),
+  }
+
   const instructions = typeof file.instructions === 'string' && file.instructions.trim() ? file.instructions : null
 
   return {
@@ -100,6 +114,7 @@ export function loadConfig(env = process.env, { warn = () => {} } = {}) {
     adminMaxBatch,
     adminReadOnly,
     trustProxy,
+    ingest,
     llm,
     instructions,
     logLevel: String(env.MEMORY_HUB_LOG_LEVEL ?? file.logLevel ?? 'info').toLowerCase(),

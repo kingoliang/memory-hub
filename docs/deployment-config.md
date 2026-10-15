@@ -20,3 +20,18 @@
 1. 确认 DeepSeek 的 base URL 与 key 的真实来源（用户提供，或在 58 上只读核实配置键位置——**不要打印 key 值**）。
 2. 把三个变量写入 58 上 systemd 单元的 0600 `EnvironmentFile`。
 3. 部署后用一条真实 `memory_capture` 验证走了蒸馏（返回里没有 `degraded:true`）。
+
+## 会话文本摄入（`POST {basePath}/api/ingest`）
+
+协议见 [ingest-api.md](ingest-api.md)。以下闸门均为非负整数，非法值启动即报错。环境变量优先于配置文件（`memory-hub.json` 的 `ingest.*`）。
+
+| 环境变量 | 配置文件键 | 默认 | 范围 | 含义 |
+|---|---|---|---|---|
+| `MEMORY_HUB_INGEST_MIN_CHARS` | `ingest.minChars` | `300` | 60~65536 | 剥噪声后的最小字数，不足 → `deferred too_short` |
+| `MEMORY_HUB_INGEST_COOLDOWN_S` | `ingest.cooldownS` | `120` | 0~86400 | 同 (令牌, session_id) 两次**实际处理**的最小间隔秒数；0 = 不设冷却 |
+| `MEMORY_HUB_INGEST_DAILY_QUOTA` | `ingest.dailyQuota` | `200` | 0~100000 | 每令牌滚动 24h 内实际处理（走过蒸馏）次数上限 |
+| `MEMORY_HUB_INGEST_MAX_BODY_BYTES` | `ingest.maxBodyBytes` | `262144`（256KB） | 1024~1048576 | 请求体上限，超出 → 413 |
+
+蒸馏沿用上文 `MEMORY_LLM_*`；去重沿用 `MEMORY_DEDUP_*`（阈值默认 0.62）；待审与否由库内 `auditMode` 决定。
+
+状态存储：冷却 / 配额 / 幂等记录在表 `ingest_log`，首次摄入时 `CREATE TABLE IF NOT EXISTS` 惰性创建（**不改 `user_version`**，旧版本代码打开该库不受影响；记录保留 7 天）。
