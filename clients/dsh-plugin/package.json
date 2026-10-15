@@ -1,0 +1,20 @@
+{
+  "name": "dsh-memory-hub-ingest",
+  "version": "0.1.0",
+  "private": true,
+  "description": "DSH (DeepSeek Harness) 插件：每轮对话结束把增量对话文本推给 memory-hub 的 POST /api/ingest",
+  "license": "MIT",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json"
+  },
+  "files": ["index.js", "lib", "README.md"],
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "test": "node --test --test-concurrency=1 \"tests/*.test.mjs\"",
+    "smoke": "node scripts/smoke.mjs"
+  },
+  "keywords": ["dsh", "dsh-plugin", "memory-hub"]
+}
