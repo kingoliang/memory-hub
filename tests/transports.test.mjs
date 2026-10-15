@@ -58,7 +58,8 @@ test('stdio 与 HTTP 下 recall / stats / audit_list 输出逐字一致，且格
       ]) {
         const a = text(await http.callTool({ name, arguments: args }))
         const b = text(await stdio.callTool({ name, arguments: args }))
-        assert.equal(a, b, `${name} ${JSON.stringify(args)}`)
+        // M3 修复 c：HTTP 对远程 Agent 隐藏服务器绝对路径（stdio 保持原样），其余逐字一致
+        assert.equal(a, b.split(h.home).join('<data-dir>'), `${name} ${JSON.stringify(args)}`)
       }
       // 与原版 mcp.js 的输出格式一致（见 memory-eternal-fork/lib/mcp.js callTool）
       const recall = text(await stdio.callTool({ name: 'memory_recall', arguments: { query: '数据库选型' } }))
