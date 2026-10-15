@@ -1,4 +1,4 @@
-# memory-hub 决策与 spike 记录（M1）
+# memory-hub 决策与 spike 记录（M1、M3）
 
 日期：2026-10-15。依据：`PLAN.md` 第 3、4、6、7、9 节 + 用户补充决策。
 
@@ -62,3 +62,38 @@ PLAN 列的四个未确认项，逐项结果（证据：`tests/e2e/mcp-both-eras
 
 ## 5. 真实库验证（只读）
 用 58 上 10-15 03:07 的每日备份快照（只读 scp 到本机临时目录，验证后已删除；未把任何卡片内容写入仓库/日志）：新代码打开后 `user_version` 0→1、`integrity_check=ok`、`cards=578 / quarantine=284 / card_sequence.seq=1853`（与快照一致）；38 条查询（30 条取自标题前缀 + 8 条手写，含 2 字中文、英文、无结果）旧/新 `search()` 的 `(path, score)` 序列逐位相同；`tidyPlan` / `tidyLint` 可运行。
+
+
+---
+
+# M3 决策与实测记录（2026-10-15）
+
+## M3-1 用户已拍板（本里程碑的前提）
+- **沉淀只靠 Agent 主动调用 MCP `memory_capture`，不做任何宿主 hook。** Mac 上现有的会话结束 hook 由用户在切换时自己移除；本项目不读取、不修改 `~/.claude/settings.json` 或任何用户全局配置。
+- **`tidy apply` 默认不暴露给 Agent**（`exposeTidyApply=false`），只在管理界面/CLI 可用。M3 的管理界面 apply 走独立的 `POST /admin/api/tidy/apply`，与 MCP 开关无关。
+- **蒸馏模型沿用 DeepSeek**，部署阶段配置（`docs/deployment-config.md`）；M3 不读不写任何 key。
+
+## M3-2 与 PLAN / 原任务的差异或新增（需要你知道的）
+- **schema v2**：`agent_tokens` 去掉整列 UNIQUE，改"仅未撤销令牌名唯一"，使已撤销令牌的名字可复用（原任务允许"风险可控就做迁移"）。迁移、兼容与回滚见 `docs/m3-admin.md`。风险评估：迁移在单事务内、旧代码仍可打开、令牌数据逐列拷贝并有测试；残留风险是复用名字后新旧令牌写的卡共用署名。
+- **新增 `MEMORY_HUB_ADMIN_READONLY` 开关**（原任务没有）：为"真实数据快照环境"防误点而加，默认关闭。
+- **"设置页"未做**（PLAN 5 节有，原任务 M3 范围没列）。
+- 管理接口新增 `POST /card/purge`（永久删除，要输入标题）——PLAN 5 节"软删/恢复/回收站"页的一部分，原任务清单未单列。
+- 整理回滚文件使用后改名 `.done`，只能用一次（避免用旧快照覆盖之后的新编辑）。
+- 先写红测试再实现：M3 写接口与修复项 a-d 的测试在 `13190bb` 提交时对旧代码失败；**只读保护开关与前端新增的静态检查是实现后补的测试**，不是红测试先行。
+
+## M3-3 真实客户端实测：401 / OAuth 发现（`claude -p` 2.1.295，共 6 次调用，已用完）
+环境：scratch 临时项目目录、`--mcp-config`（无 headers 的 HTTP 服务）+ `--strict-mcp-config`、临时数据目录、非默认端口（旧代码 7993 / 新代码 7994）、未改任何全局 Claude 配置。旧代码 = M2 提交 `454a181` 的 worktree。
+
+| | 旧代码（M2） | 新代码（M3） |
+|---|---|---|
+| 无令牌 401 的响应体 | `{"error":"unauthorized"}`（24 字节，**已带** `WWW-Authenticate: Bearer realm="memory-hub"`） | `{"error":"unauthorized","message":"需要 Bearer 令牌：…"}` + 同样的头 |
+| `claude -p` 的 MCP 状态（stream-json init） | `memhub: failed` | `memhub: failed`（相同） |
+| 客户端报错（`--debug mcp` 日志） | `Dynamic Client Registration rejected (HTTP 404): {"error":"not found"}` | **同样走 OAuth 动态注册**，实测报错仍是 `Dynamic Client Registration rejected (HTTP 404): {"error":"not found"}`（调用 6 次已用完，**之后加的"OAuth 探测路径 404 带原因说明"没有再用真实 claude 复测**；因为客户端会把响应体原样带进报错，预期报错会带上"本服务不支持 OAuth…请用静态 Bearer 令牌"，但这是推断，不是实测） |
+| 每次连接的无令牌请求数 | 2（服务日志 7 条"鉴权失败" = 3 次 claude + 1 次 curl 的 POST，每次 claude 连接 2 条） | 2（日志 7 条"已质询"），**全部不计入失败限流**，0 条"鉴权失败" |
+
+结论：
+- `WWW-Authenticate: Bearer realm=…` **无法改善** Claude Code 的行为：这个版本在 401 后无论如何都先做 OAuth 受保护资源发现，回落到把服务器自身当授权服务器并 `POST /register`，所以看到的仍是"Dynamic Client Registration rejected (HTTP 404)"。**没有为此实现 OAuth。** 实际可用的做法是在客户端配置里直接给 `Authorization: Bearer <令牌>` 头（带令牌时不走 OAuth）。
+- 确认了问题 b 的根因：一次连接 = 2 个无令牌请求（先探测版本协商、再按 legacy 重连），旧限流把它们都算失败。
+
+## M3-4 其它
+- 真实数据快照上的完整 plan→dry-run→apply→rollback（在临时副本上）：`IDENTICAL`，见 `tests/e2e/tidy-roundtrip-on-copy.mjs`；用户查看的 `~/memory-hub-dev` 数据在只读保护下，写请求被 403，指纹不变。
