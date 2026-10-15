@@ -356,7 +356,7 @@
 | Agent 令牌管理 | 列表（名称、scope、创建/最近使用/过期/吊销）、创建（明文只显示一次）、吊销、改 scope、按令牌看写入记录 | M3（API 在 M1 CLI 已有） |
 | 审计日志 | `write_log` 检索（按 Agent/动作/结果/时间） | M2 |
 | 设置 | 审核模式（auditMode：all/none）、免审 Agent/kind、去重阈值、回收站保留天数、`exposeTidyApply` 开关（只读展示 env 值，改需重启）、LLM 连接状态检测（只显示是否已配置，不显示 key） | M3 |
-| 知识图谱 | 沿用 `graph()` 数据；**不在首版范围**，待拍板 | M5 可选 |
+| 知识图谱 | 沿用 `graph()` 语义（卡片节点；[[链接]]/共享标签/正文相似边）；只读，`GET /admin/api/graph` + canvas 页面；见 `docs/m4-graph.md` | **M4 已实现** |
 
 管理 API 与上游路由的对应（便于参考，不沿用路径）：`/admin/api/{overview, cards, cards/:path(GET/PATCH/DELETE), cards/:path/restore, audit/{list,approve,reject}, recycle/{list,purge}, tags/*, tidy/{plan,apply,rollback,lint}, tokens/*, write-log, settings, backup}`；卡片以 **path** 为键（1.7 #5），不暴露 id。
 
@@ -544,7 +544,7 @@ memory-hub backup now && memory-hub backup restore <file> --dry-run      # 演�
 12. **召回增强。** 推荐首版不改算法、标签不参与（保对账）；FTS5 预筛放 M5。
 13. **是否新增 `memory_read`（按 path 取全文）。** 推荐新增（read scope）。
 14. **管理员认证。** 推荐单管理员口令（scrypt）+ 会话 cookie；不做多用户/OIDC/TOTP。
-15. **知识图谱页。** 推荐首版不做。
+15. **知识图谱页。** ~~推荐首版不做~~ → 已在 M4 实现（只读，见 `docs/m4-graph.md`）。
 16. **capture 遇到疑似明文密钥。** 推荐拒绝写入（只报类型），可配置为仅警告。
 17. **异机备份。** 推荐每日 rsync 到另一台 tailnet 机器；**需要你指定**目标机；58 是否已有机器级备份 **[未确认]**。
 18. **其它客户端/设备。** 本阶段只核实了 Mac 与 58 的客户端配置；**请确认**还有没有别的机器/设备/程序在连旧 MCP（尤其是 `~/.config/mcp/mcp.json` 的读取方）。

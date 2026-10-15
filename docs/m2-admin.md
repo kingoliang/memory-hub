@@ -24,6 +24,7 @@ memory-hub serve                             # 默认 127.0.0.1:7990
 ## API（均需会话 cookie；`GET`，除注明）
 | 路径 | 说明 |
 |---|---|
+| `GET /admin/api/graph`（M4） | 知识图谱数据（只读，不含正文），见 `docs/m4-graph.md` |
 | `POST /admin/api/login` / `POST /logout`(CSRF) / `GET /session` | 认证；未登录一律 401，body 带 `passwordSet` |
 | `/overview` | 总数、kind 分布、隔离区、30 天曲线、vault/备份、署名分布、最近日志、告警 |
 | `/facets` | kind / 署名 / 来源 / 状态 / 标签的可选值与计数 |

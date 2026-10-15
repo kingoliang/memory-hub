@@ -12,6 +12,7 @@ import {
   cleanupSessions, csrfValid, parseCookies,
 } from './auth.js'
 import * as Q from './queries.js'
+import * as G from './graph.js'
 import { writeLog } from '../core/writelog.js'
 import { HttpError } from './errors.js'
 import * as Ops from './ops.js'
@@ -162,6 +163,30 @@ export function createAdminHandler({ config, log }) {
       const d = Q.cardDetail(root, p)
       if (!d) throw new HttpError(404, 'not_found', '卡片不存在')
       return d
+    },
+    'GET /graph': (ctx) => {
+      // 只读（GET）：即使 MEMORY_HUB_ADMIN_READONLY=1 也可访问；节点不含正文/摘要，详情走 GET /card
+      const u = ctx.url
+      enumParam(u, 'status', ['approved'], 'approved') // 图只含主库（approved）卡；隔离区/回收站不入图
+      const types = strParam(u, 'types', 100).split(',').map((t) => t.trim()).filter(Boolean)
+      for (const t of types) if (!G.EDGE_TYPES.includes(t)) throw new HttpError(400, 'bad_request', `types 只能是：${G.EDGE_TYPES.join(' / ')}`)
+      const hi = P(u).get('hide_isolated')
+      if (hi !== null && !['', '0', '1'].includes(hi)) throw new HttpError(400, 'bad_request', 'hide_isolated 只能是 0 或 1')
+      try {
+        return G.graphQuery(root, {
+          kind: strParam(u, 'kind', 50),
+          tags: strParam(u, 'tag', 500).split(',').map((t) => t.trim()).filter(Boolean),
+          types,
+          minWeight: intParam(u, 'min_weight', { def: 1, min: 1, max: 20 }),
+          focus: strParam(u, 'focus', 500),
+          depth: intParam(u, 'depth', { def: 1, min: 1, max: 3 }),
+          hideIsolated: hi === '1',
+          limit: intParam(u, 'limit', { def: G.GRAPH_DEFAULT_LIMIT, min: 1, max: G.GRAPH_MAX_LIMIT, clamp: true }),
+        })
+      } catch (e) {
+        if (e instanceof G.GraphNotFound) throw new HttpError(404, 'not_found', e.message)
+        throw e
+      }
     },
     'GET /queue': (ctx) => Q.queuePage(root, { ...paging(ctx.url, 50), status: enumParam(ctx.url, 'status', ['pending', 'rejected', 'all'], 'all') }),
     'GET /recycle': (ctx) => Q.recyclePage(root, paging(ctx.url, 50)),
