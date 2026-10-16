@@ -1,0 +1,10 @@
+/* 知识图谱页：画布恒为深色霓虹（与全站 Swiss 主题无关，浅色主题下也保持深色）。画布外的页头 / 面板 / 工具栏仍用全站主题。 */
+.graph-layout .graph-stage { background-color: #05060a; background-image: radial-gradient(ellipse at 50% 42%, #0a0d16 0%, #05060a 72%); border-color: #1a2030; }
+.graph-layout .graph-canvas:focus-visible { outline-color: #2ee6ff; }
+.graph-stage .graph-zoom { background: rgba(8, 10, 18, .8); border-color: rgba(255, 255, 255, .16); box-shadow: none; backdrop-filter: blur(4px); }
+.graph-stage .graph-zbtn { color: #cfd6e6; border-bottom-color: rgba(255, 255, 255, .1); }
+.graph-stage .graph-zbtn:hover { background: rgba(255, 255, 255, .09); color: #fff; }
+.graph-stage .graph-tip { background: rgba(8, 10, 18, .94); color: #e6ebf6; border: 1px solid rgba(255, 255, 255, .18); font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; box-shadow: none; }
+/* 图例 / 侧栏里的簇色点：霓虹色在浅底上加一圈暗描边保证可见 */
+.graph-controls .gdot, .graph-side .gdot, .graph-nodelist .gdot { box-shadow: 0 0 0 1px rgba(5, 6, 10, .55); }
+@media (prefers-reduced-motion: reduce) { .graph-stage .graph-zbtn { transition: none; } }

@@ -1,5 +1,7 @@
-// 知识图谱（M4，只读）：canvas 力导向图。节点 = 主库卡片，颜色 = kind，大小 = 度数；边 = [[链接]] / 共享标签 / 内容相似。
+// 知识图谱（M4，只读）：暗色霓虹簇云风格的 canvas 力导向图。
+// 簇 = 卡片 kind（= 主库顶级目录）；每簇一个霓虹主题色，簇内细密半透明纤维线，簇间留白；节点为细小的点，枢纽带发光。
 // 数据来自 GET /admin/api/graph（不含正文）；点击节点后才请求现有卡片详情接口取摘要。
+// 交互：点节点 → 向邻居辐射点状虚线 + 邻居小矩形标签、其余变暗；点簇名/簇 → 相机缓动飞到该簇、其余变暗；点空白恢复。
 // URL 哈希参数：focus=<card path> 邻域模式、tag、kind、limit。
 
 import { h } from '../dom.js'
@@ -7,13 +9,155 @@ import { get } from '../api.js'
 import { kindLabel, fmtNum, fmtDate } from '../format.js'
 import { panel, notice, empty, kindBadge, tagChip, icon, pageHead } from '../ui.js'
 import {
-  EDGE_LABEL, kindColor, nodeRadius, filterGraph, searchMatches, adjacency, tagCounts,
-  createLayout, stepLayout, runLayout, LAYOUT_DONE, fitView, screenToWorld, zoomAt, hitTest, topLabelIds, clampZoom,
+  EDGE_LABEL, searchMatches, adjacency, tagCounts,
+  createLayout, LAYOUT_DONE, fitView, screenToWorld, zoomAt, hitTest, topLabelIds, clampZoom, filterGraph,
 } from '../graph-core.js'
 
 const LIMITS = [200, 500, 800, 1500, 2000]
 const DEFAULT_LIMIT = 800
 const KIND_ORDER = ['project', 'knowledge', 'content', 'prompt', 'business', 'tool', 'mistake']
+/** 簇主题色（霓虹：青 / 紫 / 黄 / 品红 / 橙 / 薄荷 / 红）。画布恒为深色，与全站主题无关。 */
+const NEON = { project: '#2ee6ff', knowledge: '#b47bff', content: '#ffd23f', prompt: '#ff4fd8', business: '#ff8a2b', tool: '#3dffb0', mistake: '#ff4d5e', other: '#8b93a7' }
+const neon = (k) => NEON[k] || NEON.other
+const BG = '#05060a'
+const MONO = 'ui-monospace, "SF Mono", Menlo, Consolas, "Noto Sans Mono CJK SC", monospace'
+
+const hex = (c) => [parseInt(c.slice(1, 3), 16), parseInt(c.slice(3, 5), 16), parseInt(c.slice(5, 7), 16)]
+const rgba = (c, a) => { const [r, g, b] = hex(c); return `rgba(${r},${g},${b},${a})` }
+const mixWhite = (c, t) => { const [r, g, b] = hex(c); const m = (v) => Math.round(v + (255 - v) * t); return `rgb(${m(r)},${m(g)},${m(b)})` }
+const easeInOut = (p) => (p < 0.5 ? 4 * p * p * p : 1 - Math.pow(-2 * p + 2, 3) / 2)
+
+// 发光精灵：径向渐变一次性预渲染，之后只 drawImage（几千节点也不逐点 shadowBlur）
+const spriteCache = new Map()
+function glowSprite(color, size = 64) {
+  const key = color + size
+  let c = spriteCache.get(key)
+  if (c) return c
+  c = typeof OffscreenCanvas === 'function' ? new OffscreenCanvas(size, size) : Object.assign(document.createElement('canvas'), { width: size, height: size })
+  const g = c.getContext('2d')
+  const gr = g.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2)
+  gr.addColorStop(0, rgba(color, 0.95)); gr.addColorStop(0.18, rgba(color, 0.55)); gr.addColorStop(0.5, rgba(color, 0.16)); gr.addColorStop(1, rgba(color, 0))
+  g.fillStyle = gr; g.fillRect(0, 0, size, size)
+  spriteCache.set(key, c)
+  return c
+}
+
+// ---------------------------------------------------------------------------
+// 簇布局：簇中心确定性打包（互不重叠 + 留白），簇内力导向（网格近邻斥力 + 弹簧 + 向簇心的引力）。O(n·k)，几千节点可跑。
+// ---------------------------------------------------------------------------
+function buildClusters(nodes) {
+  const by = new Map()
+  nodes.forEach((n, i) => { const k = n.kind || 'other'; if (!by.has(k)) by.set(k, []); by.get(k).push(i) })
+  const rank = (k) => { const i = KIND_ORDER.indexOf(k); return i < 0 ? 99 : i }
+  const cls = [...by.entries()].map(([key, idxs]) => ({ key, idxs, n: idxs.length, color: neon(key), tint: mixWhite(neon(key), 0.72), R: 13 * Math.sqrt(idxs.length) + 30, cx: 0, cy: 0, r: 40, hx: 0, hy: 0, dim: 1 }))
+    .sort((a, b) => b.n - a.n || rank(a.key) - rank(b.key))
+  const placed = []
+  cls.forEach((c, ci) => {
+    if (!placed.length) { c.hx = 0; c.hy = 0 } else {
+      search: for (let rho = 40; ; rho += 30) {
+        const steps = 28
+        for (let s = 0; s < steps; s++) {
+          const a = ((s + ci * 0.37) / steps) * Math.PI * 2
+          const x = Math.cos(a) * rho
+          const y = Math.sin(a) * rho * 0.82
+          if (placed.every((p) => Math.hypot(p.hx - x, p.hy - y) >= p.R + c.R + 70)) { c.hx = x; c.hy = y; break search }
+        }
+      }
+    }
+    placed.push(c)
+  })
+  return cls
+}
+
+let gridHead = new Int32Array(0)
+function stepClusters(L, alpha = L.alpha) {
+  const nodes = L.nodes
+  const N = nodes.length
+  let x0 = Infinity; let y0 = Infinity; let x1 = -Infinity; let y1 = -Infinity
+  for (let i = 0; i < N; i++) { const a = nodes[i]; if (a.x < x0) x0 = a.x; if (a.x > x1) x1 = a.x; if (a.y < y0) y0 = a.y; if (a.y > y1) y1 = a.y }
+  const CELL = Math.max(34, Math.sqrt(((x1 - x0) * (y1 - y0)) / 160000))
+  const gw = Math.floor((x1 - x0) / CELL) + 1
+  const gh = Math.floor((y1 - y0) / CELL) + 1
+  if (gridHead.length < gw * gh) gridHead = new Int32Array(gw * gh)
+  const head = gridHead
+  head.fill(-1, 0, gw * gh)
+  const next = new Int32Array(N)
+  const cellOf = new Int32Array(N)
+  for (let i = 0; i < N; i++) {
+    const a = nodes[i]
+    const c = Math.floor((a.y - y0) / CELL) * gw + Math.floor((a.x - x0) / CELL)
+    cellOf[i] = c; next[i] = head[c]; head[c] = i
+  }
+  const C2 = CELL * CELL
+  const REP = 1500 * alpha
+  for (let i = 0; i < N; i++) {
+    const a = nodes[i]
+    const cx = cellOf[i] % gw
+    const cy = (cellOf[i] / gw) | 0
+    for (let yy = Math.max(0, cy - 1); yy <= Math.min(gh - 1, cy + 1); yy++) {
+      for (let xx = Math.max(0, cx - 1); xx <= Math.min(gw - 1, cx + 1); xx++) {
+        for (let j = head[yy * gw + xx]; j >= 0; j = next[j]) {
+          if (j <= i) continue
+          const b = nodes[j]
+          let dx = a.x - b.x
+          let dy = a.y - b.y
+          let d2 = dx * dx + dy * dy
+          if (d2 >= C2) continue
+          if (d2 < 0.01) { dx = ((i + j) % 2 ? 1 : -1) * 0.1; dy = 0.1; d2 = 0.02 }
+          const f = REP / (d2 + 30)
+          const d = Math.sqrt(d2)
+          const fx = (dx / d) * f; const fy = (dy / d) * f
+          a.vx += fx; a.vy += fy; b.vx -= fx; b.vy -= fy
+        }
+      }
+    }
+  }
+  for (const l of L.links) {
+    const a = nodes[l.a]; const b = nodes[l.b]
+    const dx = b.x - a.x; const dy = b.y - a.y
+    const d = Math.sqrt(dx * dx + dy * dy) || 0.01
+    const same = a.c === b.c
+    const f = same ? (d - 30) * 0.04 * alpha : (d - 200) * 0.0008 * alpha
+    const fx = (dx / d) * f; const fy = (dy / d) * f
+    a.vx += fx; a.vy += fy; b.vx -= fx; b.vy -= fy
+  }
+  for (let i = 0; i < N; i++) {
+    const a = nodes[i]
+    const c = a.c
+    const dx = c.hx - a.x; const dy = c.hy - a.y
+    const d = Math.sqrt(dx * dx + dy * dy) || 0.01
+    const over = Math.max(0, d - c.R) / d
+    const k = (0.012 + over * 0.2) * alpha * 4
+    a.vx += dx * k; a.vy += dy * k
+    if (a.fixed) { a.vx = 0; a.vy = 0; continue }
+    a.vx *= 0.8; a.vy *= 0.8
+    const sp = Math.hypot(a.vx, a.vy)
+    if (sp > 24) { a.vx = (a.vx / sp) * 24; a.vy = (a.vy / sp) * 24 }
+    a.x += a.vx; a.y += a.vy
+  }
+  L.alpha = Math.max(0, alpha * 0.985 - 0.0005)
+  return L.alpha
+}
+
+/** 簇的质心 / 区域半径 / 视图框（按均值±2.2σ 截断，避免个别游离点把框撑大）。 */
+function recomputeClusters(L) {
+  for (const c of L.cl) {
+    let sx = 0; let sy = 0
+    for (const i of c.idxs) { sx += L.nodes[i].x; sy += L.nodes[i].y }
+    const m = c.idxs.length || 1
+    c.cx = sx / m; c.cy = sy / m
+    let vx = 0; let vy = 0; let x0 = Infinity; let y0 = Infinity; let x1 = -Infinity; let y1 = -Infinity
+    for (const i of c.idxs) {
+      const n = L.nodes[i]
+      vx += (n.x - c.cx) ** 2; vy += (n.y - c.cy) ** 2
+      if (n.x < x0) x0 = n.x; if (n.x > x1) x1 = n.x; if (n.y < y0) y0 = n.y; if (n.y > y1) y1 = n.y
+    }
+    const sdx = Math.sqrt(vx / m); const sdy = Math.sqrt(vy / m)
+    c.bx0 = Math.max(x0, c.cx - 2.2 * sdx); c.bx1 = Math.min(x1, c.cx + 2.2 * sdx)
+    c.by0 = Math.max(y0, c.cy - 2.2 * sdy); c.by1 = Math.min(y1, c.cy + 2.2 * sdy)
+    c.r = Math.max(36, Math.hypot(sdx, sdy) * 1.55)
+  }
+}
 
 export default async function render(ctx) {
   const p = ctx.params
@@ -36,7 +180,7 @@ export default async function render(ctx) {
   }
 
   // ---------- 状态 ----------
-  const canvas = h('canvas', { class: 'graph-canvas', role: 'img', 'aria-label': `知识图谱画布（${fmtNum(data.stats.nodes)} 个节点；键盘：+ 放大，- 缩小，0 适应窗口，Esc 取消选中；也可用下方节点列表）`, tabindex: '0' })
+  const canvas = h('canvas', { class: 'graph-canvas', role: 'img', 'aria-label': `知识图谱画布（${fmtNum(data.stats.nodes)} 个节点，按类型分簇；点击节点或簇名聚焦；键盘：+ 放大，- 缩小，0 适应窗口，Esc 取消选中；也可用下方节点列表）`, tabindex: '0' })
   const tip = h('div', { class: 'graph-tip', hidden: true, role: 'tooltip' })
   const stage = h('div', { class: 'graph-stage' }, [canvas, tip])
   const side = h('aside', { class: 'graph-side', 'aria-live': 'polite' })
@@ -44,12 +188,14 @@ export default async function render(ctx) {
   const legendEl = h('div', { class: 'graph-legend' })
 
   let view = { zoom: 1, panX: 0, panY: 0 }
-  let L = null // 布局
+  let L = null // 布局（nodes 与 shown.nodes 下标对齐；L.cl = 簇）
   let shown = { nodes: [], edges: [] }
   let adj = new Map()
   let maxDeg = 1
+  let hubDeg = 3
   let matches = null
   let selected = ''
+  let focusCluster = '' // 被聚焦的簇 key
   let hover = -1
   let labelIds = new Set()
   let dirty = true
@@ -57,17 +203,11 @@ export default async function render(ctx) {
   let fitted = false
   let w = 0
   let hgt = 0
-  let colors = null
-
-  const readColors = () => {
-    const cs = getComputedStyle(document.documentElement)
-    const v = (n, d) => cs.getPropertyValue(n).trim() || d
-    colors = { text: v('--text', '#222'), muted: v('--muted', '#666'), line: v('--line-strong', '#ccc'), accent: v('--accent', '#2457d6'), surface: v('--surface', '#fff'), edge: v('--graph-edge', '#8a97ab'), link: v('--graph-link', '#2457d6') }
-  }
-  const mq = typeof matchMedia === 'function' ? matchMedia('(prefers-color-scheme: dark)') : null
-  const onScheme = () => { colors = null; dirty = true; kick() }
-  mq?.addEventListener?.('change', onScheme)
-  globalThis.addEventListener?.('mh-theme', onScheme) // 手动切换主题（theme.js 派发）
+  let tween = null
+  let labelRects = [] // 上一帧簇名的屏幕矩形（命中用）
+  const reduced = typeof matchMedia === 'function' && matchMedia('(prefers-reduced-motion: reduce)').matches
+  const perf = { frames: 0, last: 0, sum: 0, max: 0 }
+  const clusterOf = (key) => L?.cl.find((c) => c.key === key)
 
   // ---------- 过滤 / 重建布局 ----------
   function rebuild({ keepPositions = true, refit = false } = {}) {
@@ -75,15 +215,28 @@ export default async function render(ctx) {
     shown = filterGraph(data, { kinds: st.kinds, tag: st.tag, minWeight: st.minWeight, types: st.types, hideIsolated: st.hideIsolated })
     adj = adjacency(shown.edges)
     maxDeg = Math.max(1, ...shown.nodes.map((n) => n.degree))
+    const sorted = shown.nodes.map((n) => n.degree).sort((a, b) => b - a)
+    hubDeg = Math.max(3, sorted[Math.floor(sorted.length * 0.04)] || 0) // 前 ~4% 且至少 3 条关联的算枢纽（带发光）
     L = createLayout(shown.nodes, shown.edges, { prev })
+    L.cl = buildClusters(shown.nodes)
+    for (const c of L.cl) {
+      c.dim = 1
+      c.idxs.forEach((i, k) => {
+        const n = L.nodes[i]
+        n.c = c
+        if (!prev) { const a = k * 2.399963229728653; const rr = (c.R / Math.sqrt(c.n)) * 0.9 * Math.sqrt(k + 1); n.x = c.hx + Math.cos(a) * rr; n.y = c.hy + Math.sin(a) * rr }
+      })
+    }
+    if (focusCluster && !clusterOf(focusCluster)) focusCluster = ''
     if (prev) L.alpha = 0.5
-    else runLayout(L, 260) // 首次：预热后再展示，避免一开始满屏乱跳
+    else { for (let i = 0; i < 260 && L.alpha > LAYOUT_DONE; i++) stepClusters(L) } // 首次：预热后再展示，避免一开始满屏乱跳
     L.alpha = Math.max(L.alpha, prev ? 0.5 : 0.25)
+    recomputeClusters(L)
     labelIds = topLabelIds(shown.nodes, shown.nodes.length <= 60 ? shown.nodes.length : 24)
     if (selected && !L.idx.has(selected)) { selected = ''; renderSide() }
     updateMatches()
     renderNodeList()
-    countEl.textContent = `显示 ${fmtNum(shown.nodes.length)} 个节点 · ${fmtNum(shown.edges.length)} 条边` + (shown.nodes.length !== data.stats.nodes ? `（已过滤，共 ${fmtNum(data.stats.nodes)}）` : '')
+    countEl.textContent = `显示 ${fmtNum(shown.nodes.length)} 个节点 · ${fmtNum(shown.edges.length)} 条边 · ${L.cl.length} 个簇` + (shown.nodes.length !== data.stats.nodes ? `（已过滤，共 ${fmtNum(data.stats.nodes)}）` : '')
     if (refit || !fitted) { fitNow() }
     dirty = true
     kick()
@@ -92,6 +245,7 @@ export default async function render(ctx) {
     if (!w || !hgt || !L) return
     view = fitView(L.nodes, w, hgt)
     fitted = true
+    tween = null
     dirty = true
   }
   function updateMatches() {
@@ -99,120 +253,333 @@ export default async function render(ctx) {
     dirty = true
   }
 
-  // ---------- 绘制 ----------
-  // 缩放补偿：ctx 按 zoom 放大世界坐标，节点/描边/标签若按世界单位绘制会随缩放等比暴涨。
-  // 节点屏幕半径 = 基础半径 × zoom^NODE_ZOOM_EXP（缓增），世界半径 = 屏幕半径 / zoom；描边/连线/标签字号按 1/zoom 保持屏幕恒定。
-  const NODE_ZOOM_EXP = 0.2
-  const radiusOf = (n) => nodeRadius(n.degree, maxDeg) * Math.pow(view.zoom, NODE_ZOOM_EXP - 1)
-  function draw() {
-    const ctx2 = canvas.getContext('2d')
-    if (!ctx2 || !L) return
-    if (!colors) readColors()
-    const dpr = Math.max(1, globalThis.devicePixelRatio || 1)
-    ctx2.setTransform(dpr, 0, 0, dpr, 0, 0)
-    ctx2.clearRect(0, 0, w, hgt)
-    ctx2.save()
-    ctx2.translate(view.panX, view.panY)
-    ctx2.scale(view.zoom, view.zoom)
-    const nodes = L.nodes
-    const focusId = hover >= 0 ? nodes[hover]?.id : selected
-    const nbrs = focusId ? adj.get(focusId) : null
-    const dense = nodes.length > 80
-    // 边
-    for (const l of L.links) {
-      const a = nodes[l.a]
-      const b = nodes[l.b]
-      const touch = focusId && (a.id === focusId || b.id === focusId)
-      const dim = (focusId && !touch) || (matches && !(matches.has(a.id) || matches.has(b.id)))
-      ctx2.globalAlpha = touch ? 0.95 : dim ? 0.05 : l.type === 'link' ? (dense ? 0.5 : 0.7) : dense ? 0.22 : 0.4
-      ctx2.strokeStyle = touch ? colors.accent : l.type === 'link' ? colors.link : colors.edge
-      ctx2.lineWidth = (touch ? 1.8 : l.type === 'link' ? 1.6 : 0.9) / view.zoom
-      ctx2.setLineDash(l.type === 'similar' ? [5 / view.zoom, 4 / view.zoom] : l.type === 'tag' ? [] : [])
-      ctx2.beginPath(); ctx2.moveTo(a.x, a.y); ctx2.lineTo(b.x, b.y); ctx2.stroke()
-    }
-    ctx2.setLineDash([])
-    // 节点
-    for (let i = 0; i < nodes.length; i++) {
-      const n = nodes[i]
-      const r = radiusOf(n)
-      const isSel = n.id === selected
-      const isNb = !!nbrs && nbrs.has(n.id)
-      const hit = !matches || matches.has(n.id)
-      const faded = (focusId && n.id !== focusId && !isNb) || !hit
-      ctx2.globalAlpha = faded ? 0.14 : 1
-      ctx2.fillStyle = kindColor(n.kind)
-      ctx2.beginPath(); ctx2.arc(n.x, n.y, r, 0, Math.PI * 2); ctx2.fill()
-      ctx2.lineWidth = 1.4 / view.zoom // 与背景同色的细环：相邻节点不糊成一团
-      ctx2.strokeStyle = colors.surface
-      ctx2.stroke()
-      if (isSel || i === hover || (matches && hit)) {
-        if (isSel) { ctx2.save(); ctx2.globalAlpha = 0.22; ctx2.fillStyle = colors.accent; ctx2.beginPath(); ctx2.arc(n.x, n.y, r + 6 / view.zoom, 0, Math.PI * 2); ctx2.fill(); ctx2.restore() }
-        ctx2.lineWidth = 2.4 / view.zoom
-        ctx2.strokeStyle = isSel ? colors.text : colors.accent
-        ctx2.beginPath(); ctx2.arc(n.x, n.y, r, 0, Math.PI * 2); ctx2.stroke()
-      }
-    }
-    // 标签：特殊节点（选中/悬停/邻居/搜索命中）优先，其余按关联数从高到低；与已放置标签重叠的普通标签直接跳过，避免挤成一团
-    ctx2.globalAlpha = 1
-    const fs = 12 / view.zoom
-    ctx2.font = `${fs}px system-ui, sans-serif`
-    ctx2.textAlign = 'center'
-    ctx2.textBaseline = 'top'
-    const showAll = view.zoom > 3
-    const cand = []
-    for (let i = 0; i < nodes.length; i++) {
-      const n = nodes[i]
-      const special = n.id === selected || i === hover || (nbrs && nbrs.has(n.id)) || (matches && matches.has(n.id))
-      if (special || labelIds.has(n.id) || showAll) cand.push({ i, special: !!special, deg: shown.nodes[i]?.degree || 0 })
-    }
-    cand.sort((a, b) => (b.special - a.special) || (b.deg - a.deg))
-    const placed = []
-    const clash = (b) => placed.some((o) => b.x < o.x + o.w && b.x + b.w > o.x && b.y < o.y + o.h && b.y + b.h > o.y)
-    let budget = 220
-    for (const c of cand) {
-      if (budget <= 0) break
-      const n = nodes[c.i]
-      const t = shown.nodes[c.i]?.title || n.id
-      const txt = t.length > 18 ? t.slice(0, 17) + '…' : t
-      const y = n.y + radiusOf(n) + 2
-      const wd = ctx2.measureText(txt).width
-      const box = { x: n.x - wd / 2 - 2, y, w: wd + 4, h: fs * 1.25 }
-      if (!c.special && clash(box)) continue
-      placed.push(box)
-      ctx2.lineWidth = 3 / view.zoom
-      ctx2.strokeStyle = colors.surface
-      ctx2.globalAlpha = c.special ? 1 : 0.9
-      ctx2.strokeText(txt, n.x, y)
-      ctx2.fillStyle = colors.text
-      ctx2.fillText(txt, n.x, y)
-      budget--
-    }
-    ctx2.restore()
-    ctx2.globalAlpha = 1
+  // ---------- 相机 ----------
+  function flyTo(cx, cy, zoom, dur = 650) {
+    const z1 = clampZoom(zoom)
+    if (reduced || !w) { view = { zoom: z1, panX: w / 2 - cx * z1, panY: hgt / 2 - cy * z1 }; tween = null; dirty = true; kick(); return }
+    const c0 = screenToWorld(view, w / 2, hgt / 2)
+    tween = { t0: performance.now(), dur, z0: view.zoom, z1, x0: c0.x, y0: c0.y, x1: cx, y1: cy }
+    userMoved = true
+    kick()
+  }
+  function flyToCluster(c) {
+    const bw = Math.max(80, c.bx1 - c.bx0) + 120
+    const bh = Math.max(80, c.by1 - c.by0) + 120
+    flyTo((c.bx0 + c.bx1) / 2, (c.by0 + c.by1) / 2, Math.min(w / bw, hgt / bh, 3.5))
   }
 
+  // ---------- 绘制 ----------
+  // 缩放补偿：节点屏幕半径 = 基础半径 × zoom^NODE_ZOOM_EXP（缓增），世界半径 = 屏幕半径 / zoom；连线宽/标签字号按屏幕像素恒定（commit 1496dda 的行为）。
+  const NODE_ZOOM_EXP = 0.2
+  const baseR = (n) => 0.8 + 1.5 * Math.sqrt(n.degree / maxDeg) // 屏幕像素：细小的点，度数越高略大
+  const radiusOf = (n) => Math.max(0.7, baseR(n) * Math.pow(view.zoom, NODE_ZOOM_EXP)) / view.zoom
+  const hubOf = (i) => shown.nodes[i].degree >= hubDeg
+
+  const tagText = (n) => { const t = n.title || n.id; return (t.length > 20 ? t.slice(0, 19) + '…' : t) + ' · ' + kindLabel(n.kind) }
+
+  function draw() {
+    const t0 = performance.now()
+    const g = canvas.getContext('2d')
+    if (!g || !L) return
+    const dpr = Math.max(1, globalThis.devicePixelRatio || 1)
+    g.setTransform(dpr, 0, 0, dpr, 0, 0)
+    g.globalAlpha = 1
+    g.globalCompositeOperation = 'source-over'
+    g.fillStyle = BG
+    g.fillRect(0, 0, w, hgt)
+    const nodes = L.nodes
+    const z = view.zoom
+    const sx = (x) => x * z + view.panX
+    const sy = (y) => y * z + view.panY
+    const now = t0 / 1000
+    const selI = selected ? L.idx.get(selected) : undefined
+    const selN = selI === undefined ? null : nodes[selI]
+    const nbrs = selected ? adj.get(selected) : null
+    const hoverN = hover >= 0 ? nodes[hover] : null
+    const hoverNb = hoverN && !selected ? adj.get(hoverN.id) : null
+    const x0 = -view.panX / z - 40 / z; const x1 = (w - view.panX) / z + 40 / z
+    const y0 = -view.panY / z - 40 / z; const y1 = (hgt - view.panY) / z + 40 / z
+
+    // 簇星云：每簇一团很淡的彩色光晕，给“云”的体积感
+    g.globalCompositeOperation = 'lighter'
+    for (const c of L.cl) {
+      const rr = c.r * z * 1.7
+      if (sx(c.cx) + rr < 0 || sx(c.cx) - rr > w || sy(c.cy) + rr < 0 || sy(c.cy) - rr > hgt) continue
+      g.globalAlpha = 0.11 * c.dim
+      g.drawImage(glowSprite(c.color, 128), sx(c.cx) - rr, sy(c.cy) - rr, rr * 2, rr * 2)
+    }
+
+    // 世界坐标系：边与点（批量成一条 path，一次 stroke/fill）
+    g.save()
+    g.translate(view.panX, view.panY)
+    g.scale(z, z)
+    g.lineCap = 'butt'
+    const buckets = new Map() // `${簇key}|${link?}` → 路径
+    const bucket = (key, c, kind) => { let b = buckets.get(key); if (!b) { b = { c, kind, path: new Path2D() }; buckets.set(key, b) } return b.path }
+    for (const l of L.links) {
+      const a = nodes[l.a]; const b = nodes[l.b]
+      if ((a.x < x0 && b.x < x0) || (a.x > x1 && b.x > x1) || (a.y < y0 && b.y < y0) || (a.y > y1 && b.y > y1)) continue
+      const same = a.c === b.c
+      const path = same ? bucket(a.c.key + (l.type === 'link' ? '|L' : '|T'), a.c, l.type === 'link' ? 'link' : 'fiber') : bucket('x', null, 'cross')
+      path.moveTo(a.x, a.y); path.lineTo(b.x, b.y)
+    }
+    for (const b of buckets.values()) {
+      if (b.kind === 'cross') { g.globalAlpha = 0.035 * (focusCluster || selected ? 0.4 : 1); g.strokeStyle = '#9aa6c0'; g.lineWidth = 0.7 / z }
+      else if (b.kind === 'link') { g.globalAlpha = 0.34 * b.c.dim; g.strokeStyle = b.c.color; g.lineWidth = 1 / z }
+      else { g.globalAlpha = 0.15 * b.c.dim; g.strokeStyle = b.c.color; g.lineWidth = 0.6 / z }
+      g.stroke(b.path)
+    }
+    // 悬停：被悬停节点的邻边提亮（实线、细）
+    if (hoverN && !selected) {
+      g.globalAlpha = 0.8; g.lineWidth = 1 / z; g.strokeStyle = hoverN.c.color
+      g.beginPath()
+      for (const l of L.links) { const a = nodes[l.a]; const b = nodes[l.b]; if (a === hoverN || b === hoverN) { g.moveTo(a.x, a.y); g.lineTo(b.x, b.y) } }
+      g.stroke()
+    }
+    // 点：每簇一批（普通点 = 偏白的簇色小点；被搜索排除的点更暗）
+    g.globalCompositeOperation = 'source-over'
+    const rr = (n) => radiusOf(n)
+    for (const c of L.cl) {
+      const dimPath = new Path2D(); const litPath = new Path2D()
+      let nl = 0; let nd = 0
+      for (const i of c.idxs) {
+        const n = nodes[i]
+        if (n.x < x0 || n.x > x1 || n.y < y0 || n.y > y1) continue
+        if (hubOf(i)) continue // 枢纽走发光精灵
+        const lit = !matches || matches.has(n.id)
+        const r = rr(n)
+        const path = lit ? litPath : dimPath
+        path.moveTo(n.x + r, n.y); path.arc(n.x, n.y, r, 0, Math.PI * 2)
+        if (lit) nl++; else nd++
+      }
+      g.fillStyle = c.tint
+      if (nl) { g.globalAlpha = (matches ? 0.95 : 0.8) * Math.max(c.dim, 0.14); g.fill(litPath) }
+      if (nd) { g.globalAlpha = 0.12 * c.dim; g.fill(dimPath) }
+    }
+    g.restore()
+
+    // 屏幕坐标系：发光枢纽、选中/邻居、标签
+    g.globalAlpha = 1
+    const placed = []
+    const clash = (b) => placed.some((o) => b.x < o.x + o.w && b.x + b.w > o.x && b.y < o.y + o.h && b.y + b.h > o.y)
+    const onScreen = (px, py, m = 8) => px > -m && px < w + m && py > -m && py < hgt + m
+    const sr = (n) => Math.max(0.7, baseR(n) * Math.pow(z, NODE_ZOOM_EXP))
+    g.globalCompositeOperation = 'lighter'
+    let glows = 0
+    for (let i = 0; i < nodes.length && glows < 400; i++) {
+      if (!hubOf(i)) continue
+      const n = nodes[i]
+      const px = sx(n.x); const py = sy(n.y)
+      if (!onScreen(px, py, 20)) continue
+      const lit = !matches || matches.has(n.id)
+      const a = (lit ? 1 : 0.15) * Math.max(n.c.dim, 0.14)
+      const rg = sr(n) * 4.2
+      g.globalAlpha = 0.6 * a
+      g.drawImage(glowSprite(n.c.color), px - rg, py - rg, rg * 2, rg * 2)
+      glows++
+    }
+    // 搜索命中（非枢纽）补一圈小光晕
+    if (matches) {
+      let k = 0
+      for (let i = 0; i < nodes.length && k < 200; i++) {
+        const n = nodes[i]
+        if (!matches.has(n.id) || hubOf(i)) continue
+        const px = sx(n.x); const py = sy(n.y)
+        if (!onScreen(px, py, 20)) continue
+        const rg = sr(n) * 4.5
+        g.globalAlpha = 0.9; g.drawImage(glowSprite(n.c.color), px - rg, py - rg, rg * 2, rg * 2); k++
+      }
+    }
+    g.globalCompositeOperation = 'source-over'
+    // 枢纽白色亮核
+    g.fillStyle = '#fff'
+    for (let i = 0; i < nodes.length; i++) {
+      if (!hubOf(i)) continue
+      const n = nodes[i]
+      const px = sx(n.x); const py = sy(n.y)
+      if (!onScreen(px, py)) continue
+      g.globalAlpha = 0.95 * Math.max(n.c.dim, 0.14) * (!matches || matches.has(n.id) ? 1 : 0.2)
+      g.beginPath(); g.arc(px, py, Math.max(0.9, sr(n) * 0.55), 0, Math.PI * 2); g.fill()
+    }
+
+    // 选中节点：向邻居辐射的点状虚线（带流动）+ 邻居提亮
+    const tags = [] // 待放置的小矩形标签（按优先级）
+    if (selN) {
+      const px = sx(selN.x); const py = sy(selN.y)
+      const list = [...nbrs || []].map((id) => L.idx.get(id)).filter((i) => i !== undefined)
+      list.sort((a, b) => shown.nodes[b].degree - shown.nodes[a].degree)
+      g.lineCap = 'round'
+      g.lineWidth = 1.5
+      g.setLineDash([0.1, 5.5])
+      g.lineDashOffset = reduced ? 0 : -(now * 16)
+      g.globalCompositeOperation = 'lighter'
+      let drawn = 0
+      for (const i of list) {
+        const m = nodes[i]
+        const qx = sx(m.x); const qy = sy(m.y)
+        if (drawn < 160 && (onScreen(qx, qy, 400) || onScreen(px, py, 400))) {
+          g.globalAlpha = 0.9
+          g.strokeStyle = m.c === selN.c ? '#ffffff' : m.c.color
+          g.beginPath(); g.moveTo(px, py); g.lineTo(qx, qy); g.stroke(); drawn++
+        }
+      }
+      g.setLineDash([]); g.lineDashOffset = 0
+      // 邻居节点：簇色发光点
+      for (const i of list) {
+        const m = nodes[i]
+        const qx = sx(m.x); const qy = sy(m.y)
+        if (!onScreen(qx, qy, 20)) continue
+        const rg = Math.max(sr(m), 1.6) * 4
+        g.globalAlpha = 0.9; g.drawImage(glowSprite(m.c.color), qx - rg, qy - rg, rg * 2, rg * 2)
+      }
+      g.globalCompositeOperation = 'source-over'
+      g.fillStyle = '#fff'
+      for (const i of list) { const m = nodes[i]; const qx = sx(m.x); const qy = sy(m.y); if (onScreen(qx, qy)) { g.globalAlpha = 1; g.beginPath(); g.arc(qx, qy, Math.max(1.3, sr(m) * 0.8), 0, Math.PI * 2); g.fill() } }
+      // 选中点：大光晕 + 脉动环
+      g.globalCompositeOperation = 'lighter'
+      const rg = 22 + (reduced ? 0 : Math.sin(now * 3) * 3)
+      g.globalAlpha = 0.95; g.drawImage(glowSprite(selN.c.color), px - rg, py - rg, rg * 2, rg * 2)
+      g.globalCompositeOperation = 'source-over'
+      if (!reduced) {
+        const ph = (now * 0.9) % 1
+        g.globalAlpha = (1 - ph) * 0.7; g.lineWidth = 1.2; g.strokeStyle = selN.c.color
+        g.beginPath(); g.arc(px, py, 6 + ph * 22, 0, Math.PI * 2); g.stroke()
+      }
+      g.globalAlpha = 1; g.fillStyle = '#fff'
+      g.beginPath(); g.arc(px, py, 3.4, 0, Math.PI * 2); g.fill()
+      g.lineWidth = 1.4; g.strokeStyle = selN.c.color; g.beginPath(); g.arc(px, py, 5.6, 0, Math.PI * 2); g.stroke()
+      tags.push({ n: selN, i: selI, kind: 'sel' })
+      for (const i of list.slice(0, 26)) tags.push({ n: nodes[i], i, kind: 'nbr' })
+    }
+    if (hoverN && hover !== selI) {
+      const px = sx(hoverN.x); const py = sy(hoverN.y)
+      g.globalAlpha = 1; g.lineWidth = 1.2; g.strokeStyle = '#fff'
+      g.beginPath(); g.arc(px, py, Math.max(3.2, sr(hoverN) + 2), 0, Math.PI * 2); g.stroke()
+      tags.push({ n: hoverN, i: hover, kind: 'hover' })
+      if (hoverNb) for (const id of [...hoverNb].slice(0, 8)) { const i = L.idx.get(id); if (i !== undefined) tags.push({ n: nodes[i], i, kind: 'nbr' }) }
+    }
+    if (matches) {
+      let k = 0
+      for (let i = 0; i < nodes.length && k < 40; i++) if (matches.has(nodes[i].id)) { tags.push({ n: nodes[i], i, kind: 'match' }); k++ }
+    }
+    if (focusCluster && !selN) {
+      const c = clusterOf(focusCluster)
+      if (c) [...c.idxs].sort((a, b) => shown.nodes[b].degree - shown.nodes[a].degree).slice(0, 12).forEach((i) => tags.push({ n: nodes[i], i, kind: 'hub' }))
+    }
+    if (z >= 1.6 && !selN) for (const i of nodes.keys()) { if (labelIds.has(nodes[i].id)) tags.push({ n: nodes[i], i, kind: 'hub' }) }
+    if (z > 3) { let k = 0; for (let i = 0; i < nodes.length && k < 90; i++) { const q = nodes[i]; if (q.c.dim > 0.5 && onScreen(sx(q.x), sy(q.y))) { tags.push({ n: q, i, kind: 'faint' }); k++ } } }
+
+    // 簇标签：粗体大号名 + 一行小字 “N cards”；放在簇心偏上。聚焦某簇时其余簇名变淡。
+    labelRects = []
+    g.textAlign = 'center'
+    g.textBaseline = 'alphabetic'
+    for (const c of L.cl) {
+      const px = sx(c.cx); const py = sy(c.cy) - c.r * z * 0.92 - 8
+      const foc = focusCluster === c.key
+      const fs = Math.round(Math.min(30, Math.max(15, 13 + Math.sqrt(c.n) * 0.7)))
+      const name = kindLabel(c.key)
+      g.font = `700 ${fs}px ${MONO}`
+      const tw = g.measureText(name).width
+      if (px + tw / 2 < 0 || px - tw / 2 > w || py < -40 || py > hgt + 40) continue
+      let a = 0.35 + 0.65 * c.dim
+      if (z > 2.4 && !foc) a *= 0.35
+      g.lineJoin = 'round'
+      g.lineWidth = 5; g.strokeStyle = 'rgba(5,6,10,.9)'; g.globalAlpha = a
+      g.strokeText(name, px, py)
+      g.fillStyle = foc ? '#fff' : mixWhite(c.color, 0.35); g.fillText(name, px, py)
+      g.font = `500 ${Math.max(10, Math.round(fs * 0.46))}px ${MONO}`
+      const sub = `${c.n} cards`
+      g.lineWidth = 4; g.strokeText(sub, px, py + fs * 0.62)
+      g.fillStyle = rgba(c.color, 0.85); g.globalAlpha = a * 0.85; g.fillText(sub, px, py + fs * 0.62)
+      labelRects.push({ key: c.key, x: px - Math.max(tw, 56) / 2 - 6, y: py - fs - 2, w: Math.max(tw, 56) + 12, h: fs * 1.85 + 8 })
+    }
+
+    // 小矩形标签：等宽小字、描边按类型着色，“标题 · 类型”
+    g.globalAlpha = 1
+    g.textAlign = 'left'
+    g.textBaseline = 'middle'
+    const order = { sel: 0, hover: 1, nbr: 2, match: 3, hub: 4, faint: 5 }
+    tags.sort((a, b) => order[a.kind] - order[b.kind])
+    const seen = new Set()
+    let budget = 160
+    for (const t of tags) {
+      if (budget <= 0) break
+      if (seen.has(t.i)) continue
+      const px = sx(t.n.x); const py = sy(t.n.y)
+      if (!onScreen(px, py, 4)) continue
+      const sel = t.kind === 'sel'
+      g.font = `${sel ? 600 : 500} ${sel ? 12 : 10.5}px ${MONO}`
+      const txt = tagText(shown.nodes[t.i])
+      const bw = g.measureText(txt).width + 10
+      const bh = sel ? 20 : 17
+      const gap = sel ? 12 : 6
+      const spots = sel ? [[gap, -bh - 4], [gap, 6], [-bw - gap, -bh - 4], [-bw - gap, 6]] : [[gap, 2], [gap, -bh - 2], [-bw - gap, 2], [-bw - gap, -bh - 2]]
+      let box = null
+      for (const [ox, oy] of spots) { const b = { x: Math.min(Math.max(2, px + ox), w - bw - 2), y: Math.min(Math.max(2, py + oy), hgt - bh - 2), w: bw, h: bh }; if (!clash(b)) { box = b; break } }
+      if (!box) { if (t.kind === 'faint' || t.kind === 'hub' || t.kind === 'match') continue; if (t.kind === 'nbr') continue; box = { x: px + spots[0][0], y: py + spots[0][1], w: bw, h: bh } }
+      placed.push(box); seen.add(t.i); budget--
+      const col = neon(t.n.kind)
+      g.globalAlpha = t.kind === 'faint' ? 0.7 : 1
+      g.fillStyle = sel ? col : 'rgba(4,5,9,.9)'
+      g.fillRect(box.x, box.y, box.w, box.h)
+      g.lineWidth = 1; g.strokeStyle = sel ? '#fff' : rgba(col, t.kind === 'faint' ? 0.5 : 0.95)
+      g.strokeRect(box.x + 0.5, box.y + 0.5, box.w - 1, box.h - 1)
+      g.fillStyle = sel ? '#05060a' : '#dde4f2'
+      g.fillText(txt, box.x + 5, box.y + box.h / 2 + 0.5)
+    }
+    g.globalAlpha = 1
+    g.globalCompositeOperation = 'source-over'
+
+    const ms = performance.now() - t0
+    perf.frames++; perf.last = ms; perf.sum += ms; if (ms > perf.max) perf.max = ms
+  }
+
+  // 簇的目标亮度：聚焦簇 → 其余暗；选中节点 → 自己的簇半亮、其余暗；搜索时保持整体可见（点级别另行变暗）
+  function dimTarget(c) {
+    if (focusCluster) return c.key === focusCluster ? 1 : 0.13
+    if (selected) { const n = L.nodes[L.idx.get(selected)]; return n && n.c === c ? 0.6 : 0.14 }
+    return 1
+  }
+
+  let userMoved = false
   function frame() {
     raf = 0
     if (!canvas.isConnected) { cleanup(); return }
     let active = false
     if (L && L.alpha > LAYOUT_DONE) {
-      stepLayout(L); stepLayout(L)
+      stepClusters(L); stepClusters(L)
+      recomputeClusters(L)
       active = true
       dirty = true
       if (L.alpha <= LAYOUT_DONE && !userMoved) fitNow()
     }
+    if (tween) {
+      const pr = Math.min(1, (performance.now() - tween.t0) / tween.dur)
+      const e = easeInOut(pr)
+      const zz = Math.exp(Math.log(tween.z0) + (Math.log(tween.z1) - Math.log(tween.z0)) * e)
+      const cx = tween.x0 + (tween.x1 - tween.x0) * e
+      const cy = tween.y0 + (tween.y1 - tween.y0) * e
+      view = { zoom: zz, panX: w / 2 - cx * zz, panY: hgt / 2 - cy * zz }
+      if (pr >= 1) tween = null
+      active = true; dirty = true
+    }
+    if (L) {
+      for (const c of L.cl) {
+        const tg = dimTarget(c)
+        const d = tg - c.dim
+        if (Math.abs(d) > 0.004) { c.dim = reduced ? tg : c.dim + d * 0.2; active = true; dirty = true } else if (c.dim !== tg) { c.dim = tg; dirty = true }
+      }
+    }
+    if (selected && !reduced) { active = true; dirty = true } // 辐射虚线流动 / 脉动环
     if (dirty) { draw(); dirty = false }
     if (active) raf = requestAnimationFrame(frame)
   }
   function kick() { if (!raf) raf = requestAnimationFrame(frame) }
-  let userMoved = false
   let ro = null
   function cleanup() {
     if (raf) cancelAnimationFrame(raf)
     raf = 0
     ro?.disconnect()
-    mq?.removeEventListener?.('change', onScheme)
-    globalThis.removeEventListener?.('mh-theme', onScheme)
   }
 
   function resize() {
@@ -231,13 +598,20 @@ export default async function render(ctx) {
 
   // ---------- 交互 ----------
   const pos = (e) => { const r = canvas.getBoundingClientRect(); return { x: e.clientX - r.left, y: e.clientY - r.top } }
-  const pick = (e) => { const s = pos(e); const wp = screenToWorld(view, s.x, s.y); return hitTest(L.nodes, wp.x, wp.y, radiusOf, 3 / view.zoom) }
+  const pick = (e) => { const s = pos(e); const wp = screenToWorld(view, s.x, s.y); return hitTest(L.nodes, wp.x, wp.y, radiusOf, 5 / view.zoom) }
+  const labelAt = (s) => labelRects.find((r) => s.x >= r.x && s.x <= r.x + r.w && s.y >= r.y && s.y <= r.y + r.h)?.key || ''
+  function clusterAt(s) {
+    const wp = screenToWorld(view, s.x, s.y)
+    let best = null; let bd = Infinity
+    for (const c of L.cl) { const d = Math.hypot(c.cx - wp.x, c.cy - wp.y) / c.r; if (d <= 1 && d < bd) { best = c; bd = d } }
+    return best?.key || ''
+  }
   let drag = null
   canvas.addEventListener('pointerdown', (e) => {
     if (!L) return
     canvas.setPointerCapture?.(e.pointerId)
-    const i = pick(e)
     const s = pos(e)
+    const i = labelAt(s) ? -1 : pick(e) // 簇名优先于其下的小点
     drag = { mode: i >= 0 ? 'node' : 'pan', i, sx: s.x, sy: s.y, moved: false, panX: view.panX, panY: view.panY }
     if (i >= 0) { L.nodes[i].fixed = true }
   })
@@ -246,7 +620,7 @@ export default async function render(ctx) {
     const s = pos(e)
     if (drag) {
       if (Math.abs(s.x - drag.sx) + Math.abs(s.y - drag.sy) > 3) drag.moved = true
-      if (drag.mode === 'pan') { view = { ...view, panX: drag.panX + s.x - drag.sx, panY: drag.panY + s.y - drag.sy }; userMoved = true }
+      if (drag.mode === 'pan') { if (drag.moved) tween = null; view = { ...view, panX: drag.panX + s.x - drag.sx, panY: drag.panY + s.y - drag.sy }; userMoved = true }
       else if (drag.moved) {
         const wp = screenToWorld(view, s.x, s.y)
         const n = L.nodes[drag.i]
@@ -266,23 +640,32 @@ export default async function render(ctx) {
       tip.style.setProperty('left', Math.min(s.x + 14, w - 220) + 'px')
       tip.style.setProperty('top', Math.min(s.y + 14, hgt - 50) + 'px')
       canvas.style.setProperty('cursor', 'pointer')
-    } else { tip.setAttribute('hidden', ''); canvas.style.setProperty('cursor', 'grab') }
+    } else {
+      tip.setAttribute('hidden', '')
+      canvas.style.setProperty('cursor', labelAt(s) || clusterAt(s) ? 'pointer' : 'grab')
+    }
   })
-  const endDrag = () => {
+  const endDrag = (e) => {
     if (!drag) return
     if (drag.mode === 'node') {
       const n = L.nodes[drag.i]
       if (n) n.fixed = false
       if (!drag.moved) select(shown.nodes[drag.i].id)
-    } else if (!drag.moved) { select('') }
+    } else if (!drag.moved) {
+      const s = e && e.clientX !== undefined ? pos(e) : { x: drag.sx, y: drag.sy }
+      const key = labelAt(s) || clusterAt(s)
+      if (key && key !== focusCluster) selectCluster(key)
+      else clearFocus()
+    }
     drag = null
   }
   canvas.addEventListener('pointerup', endDrag)
-  canvas.addEventListener('pointercancel', endDrag)
+  canvas.addEventListener('pointercancel', () => endDrag(null))
   canvas.addEventListener('pointerleave', () => { if (!drag) { hover = -1; tip.setAttribute('hidden', ''); dirty = true; kick() } })
   canvas.addEventListener('wheel', (e) => {
     e.preventDefault()
     const s = pos(e)
+    tween = null
     view = zoomAt(view, s.x, s.y, Math.exp(-e.deltaY * 0.0015))
     userMoved = true; dirty = true; kick()
   }, { passive: false })
@@ -290,22 +673,37 @@ export default async function render(ctx) {
     if (e.key === '+' || e.key === '=') zoomBtn(1.25)
     else if (e.key === '-') zoomBtn(0.8)
     else if (e.key === '0') { userMoved = false; fitNow(); kick() }
-    else if (e.key === 'Escape') select('')
+    else if (e.key === 'Escape') clearFocus()
   })
-  function zoomBtn(f) { view = zoomAt(view, w / 2, hgt / 2, f); userMoved = true; dirty = true; kick() }
+  function zoomBtn(f) { tween = null; view = zoomAt(view, w / 2, hgt / 2, f); userMoved = true; dirty = true; kick() }
 
   function select(id) {
     selected = id
+    if (id) focusCluster = ''
     dirty = true
     renderSide()
     kick()
+  }
+  function selectCluster(key) {
+    const c = clusterOf(key)
+    if (!c) return
+    selected = ''
+    focusCluster = key
+    flyToCluster(c)
+    renderSide()
+    dirty = true; kick()
+  }
+  function clearFocus() {
+    const had = selected || focusCluster
+    selected = ''; focusCluster = ''
+    if (had) renderSide()
+    dirty = true; kick()
   }
   function centerOn(id) {
     const i = L.idx.get(id)
     if (i === undefined) return
     const n = L.nodes[i]
-    const z = clampZoom(Math.max(view.zoom, 1.4))
-    view = { zoom: z, panX: w / 2 - n.x * z, panY: hgt / 2 - n.y * z }
+    flyTo(n.x, n.y, Math.max(view.zoom, 1.4), 500)
     userMoved = true
   }
 
@@ -315,10 +713,23 @@ export default async function render(ctx) {
     const my = ++sideToken
     side.textContent = ''
     const n = selected ? shown.nodes[L.idx.get(selected)] : null
+    const fc = !n && focusCluster ? clusterOf(focusCluster) : null
+    if (fc) {
+      const top = [...fc.idxs].sort((a, b) => shown.nodes[b].degree - shown.nodes[a].degree).slice(0, 14)
+      side.append(
+        h('div', { class: 'graph-side-head' }, [h('h3', null, [h('i', { class: 'gdot', css: { background: fc.color } }), ` ${kindLabel(fc.key)} · ${fc.n} cards`])]),
+        h('p', { class: 'sub' }, '已聚焦该簇，其余簇变暗；点击空白处或按 Esc 恢复。'),
+        h('div', { class: 'graph-nbrs' }, [
+          h('h4', null, '关联最多的卡片'),
+          h('ul', null, top.map((i) => { const m = shown.nodes[i]; return h('li', null, h('button', { type: 'button', class: 'graph-nbr', on: { click: () => { select(m.id); centerOn(m.id) } } }, [h('i', { class: 'gdot', css: { background: fc.color } }), m.title || m.id])) })),
+        ]),
+      )
+      return
+    }
     if (!n) {
       side.append(h('div', { class: 'graph-side-empty' }, [
         h('strong', null, '点击节点查看卡片'),
-        h('p', { class: 'sub' }, '悬停高亮关联；拖动节点可调整位置；拖动空白处平移，滚轮缩放。'),
+        h('p', { class: 'sub' }, '节点按类型分簇：点击节点向邻居辐射并高亮，点击簇名飞到该簇；拖动节点可调整位置；拖动空白处平移，滚轮缩放；点击空白恢复。'),
         focus ? h('p', { class: 'sub' }, '当前为邻域模式（2 跳）。') : null,
       ]))
       return
@@ -342,7 +753,7 @@ export default async function render(ctx) {
         h('h4', null, `相邻卡片（${nbrIds.length}）`),
         h('ul', null, nbrIds.slice(0, 14).map((id) => {
           const m = shown.nodes[L.idx.get(id)]
-          return h('li', null, h('button', { type: 'button', class: 'graph-nbr', on: { click: () => { select(id); centerOn(id); dirty = true; kick() } } }, [h('i', { class: 'gdot', css: { background: kindColor(m.kind) } }), m.title || id]))
+          return h('li', null, h('button', { type: 'button', class: 'graph-nbr', on: { click: () => { select(id); centerOn(id); dirty = true; kick() } } }, [h('i', { class: 'gdot', css: { background: neon(m.kind) } }), m.title || id]))
         })),
         nbrIds.length > 14 ? h('p', { class: 'sub' }, `另有 ${nbrIds.length - 14} 张未列出`) : null,
       ]) : null,
@@ -385,11 +796,11 @@ export default async function render(ctx) {
           else if (st.kinds.has(k)) st.kinds.delete(k)
           else st.kinds.add(k)
           drawLegend(); rebuild()
-        } } }, [h('i', { class: 'gdot', css: { background: kindColor(k) } }), `${kindLabel(k)} ${data.stats.byKind[k]}`]))
+        } } }, [h('i', { class: 'gdot', css: { background: neon(k) } }), `${kindLabel(k)} ${data.stats.byKind[k]}`]))
     }
     legendEl.append(
       h('span', { class: 'graph-lg-sep' }),
-      h('span', { class: 'sub' }, '圆点大小 = 关联数'),
+      h('span', { class: 'sub' }, '簇 = 类型 · 圆点大小 = 关联数'),
       h('span', { class: 'sub graph-edge-key' }, [h('i', { class: 'ek ek-link' }), '[[链接]]', h('i', { class: 'ek ek-tag' }), '共享标签', h('i', { class: 'ek ek-sim' }), '内容相似']),
     )
   }
@@ -422,7 +833,7 @@ export default async function render(ctx) {
     nodeListEl.textContent = ''
     const top = [...shown.nodes].sort((a, b) => b.degree - a.degree).slice(0, 40)
     if (!top.length) { nodeListEl.append(h('p', { class: 'sub' }, '当前过滤条件下没有节点。')); return }
-    nodeListEl.append(h('ul', null, top.map((n) => h('li', null, h('button', { type: 'button', class: 'graph-nbr', on: { click: () => { select(n.id); centerOn(n.id); dirty = true; kick() } } }, [h('i', { class: 'gdot', css: { background: kindColor(n.kind) } }), h('span', { class: 'graph-nbr-title' }, n.title || n.id), h('span', { class: 'sub' }, `${kindLabel(n.kind)} · ${n.degree}`)])))))
+    nodeListEl.append(h('ul', null, top.map((n) => h('li', null, h('button', { type: 'button', class: 'graph-nbr', on: { click: () => { select(n.id); centerOn(n.id); dirty = true; kick() } } }, [h('i', { class: 'gdot', css: { background: neon(n.kind) } }), h('span', { class: 'graph-nbr-title' }, n.title || n.id), h('span', { class: 'sub' }, `${kindLabel(n.kind)} · ${n.degree}`)])))))
     if (shown.nodes.length > top.length) nodeListEl.append(h('p', { class: 'sub' }, `仅列出关联数最高的 ${top.length} 个，共 ${fmtNum(shown.nodes.length)} 个；可用搜索或过滤缩小范围。`))
   }
 
@@ -443,6 +854,15 @@ export default async function render(ctx) {
     rebuild({ keepPositions: false })
     renderSide()
     requestAnimationFrame(() => { resize(); if (focus && L.idx.has(focus)) select(focus) })
+  }
+  // 调试 / 自动化测试钩子（只读）：绘制耗时统计与节点屏幕坐标
+  canvas.__mhGraph = {
+    perf,
+    get view() { return view },
+    clusters: () => (L ? L.cl.map((c) => ({ key: c.key, n: c.n, x: c.cx * view.zoom + view.panX, y: c.cy * view.zoom + view.panY, dim: c.dim })) : []),
+    nodeScreen: (id) => { const i = L?.idx.get(id); if (i === undefined) return null; const n = L.nodes[i]; return { x: n.x * view.zoom + view.panX, y: n.y * view.zoom + view.panY, r: radiusOf(n) * view.zoom } },
+    drawNow: () => { draw() },
+    state: () => ({ selected, focusCluster, hover, tweening: !!tween }),
   }
   return root
 }
