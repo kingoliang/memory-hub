@@ -13,7 +13,7 @@ import { captureCard, captureUpdate, pickNeighbors, summarizeTurnDetailed, route
 import { createLlmFromEnv } from './llm-openai.js'
 import { DEFAULT_LLM_TIMEOUT_MS } from '../config.js'
 import { resolveDedupConfig } from './dedup-config.js'
-import { enforceAudit } from './db.js'
+import { enforceAudit, getDb } from './db.js'
 import { detectSecrets } from './tidy.js'
 import { getLogger } from '../logger.js'
 
@@ -57,7 +57,7 @@ export async function runStandaloneCapture(vaultRoot, text, { source = '', submi
     try {
       const neighbors = await pickNeighbors(vaultRoot, { title: '', body: clean.slice(0, 400) }, 8)
       const { detailed, attempts, outBudget } = await distillWithRetry(llmClient, route, clean, neighbors, log)
-      const result = detailed.card
+      let result = detailed.card
       if (detailed.failure) {
         const f = detailed.failure
         log.warn(f.category === 'invalid_card' ? '蒸馏结果不合格，降级为原文卡' : '蒸馏失败，降级为原文卡', {
@@ -69,11 +69,14 @@ export async function runStandaloneCapture(vaultRoot, text, { source = '', submi
         // 预筛跳过（太短 / 噪声 / 无复用信号）：没调模型，直接落原文卡。留一条决策日志，别让它静默。
         log.info('蒸馏跳过，降级为原文卡', { reason: detailed.skip, inputChars: clean.length })
       }
+      // 模型判定「属于已有卡」：输出形如 {append_to, update}，**没有 save 字段**（见 cardFromParsedJson），
+      // 所以必须在 save===true 分支之前处理——此前它两个分支都不命中，被无声落成原文卡。
+      if (result && result.append_to) {
+        const applied = await applyModelAppend(vaultRoot, result, { dd, author, clean, log })
+        if (applied.done) return applied.done
+        result = applied.result // 新建卡 {save:true,…}，或 null（密钥 → 落原文卡）
+      }
       if (result && result.save === true) {
-        if (result.append_to) {
-          await captureUpdate(vaultRoot, result.append_to, result.update, { threshold: 0.62 })
-          return { ok: true, action: 'appended', path: result.append_to }
-        }
         const card = { kind: result.kind, title: result.title, tags: result.tags, body: result.body, source, status: 'pending', submittedBy: author, severity: 'info', reason: 'AI 自动沉淀（蒸馏卡）' }
         const out = await captureCard(vaultRoot, card, dupOpts)
         if (out.ok) return { ok: true, action: 'created', path: out.path ?? out.rel }
@@ -107,6 +110,34 @@ export async function runStandaloneCapture(vaultRoot, text, { source = '', submi
   if (out.ok) return { ok: true, action: 'created', path: out.path ?? out.rel, degraded: true }
   if (out.duplicate) return { ...(await handleDuplicate(vaultRoot, out.duplicate, clean, dd, clean.slice(0, 400), rawCard, log)), degraded: true }
   return { ok: false, action: 'failed', reason: String(out.reason || 'write failed') }
+}
+
+/**
+ * 处理模型的 {append_to, update} 指令（语义同上游 memory-eternal：追加到已有卡，而不是新建）。
+ *  - 目标必须是主库（cards）里未删除的卡；否则 WARN 并改为「新建」一张知识卡（正文取 update），不落 raw；
+ *  - update 是模型产出的文本，同样过密钥检测；命中则拒绝追加并落原文卡（clean 已在入口过检测）；
+ *  - 实际追加复用 handleDuplicate（与去重命中同一条路径）：auditMode 允许免审且开了 merge → 合并进正文
+ *    （受 mergeIntoCard 的行数 / 行长上限保护）；否则只追加 card_updates 更新记录，不改已批准卡正文。
+ * @returns {Promise<{done?:object, result?:object|null}>}
+ */
+async function applyModelAppend(vaultRoot, result, { dd, author, clean, log }) {
+  const target = String(result.append_to || '').trim()
+  const update = String(result.update || '').trim()
+  const secretTypes = detectSecrets(update)
+  if (secretTypes.length) {
+    log.warn('蒸馏追加内容含疑似明文密钥，拒绝追加，降级为原文卡', { actor: author, target, secretTypes })
+    return { result: null }
+  }
+  const row = target ? getDb(vaultRoot).prepare('SELECT kind FROM cards WHERE path = ? AND deleted_at IS NULL').get(target) : null
+  if (!row) {
+    log.warn('蒸馏追加目标无效（不在主库或已删除），改为新建卡', { actor: author, target })
+    const title = [deriveTitle(update), deriveTitle(clean)].find((t) => isUsableTitle(t))
+    if (!title) return { result: null }
+    return { result: { save: true, kind: 'knowledge', title, tags: [], body: `# ${title}\n\n${update}` } }
+  }
+  const out = await handleDuplicate(vaultRoot, { store: 'main', path: target, via: 'model-append', score: 1 }, update, dd, undefined, { kind: row.kind, submittedBy: author, status: 'pending' }, log)
+  log.info('蒸馏追加到已有卡', { actor: author, path: target, merged: out.merged })
+  return { done: out }
 }
 
 /** 这些失败类别是「输出预算不够 / 输出残缺」，加大 max_tokens 重试有意义。 */

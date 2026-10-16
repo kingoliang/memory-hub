@@ -212,16 +212,15 @@ test('蒸馏 skip（预筛判定无复用信号）→ 降级并留 INFO 决策�
   } finally { await srv.close() }
 })
 
-test('模型返回 append_to 指令（无 save 字段）→ 降级并留 WARN 日志（此前完全静默）', async () => {
+test('模型返回 append_to 指向不存在的卡 → 改为新建卡（不再静默落 raw）并 WARN', async () => {
   const srv = await fakeServer(() => ({ content: JSON.stringify({ append_to: '04-Content/某张已有卡.md', update: '补充一段足够长的更新说明文字。' }) }))
   const sink = logSink()
   try {
     await withHub(async (h) => {
       const out = await runStandaloneCapture(h.home, durableText('追加指令'), { llm: createOpenAiLlm({ baseUrl: srv.baseUrl, model: 'm' }), submittedBy: 'a', log: createLogger({ level: 'debug', stream: sink.stream }) })
-      assert.equal(out.degraded, true)
-      const w = sink.lines().map((l) => JSON.parse(l)).find((r) => r.level === 'WARN' && /蒸馏结果未被处理/.test(r.msg))
-      assert.ok(w, sink.text())
-      assert.equal(w.hasAppendTo, true)
+      assert.equal(out.action, 'created')
+      assert.ok(!out.degraded)
+      assert.ok(sink.lines().map((l) => JSON.parse(l)).some((r) => r.level === 'WARN' && /追加目标无效/.test(r.msg)), sink.text())
     })
   } finally { await srv.close() }
 })
