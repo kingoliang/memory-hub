@@ -48,7 +48,7 @@ export default async function render(ctx) {
           ],
         })
       }))
-      : empty('回收站是空的'),
+      : empty('回收站是空的', '软删的卡会在这里保留一段时间，之后自动永久清除', h('a', { class: 'btn', href: '#/cards' }, '返回卡片'), 'trash'),
     d.total > limit ? pager(d, (o) => ctx.go(`#/recycle?offset=${o}`)) : null,
   ])
 }

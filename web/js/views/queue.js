@@ -3,7 +3,7 @@
 import { h } from '../dom.js'
 import { get, post } from '../api.js'
 import { cardRow } from './cards.js'
-import { notice, pager, empty, badge } from '../ui.js'
+import { notice, pager, empty, badge, icon } from '../ui.js'
 import { fmtNum } from '../format.js'
 import { createSelection, bulkBar, reportBatch } from '../bulk.js'
 import { guard, toast, errText, confirmDialog, formDialog } from '../dialogs.js'
@@ -15,7 +15,9 @@ export default async function render(ctx) {
   const d = await get('queue', { status, limit, offset })
   ctx.setTitle('待审队列')
   const sel = createSelection()
-  const tab = (key, label, n) => h('a', { class: 'tab' + (status === key ? ' active' : ''), href: `#/queue?status=${key}` }, [label, badge(fmtNum(n), key === 'pending' ? 'warn' : 'neutral')])
+  const tab = (key, label, n) => h('a', { class: 'tab' + (status === key ? ' active' : ''), href: `#/queue?status=${key}`, ...(status === key ? { 'aria-current': 'page' } : {}) }, [label, badge(fmtNum(n), key === 'pending' && n ? 'warn' : 'neutral')])
+  // 等待时间分级：≥14 天红、≥7 天橙（文字里始终带天数，颜色只是辅助）
+  const ageChip = (days) => h('span', { class: 'age ' + (days >= 14 ? 'age-bad' : days >= 7 ? 'age-warn' : '') }, [icon('pulse', 'icon-sm'), `已等待 ${days} 天`])
 
   const approve = async (paths) => {
     const multi = paths.length > 1
@@ -48,20 +50,22 @@ export default async function render(ctx) {
   ], { reload: ctx.reload })
 
   return h('div', { class: 'page' }, [
-    h('div', { class: 'page-head' }, [h('h1', null, '待审队列'), h('p', { class: 'sub' }, '按等待时间排序，最久的在前')]),
-    notice('info', '批准后才能被检索到', 'auditMode=all 时，未批准的卡不会被 memory_recall 搜到。可勾选多张批量批准 / 驳回。'),
+    h('div', { class: 'page-head' }, [h('h1', null, '待审队列'), h('p', { class: 'sub' }, d.items.length ? `按等待时间排序，最久的在前（最久已等待 ${Math.max(...d.items.map((i) => i.ageDays))} 天）` : '按等待时间排序，最久的在前')]),
+    notice('info', '批准后才能被检索到', 'auditMode=all 时，未批准的卡不会被 memory_recall 搜到。可勾选多张批量批准 / 驳回；点卡片标题查看全文。'),
     h('nav', { class: 'tabs' }, [tab('all', '全部', d.counts.pending + d.counts.rejected), tab('pending', '待审', d.counts.pending), tab('rejected', '已驳回', d.counts.rejected)]),
     d.items.length ? bar : null,
     d.items.length
       ? h('div', { class: 'card-list' }, d.items.map((it) => cardRow(it, {
         select: sel.checkbox(it.path, it.title),
         actions: rowActions(it),
+        excerptLines: 3,
+        cls: 'queue-row',
         extra: [
-          h('span', { class: 'meta-time' }, `已等待 ${it.ageDays} 天`),
+          ageChip(it.ageDays),
           it.reason ? h('span', { class: 'meta-reason' }, `原因：${it.reason}`) : null,
         ],
       })))
-      : empty('队列是空的', '没有待审或被驳回的卡片'),
+      : empty('队列是空的', '没有待审或被驳回的卡片，Agent 新沉淀的卡会出现在这里', h('a', { class: 'btn', href: '#/cards' }, '去看已批准的卡片'), 'ok'),
     d.total > limit ? pager(d, (o) => ctx.go(`#/queue?status=${status}&offset=${o}`)) : null,
   ])
 }

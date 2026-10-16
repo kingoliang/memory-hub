@@ -1,4 +1,5 @@
 // 共享 UI 组件。全部通过 dom.js 构造，文本一律经文本节点。
+// 视觉规范见 docs/ui-design.md；这里只负责结构与语义（类名由 styles.css 定义）。
 
 import { h, s } from './dom.js'
 import { kindLabel, statusLabel, relTime, fmtDate, fmtNum, secretLabel } from './format.js'
@@ -20,11 +21,22 @@ const ICONS = {
   warn: 'M12 3l10 18H2L12 3zm0 7v5m0 3h.01',
   info: 'M12 3a9 9 0 100 18 9 9 0 000-18zm0 8v6m0-9h.01',
   check: 'M5 12l5 5 9-10',
+  ok: 'M12 3a9 9 0 100 18 9 9 0 000-18zm-4 9l3 3 5-6',
   lock: 'M6 11h12v9H6v-9zm3 0V8a3 3 0 016 0v3',
   menu: 'M4 7h16M4 12h16M4 17h16',
   chevron: 'M9 6l6 6-6 6',
   back: 'M15 6l-6 6 6 6',
   moon: 'M20 14A8 8 0 0110 4a8 8 0 1010 10z',
+  sun: 'M12 8a4 4 0 100 8 4 4 0 000-8zM12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4',
+  monitor: 'M3 5h18v11H3V5zM8 20h8M12 16v4',
+  arrow: 'M5 12h14M13 6l6 6-6 6',
+  inbox: 'M3 13l3-8h12l3 8M3 13v6h18v-6M3 13h5l1 2h6l1-2h5',
+  refresh: 'M20 11a8 8 0 00-14-4M4 5v4h4M4 13a8 8 0 0014 4M20 19v-4h-4',
+  x: 'M6 6l12 12M18 6L6 18',
+  sliders: 'M4 7h10M18 7h2M4 17h2M10 17h10M14 4v6M6 14v6',
+  plus: 'M12 5v14M5 12h14',
+  minus: 'M5 12h14',
+  fit: 'M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5',
 }
 
 export function icon(name, cls = '') {
@@ -46,6 +58,9 @@ export const tagChip = (tag, href) => (href
   ? h('a', { class: 'tag', href }, tag)
   : h('span', { class: 'tag' }, tag))
 
+/** 已应用的筛选条件：点击 × 移除该条件（纯链接，可回退、可分享）。 */
+export const filterChip = (label, href) => h('a', { class: 'chip-filter', href, title: '移除该筛选' }, [label, icon('x', 'icon-xs')])
+
 export function panel(title, body, { actions, cls = '', sub } = {}) {
   return h('section', { class: 'panel ' + cls }, [
     title || actions ? h('header', { class: 'panel-head' }, [h('div', null, [h('h2', null, title), sub ? h('p', { class: 'sub' }, sub) : null]), actions ? h('div', { class: 'panel-actions' }, actions) : null]) : null,
@@ -53,29 +68,40 @@ export function panel(title, body, { actions, cls = '', sub } = {}) {
   ])
 }
 
-export function stat(label, value, { hint, tone = '', href } = {}) {
+export function stat(label, value, { hint, tone = '', href, cls = '' } = {}) {
   const inner = [h('div', { class: 'stat-label' }, label), h('div', { class: 'stat-value' }, typeof value === 'number' ? fmtNum(value) : value), hint ? h('div', { class: 'stat-hint' }, hint) : null]
-  return href ? h('a', { class: `stat stat-link ${tone}`, href }, inner) : h('div', { class: `stat ${tone}` }, inner)
+  return href ? h('a', { class: `stat stat-link ${tone} ${cls}`, href }, inner) : h('div', { class: `stat ${tone} ${cls}` }, inner)
 }
 
-export function notice(kind, title, text) {
-  return h('div', { class: `notice notice-${kind}`, role: kind === 'bad' ? 'alert' : 'note' }, [icon(kind === 'bad' || kind === 'warn' ? 'warn' : 'info'), h('div', null, [title ? h('strong', null, title) : null, text ? h('p', null, text) : null])])
+/** 提示条。action：可选的按钮/链接节点（放在右侧）。 */
+export function notice(kind, title, text, action) {
+  const ic = kind === 'bad' || kind === 'warn' ? 'warn' : kind === 'ok' ? 'ok' : 'info'
+  return h('div', { class: `notice notice-${kind}`, role: kind === 'bad' ? 'alert' : 'note' }, [icon(ic), h('div', { class: 'notice-text' }, [title ? h('strong', null, title) : null, text ? h('p', null, text) : null]), action ? h('div', { class: 'notice-action' }, action) : null])
 }
 
-export const empty = (text, sub) => h('div', { class: 'empty' }, [h('div', { class: 'empty-art', 'aria-hidden': 'true' }, '∅'), h('p', null, text), sub ? h('p', { class: 'sub' }, sub) : null])
-export const loading = (text = '加载中…') => h('div', { class: 'loading', role: 'status' }, [h('span', { class: 'spinner' }), text])
-export function errorBlock(err) {
-  return notice('bad', '加载失败', err?.message || String(err))
+/** 空状态：图标 + 说明 + 可选的下一步操作（链接或按钮）。 */
+export const empty = (text, sub, action, iconName = 'inbox') => h('div', { class: 'empty' }, [h('div', { class: 'empty-art', 'aria-hidden': 'true' }, icon(iconName)), h('p', { class: 'empty-title' }, text), sub ? h('p', { class: 'sub' }, sub) : null, action ? h('div', { class: 'empty-action' }, action) : null])
+
+/** 加载态：状态文字 + 与真实内容形状相近的骨架（读屏只读状态文字）。 */
+export const loading = (text = '加载中…') => h('div', { class: 'loading', role: 'status' }, [
+  h('div', { class: 'loading-line' }, [h('span', { class: 'spinner' }), text]),
+  h('div', { class: 'skeleton-stack', 'aria-hidden': 'true' }, [h('i', { class: 'skel skel-title' }), h('i', { class: 'skel skel-row' }), h('i', { class: 'skel skel-row' }), h('i', { class: 'skel skel-row skel-short' })]),
+])
+
+/** 错误态：说明原因并给出重试入口（onRetry 缺省时不显示按钮）。 */
+export function errorBlock(err, onRetry) {
+  const retry = onRetry ? h('button', { type: 'button', class: 'btn btn-sm', on: { click: onRetry } }, [icon('refresh', 'icon-sm'), '重试']) : null
+  return notice('bad', '加载失败', err?.message || String(err), retry)
 }
 
 /** 水平条：值按 max 归一，宽度走 CSSOM 变量（CSP 允许）。 */
 export function barRow(label, value, max, { tone = 'accent', href, suffix } = {}) {
   const pct = max > 0 ? Math.max(value > 0 ? 2 : 0, Math.round((value / max) * 100)) : 0
-  const lab = href ? h('a', { class: 'bar-label', href }, label) : h('span', { class: 'bar-label' }, label)
+  const lab = href ? h('a', { class: 'bar-label', href, title: label }, label) : h('span', { class: 'bar-label', title: label }, label)
   return h('div', { class: 'bar-row' }, [lab, h('div', { class: `bar bar-${tone}`, role: 'presentation' }, h('i', { css: { '--w': pct + '%' } })), h('span', { class: 'bar-value' }, [fmtNum(value), suffix || ''])])
 }
 
-/** 迷你折线/面积图（SVG）。points: [{label, value}] */
+/** 迷你折线/面积图（SVG）。points: [{label, value}]；每个点有隐形热区，悬停显示 <title>。 */
 export function sparkline(points, { height = 90, label = '' } = {}) {
   const w = 600
   const max = Math.max(1, ...points.map((p) => p.value))
@@ -85,10 +111,13 @@ export function sparkline(points, { height = 90, label = '' } = {}) {
   const pts = points.map((p, i) => `${(i * step).toFixed(1)},${y(p.value).toFixed(1)}`)
   const area = `0,${height} ${pts.join(' ')} ${w},${height}`
   const total = points.reduce((a, p) => a + p.value, 0)
+  const hot = points.map((p, i) => s('rect', { x: Math.max(0, i * step - step / 2).toFixed(1), y: '0', width: step.toFixed(1), height: String(height), class: 'spark-hot' }, s('title', null, `${p.label}：${p.value}`)))
   return h('figure', { class: 'chart' }, [
     s('svg', { class: 'spark', viewBox: `0 0 ${w} ${height}`, preserveAspectRatio: 'none', role: 'img', 'aria-label': `${label}：合计 ${total}` }, [
+      s('line', { x1: '0', x2: String(w), y1: String(height - 0.5), y2: String(height - 0.5), class: 'axis' }),
       s('polygon', { points: area, class: 'spark-area' }),
       s('polyline', { points: pts.join(' '), class: 'spark-line', fill: 'none' }),
+      ...hot,
     ]),
     h('figcaption', null, [h('span', null, points[0]?.label || ''), h('span', null, `峰值 ${max} · 合计 ${fmtNum(total)}`), h('span', null, points[points.length - 1]?.label || '')]),
   ])
@@ -122,15 +151,15 @@ export function pager({ total, offset, limit }, go) {
   return h('nav', { class: 'pager', 'aria-label': '分页' }, [
     h('span', { class: 'pager-info' }, `第 ${fmtNum(from)}–${fmtNum(to)} 条，共 ${fmtNum(total)} 条`),
     h('div', { class: 'pager-btns' }, [
-      h('button', { type: 'button', class: 'btn btn-ghost', disabled: offset <= 0, on: { click: () => go(prevOff) } }, '上一页'),
-      h('button', { type: 'button', class: 'btn btn-ghost', disabled: nextOff >= total, on: { click: () => go(nextOff) } }, '下一页'),
+      h('button', { type: 'button', class: 'btn', disabled: offset <= 0, on: { click: () => go(prevOff) } }, '上一页'),
+      h('button', { type: 'button', class: 'btn', disabled: nextOff >= total, on: { click: () => go(nextOff) } }, '下一页'),
     ]),
   ])
 }
 
 export const timeEl = (iso) => h('time', { title: fmtDate(iso) }, relTime(iso))
 
-/** 通用只读表格。cols: [{key,label,render?,cls?}] */
+/** 通用只读表格。cols: [{key,label,render?,cls?}]。窄屏下 CSS 会把每行折成"标签: 值"的卡片。 */
 export function table(cols, rows, { cls = '', emptyText = '暂无数据' } = {}) {
   if (!rows.length) return empty(emptyText)
   return h('div', { class: 'table-wrap' }, h('table', { class: 'table ' + cls }, [
@@ -141,4 +170,15 @@ export function table(cols, rows, { cls = '', emptyText = '暂无数据' } = {})
 
 export function cardLink(path, title) {
   return h('a', { class: 'card-link', href: `#/card?path=${encodeURIComponent(path)}` }, title || path)
+}
+
+/**
+ * 分段选择器（单选组）。输入框是真实的 radio（同名，随表单提交），视觉上是按钮组。
+ * options: [[value, label, count?]]；onChange(value) 可选。
+ */
+export function segmented(name, options, current, { label, onChange } = {}) {
+  return h('div', { class: 'segmented', role: 'radiogroup', 'aria-label': label || name }, options.map(([v, l, n]) => h('label', { class: 'seg' }, [
+    h('input', { type: 'radio', name, value: v, checked: v === current, on: { change: () => onChange?.(v) } }),
+    h('span', null, [l, n !== undefined && n !== null ? h('b', null, fmtNum(n)) : null]),
+  ])))
 }

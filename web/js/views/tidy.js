@@ -64,9 +64,6 @@ export default async function render(ctx) {
   return h('div', { class: 'page' }, [
     h('div', { class: 'page-head' }, [h('h1', null, '整理中心'), h('p', { class: 'sub' }, ['planId ', h('code', null, d.planId), ` · ${fmtNum(d.totals.cards)} 张卡`])]),
     notice('ok', '预览不会修改任何数据', '下面先是计划预览（与 memory_tidy_plan 同一套逻辑）；要执行请用"执行整理"面板：先演练 → 再输入确认词 → 才会真正修改，且执行前自动备份、批后自检、失败自动回滚。'),
-    panel('参数', form),
-    execPanel(d, threshold, ctx),
-    rollbackList(rbs.items, ctx),
     h('div', { class: 'stats' }, [
       stat('噪声卡', c.noise, { tone: c.noise ? 'tone-warn' : '' }),
       stat('近似重复组', c.duplicateGroups, { hint: `可吸收 ${c.duplicateAbsorbable} 张` }),
@@ -75,6 +72,10 @@ export default async function render(ctx) {
       stat('密钥疑似', c.secrets, { tone: c.secrets ? 'tone-bad' : '', hint: '只显示路径与类型' }),
       stat('超大 raw 卡', c.oversizeRaw),
     ]),
+    panel('参数', form, { sub: '阈值越低越容易判为近似重复；改完点"重新生成预览"' }),
+    execPanel(d, threshold, ctx),
+    rollbackList(rbs.items, ctx),
+    h('div', { class: 'section-head' }, [h('h2', { class: 'section-title' }, '预览详情'), h('p', { class: 'sub' }, '执行前先看一遍每一类会动到哪些卡')]),
     section('噪声卡（仅 raw 原文卡）', c.noise, [h('ul', { class: 'plain-list' }, d.noise.map((n) => h('li', null, [cardLink(n.path, n.path), ' ', badge(n.reason, 'warn')]))), more('noise', d.noise.length)], { open: c.noise > 0, tone: 'warn', sub: '执行时软删进回收站' }),
     section('近似重复', c.duplicateGroups, [d.duplicates.map((g) => h('div', { class: 'dup-group' }, [
       h('div', { class: 'dup-keep' }, [badge('保留', 'ok'), cardLink(g.canonical.path, g.canonical.title || g.canonical.path)]),
@@ -99,6 +100,14 @@ function execPanel(d, threshold, ctx) {
   const goBtn = h('button', { type: 'button', class: 'btn btn-danger', disabled: true }, '确认执行…')
   const all = [dryBtn, goBtn, maxDelete, ...checks]
   let lastDry = null
+  // 流程指示：1 选批次 → 2 演练 → 3 确认执行 → 4 结果与回滚（仅反映状态，不改变任何逻辑）
+  const stepEls = ['选择批次与上限', '演练（dry-run）', '确认执行', '结果与回滚'].map((l, i) => h('li', { class: 'step' }, [h('span', { class: 'step-n' }, String(i + 1)), h('span', null, l)]))
+  const steps = h('ol', { class: 'steps', 'aria-label': '整理流程' }, stepEls)
+  const setStep = (n) => stepEls.forEach((el, i) => {
+    el.className = 'step' + (i < n ? ' done' : i === n ? ' current' : '')
+    if (i === n) el.setAttribute('aria-current', 'step'); else el.removeAttribute('aria-current')
+  })
+  setStep(0)
   const payload = (extra = {}) => ({
     planId: d.planId, batches: checks.filter((c) => c.checked).map((c) => c.value), maxDelete: Number(maxDelete.value),
     ...(threshold ? { threshold: Number(threshold) } : {}), ...extra,
@@ -109,7 +118,7 @@ function execPanel(d, threshold, ctx) {
     else show(notice('bad', e.code === 'max_delete_exceeded' ? '超过 maxDelete 上限' : '没有执行', errText(e)))
     if (e.extra?.batches) show(resultPanel({ ...e.extra, ok: false, dryRun: false }, ctx))
   }
-  const invalidate = () => { lastDry = null; goBtn.disabled = true }
+  const invalidate = () => { lastDry = null; goBtn.disabled = true; setStep(0) }
   for (const c of [...checks, maxDelete]) c.addEventListener('change', invalidate)
   dryBtn.addEventListener('click', guard(all, async () => {
     invalidate()
@@ -118,8 +127,9 @@ function execPanel(d, threshold, ctx) {
       const r = await post('tidy/apply', payload())
       lastDry = r; show(resultPanel(r, ctx))
       goBtn.disabled = !(r.plannedDeletes > 0 || (r.summary?.tagChanges > 0 && payload().batches.includes('tags')) || (r.summary?.duplicateGroups > 0 && payload().batches.includes('merge')))
+      setStep(goBtn.disabled ? 1 : 2)
       if (goBtn.disabled) show(notice('info', '没有需要执行的项', '所选批次下计划为空，无需执行。'))
-    } catch (e) { fail(e) }
+    } catch (e) { fail(e); setStep(1) }
   }))
   goBtn.addEventListener('click', guard(all, async () => {
     if (!lastDry) return
@@ -132,10 +142,11 @@ function execPanel(d, threshold, ctx) {
     if (!ok) return
     try {
       const r = await post('tidy/apply', payload({ confirm: true }))
-      show(resultPanel(r, ctx)); toast('ok', '整理完成'); lastDry = null; goBtn.disabled = true
+      show(resultPanel(r, ctx)); toast('ok', '整理完成'); lastDry = null; goBtn.disabled = true; setStep(3)
     } catch (e) { fail(e); toast('bad', errText(e)) }
   }))
   return panel('执行整理', [
+    steps,
     h('div', { class: 'exec-grid' }, [
       h('fieldset', { class: 'fieldset' }, [h('legend', null, '批次（按顺序执行）'), h('div', { class: 'checks' }, checks.map((c) => h('label', { class: 'check' }, [c, h('span', null, BATCH_LABEL[c.value])])))]),
       h('label', null, ['maxDelete（单次最多软删张数，超出则拒绝执行）', maxDelete]),

@@ -36,7 +36,7 @@ export default async function render(ctx) {
   }
 
   // ---------- 状态 ----------
-  const canvas = h('canvas', { class: 'graph-canvas', role: 'img', 'aria-label': '知识图谱画布', tabindex: '0' })
+  const canvas = h('canvas', { class: 'graph-canvas', role: 'img', 'aria-label': `知识图谱画布（${fmtNum(data.stats.nodes)} 个节点；键盘：+ 放大，- 缩小，0 适应窗口，Esc 取消选中；也可用下方节点列表）`, tabindex: '0' })
   const tip = h('div', { class: 'graph-tip', hidden: true, role: 'tooltip' })
   const stage = h('div', { class: 'graph-stage' }, [canvas, tip])
   const side = h('aside', { class: 'graph-side', 'aria-live': 'polite' })
@@ -62,11 +62,12 @@ export default async function render(ctx) {
   const readColors = () => {
     const cs = getComputedStyle(document.documentElement)
     const v = (n, d) => cs.getPropertyValue(n).trim() || d
-    colors = { text: v('--text', '#222'), muted: v('--muted', '#666'), line: v('--line-strong', '#ccc'), accent: v('--accent', '#3547d4'), surface: v('--surface', '#fff') }
+    colors = { text: v('--text', '#222'), muted: v('--muted', '#666'), line: v('--line-strong', '#ccc'), accent: v('--accent', '#2457d6'), surface: v('--surface', '#fff'), edge: v('--graph-edge', '#8a97ab'), link: v('--graph-link', '#2457d6') }
   }
   const mq = typeof matchMedia === 'function' ? matchMedia('(prefers-color-scheme: dark)') : null
   const onScheme = () => { colors = null; dirty = true; kick() }
   mq?.addEventListener?.('change', onScheme)
+  globalThis.addEventListener?.('mh-theme', onScheme) // 手动切换主题（theme.js 派发）
 
   // ---------- 过滤 / 重建布局 ----------
   function rebuild({ keepPositions = true, refit = false } = {}) {
@@ -81,6 +82,7 @@ export default async function render(ctx) {
     labelIds = topLabelIds(shown.nodes, shown.nodes.length <= 60 ? shown.nodes.length : 24)
     if (selected && !L.idx.has(selected)) { selected = ''; renderSide() }
     updateMatches()
+    renderNodeList()
     countEl.textContent = `显示 ${fmtNum(shown.nodes.length)} 个节点 · ${fmtNum(shown.edges.length)} 条边` + (shown.nodes.length !== data.stats.nodes ? `（已过滤，共 ${fmtNum(data.stats.nodes)}）` : '')
     if (refit || !fitted) { fitNow() }
     dirty = true
@@ -119,8 +121,8 @@ export default async function render(ctx) {
       const b = nodes[l.b]
       const touch = focusId && (a.id === focusId || b.id === focusId)
       const dim = (focusId && !touch) || (matches && !(matches.has(a.id) || matches.has(b.id)))
-      ctx2.globalAlpha = touch ? 0.95 : dim ? 0.05 : dense ? 0.16 : 0.3
-      ctx2.strokeStyle = touch ? colors.accent : colors.line
+      ctx2.globalAlpha = touch ? 0.95 : dim ? 0.05 : l.type === 'link' ? (dense ? 0.5 : 0.7) : dense ? 0.22 : 0.4
+      ctx2.strokeStyle = touch ? colors.accent : l.type === 'link' ? colors.link : colors.edge
       ctx2.lineWidth = (touch ? 1.8 : l.type === 'link' ? 1.6 : 0.9) / Math.sqrt(view.zoom)
       ctx2.setLineDash(l.type === 'similar' ? [5 / view.zoom, 4 / view.zoom] : l.type === 'tag' ? [] : [])
       ctx2.beginPath(); ctx2.moveTo(a.x, a.y); ctx2.lineTo(b.x, b.y); ctx2.stroke()
@@ -137,30 +139,46 @@ export default async function render(ctx) {
       ctx2.globalAlpha = faded ? 0.14 : 1
       ctx2.fillStyle = kindColor(n.kind)
       ctx2.beginPath(); ctx2.arc(n.x, n.y, r, 0, Math.PI * 2); ctx2.fill()
+      ctx2.lineWidth = 1.4 / Math.sqrt(view.zoom) // 与背景同色的细环：相邻节点不糊成一团
+      ctx2.strokeStyle = colors.surface
+      ctx2.stroke()
       if (isSel || i === hover || (matches && hit)) {
+        if (isSel) { ctx2.save(); ctx2.globalAlpha = 0.22; ctx2.fillStyle = colors.accent; ctx2.beginPath(); ctx2.arc(n.x, n.y, r + 6 / Math.sqrt(view.zoom), 0, Math.PI * 2); ctx2.fill(); ctx2.restore() }
         ctx2.lineWidth = 2.4 / Math.sqrt(view.zoom)
         ctx2.strokeStyle = isSel ? colors.text : colors.accent
-        ctx2.stroke()
+        ctx2.beginPath(); ctx2.arc(n.x, n.y, r, 0, Math.PI * 2); ctx2.stroke()
       }
     }
-    // 标签（预算内：高度数节点 + 选中/悬停/邻居/搜索命中；放大后显示更多）
+    // 标签：特殊节点（选中/悬停/邻居/搜索命中）优先，其余按关联数从高到低；与已放置标签重叠的普通标签直接跳过，避免挤成一团
     ctx2.globalAlpha = 1
     const fs = 12 / Math.max(0.6, Math.sqrt(view.zoom))
     ctx2.font = `${fs}px system-ui, sans-serif`
     ctx2.textAlign = 'center'
     ctx2.textBaseline = 'top'
     const showAll = view.zoom > 3
-    let budget = 220
-    for (let i = 0; i < nodes.length && budget > 0; i++) {
+    const cand = []
+    for (let i = 0; i < nodes.length; i++) {
       const n = nodes[i]
       const special = n.id === selected || i === hover || (nbrs && nbrs.has(n.id)) || (matches && matches.has(n.id))
-      if (!(special || labelIds.has(n.id) || showAll)) continue
-      const t = shown.nodes[i]?.title || n.id
+      if (special || labelIds.has(n.id) || showAll) cand.push({ i, special: !!special, deg: shown.nodes[i]?.degree || 0 })
+    }
+    cand.sort((a, b) => (b.special - a.special) || (b.deg - a.deg))
+    const placed = []
+    const clash = (b) => placed.some((o) => b.x < o.x + o.w && b.x + b.w > o.x && b.y < o.y + o.h && b.y + b.h > o.y)
+    let budget = 220
+    for (const c of cand) {
+      if (budget <= 0) break
+      const n = nodes[c.i]
+      const t = shown.nodes[c.i]?.title || n.id
       const txt = t.length > 18 ? t.slice(0, 17) + '…' : t
       const y = n.y + radiusOf(n) + 2
+      const wd = ctx2.measureText(txt).width
+      const box = { x: n.x - wd / 2 - 2, y, w: wd + 4, h: fs * 1.25 }
+      if (!c.special && clash(box)) continue
+      placed.push(box)
       ctx2.lineWidth = 3 / Math.sqrt(view.zoom)
       ctx2.strokeStyle = colors.surface
-      ctx2.globalAlpha = special ? 1 : 0.8
+      ctx2.globalAlpha = c.special ? 1 : 0.9
       ctx2.strokeText(txt, n.x, y)
       ctx2.fillStyle = colors.text
       ctx2.fillText(txt, n.x, y)
@@ -191,6 +209,7 @@ export default async function render(ctx) {
     raf = 0
     ro?.disconnect()
     mq?.removeEventListener?.('change', onScheme)
+    globalThis.removeEventListener?.('mh-theme', onScheme)
   }
 
   function resize() {
@@ -333,8 +352,9 @@ export default async function render(ctx) {
   }
 
   // ---------- 工具栏 ----------
+  // 主行：搜索 / 标签 / 节点上限 / 视图选项（折叠）。缩放等画布操作浮在画布右上角。
   const kindsPresent = KIND_ORDER.filter((k) => data.stats.byKind[k]).concat(Object.keys(data.stats.byKind).filter((k) => !KIND_ORDER.includes(k)))
-  const search = h('input', { type: 'search', placeholder: '搜索标题 / 标签 / kind，命中节点高亮', 'aria-label': '搜索节点', autocomplete: 'off',
+  const search = h('input', { type: 'search', placeholder: '搜索标题 / 标签 / 类型', 'aria-label': '搜索节点（命中的节点会高亮）', autocomplete: 'off',
     on: { input: (e) => { st.search = e.target.value; updateMatches(); if (matches?.size === 1) { const id = [...matches][0]; centerOn(id) } kick() } } })
   const tagOpts = tagCounts(data.nodes)
   const tagSel = h('select', { 'aria-label': '按标签过滤', on: { change: (e) => { st.tag = e.target.value; rebuild() } } }, [
@@ -342,13 +362,13 @@ export default async function render(ctx) {
     ...tagOpts.map((t) => h('option', { value: t.tag, selected: t.tag === st.tag }, `${t.tag}（${t.n}）`)),
   ])
   if (st.tag && !tagOpts.some((t) => t.tag === st.tag)) tagSel.append(h('option', { value: st.tag, selected: true }, st.tag))
-  const weightLbl = h('span', { class: 'sub' }, '1')
+  const weightLbl = h('output', { class: 'graph-weight' }, '1')
   const weight = h('input', { type: 'range', min: '1', max: '4', step: '1', value: '1', 'aria-label': '最小边权重', on: { input: (e) => { st.minWeight = Number(e.target.value); weightLbl.textContent = String(st.minWeight); rebuild() } } })
   const isoBox = h('input', { type: 'checkbox', 'aria-label': '隐藏孤立点', on: { change: (e) => { st.hideIsolated = e.target.checked; rebuild() } } })
   const typeBox = (t) => h('label', { class: 'check' }, [h('input', { type: 'checkbox', checked: true, 'aria-label': EDGE_LABEL[t], on: { change: (e) => { if (e.target.checked) st.types.add(t); else st.types.delete(t); rebuild() } } }), h('span', null, EDGE_LABEL[t])])
   const limitSel = h('select', { 'aria-label': '最多节点数', on: { change: (e) => nav({ limit: Number(e.target.value) === DEFAULT_LIMIT ? '' : e.target.value }) } },
     LIMITS.map((n) => h('option', { value: String(n), selected: n === limit }, `最多 ${n} 节点`)))
-  const btn = (label, fn, ic) => h('button', { type: 'button', class: 'btn btn-sm', on: { click: fn } }, [ic ? icon(ic, 'icon-sm') : null, label])
+  const zbtn = (label, fn, ic) => h('button', { type: 'button', class: 'graph-zbtn', title: label, 'aria-label': label, on: { click: fn } }, icon(ic))
 
   // 图例：kind 色块，点击切换显示该 kind（再点恢复）
   function drawLegend() {
@@ -366,7 +386,7 @@ export default async function render(ctx) {
     }
     legendEl.append(
       h('span', { class: 'graph-lg-sep' }),
-      h('span', { class: 'sub' }, '大小 = 关联数'),
+      h('span', { class: 'sub' }, '圆点大小 = 关联数'),
       h('span', { class: 'sub graph-edge-key' }, [h('i', { class: 'ek ek-link' }), '[[链接]]', h('i', { class: 'ek ek-tag' }), '共享标签', h('i', { class: 'ek ek-sim' }), '内容相似']),
     )
   }
@@ -375,17 +395,33 @@ export default async function render(ctx) {
 
   const toolbar = h('div', { class: 'graph-toolbar' }, [
     h('div', { class: 'search-box graph-search' }, [icon('search'), search]),
-    h('label', { class: 'graph-ctl' }, ['标签', tagSel]),
-    h('label', { class: 'graph-ctl' }, ['最小权重', weight, weightLbl]),
-    h('label', { class: 'check' }, [isoBox, h('span', null, '隐藏孤立点')]),
-    typeBox('link'), typeBox('tag'), typeBox('similar'),
+    h('label', { class: 'graph-ctl' }, [h('span', null, '标签'), tagSel]),
     limitSel,
-    h('span', { class: 'graph-btns' }, [
-      btn('+', () => zoomBtn(1.25)), btn('−', () => zoomBtn(0.8)),
-      btn('适应', () => { userMoved = false; fitNow(); kick() }),
-      btn('重新布局', () => { L.alpha = 1; userMoved = false; kick() }),
+    h('details', { class: 'graph-opts' }, [
+      h('summary', null, [icon('sliders', 'icon-sm'), '视图选项']),
+      h('div', { class: 'graph-opts-body' }, [
+        h('label', { class: 'graph-ctl' }, [h('span', null, '最小权重'), weight, weightLbl]),
+        h('label', { class: 'check' }, [isoBox, h('span', null, '隐藏孤立点')]),
+        h('div', { class: 'graph-types', role: 'group', 'aria-label': '显示的边类型' }, [typeBox('link'), typeBox('tag'), typeBox('similar')]),
+      ]),
     ]),
   ])
+  const zoomBar = h('div', { class: 'graph-zoom', role: 'group', 'aria-label': '画布缩放' }, [
+    zbtn('放大（+）', () => zoomBtn(1.25), 'plus'), zbtn('缩小（-）', () => zoomBtn(0.8), 'minus'),
+    zbtn('适应窗口（0）', () => { userMoved = false; fitNow(); kick() }, 'fit'),
+    zbtn('重新布局', () => { L.alpha = 1; userMoved = false; kick() }, 'refresh'),
+  ])
+  stage.append(zoomBar)
+
+  // 键盘 / 读屏可用的替代入口：按关联数排序的节点列表（画布本身依赖指针拖拽与悬停）
+  const nodeListEl = h('div', { class: 'graph-nodelist' })
+  function renderNodeList() {
+    nodeListEl.textContent = ''
+    const top = [...shown.nodes].sort((a, b) => b.degree - a.degree).slice(0, 40)
+    if (!top.length) { nodeListEl.append(h('p', { class: 'sub' }, '当前过滤条件下没有节点。')); return }
+    nodeListEl.append(h('ul', null, top.map((n) => h('li', null, h('button', { type: 'button', class: 'graph-nbr', on: { click: () => { select(n.id); centerOn(n.id); dirty = true; kick() } } }, [h('i', { class: 'gdot', css: { background: kindColor(n.kind) } }), h('span', { class: 'graph-nbr-title' }, n.title || n.id), h('span', { class: 'sub' }, `${kindLabel(n.kind)} · ${n.degree}`)])))))
+    if (shown.nodes.length > top.length) nodeListEl.append(h('p', { class: 'sub' }, `仅列出关联数最高的 ${top.length} 个，共 ${fmtNum(shown.nodes.length)} 个；可用搜索或过滤缩小范围。`))
+  }
 
   const head = h('div', { class: 'page-head page-head-row' }, [
     h('div', null, [h('h1', null, '知识图谱'), h('p', { class: 'sub' }, `主库 ${fmtNum(data.stats.totalCards)} 张卡 · 边 = [[链接]] / 共享标签 Top-6 / 正文相似（≥0.42）· 只读`)]),
@@ -395,8 +431,9 @@ export default async function render(ctx) {
   const root = h('div', { class: 'page graph-page' }, [
     head,
     data.truncated ? notice('warn', '节点过多，已按关联度截断', `匹配 ${fmtNum(data.stats.matchedNodes)} 个节点，仅显示关联度最高的 ${fmtNum(data.stats.nodes)} 个。可调高“最多节点数”，或用标签/类型/最小权重缩小范围。`) : null,
-    panel(null, [toolbar, legendEl], { cls: 'panel-filters' }),
-    data.nodes.length === 0 ? empty('主库里还没有卡片') : h('div', { class: 'graph-layout' }, [stage, side]),
+    panel(null, [toolbar, legendEl], { cls: 'panel-filters graph-controls' }),
+    data.nodes.length === 0 ? empty('主库里还没有卡片', '图谱只展示已批准的卡片；沉淀并批准几张卡后这里会出现关系网络', h('a', { class: 'btn', href: '#/queue' }, '去待审队列'), 'graph') : h('div', { class: 'graph-layout' }, [stage, side]),
+    data.nodes.length ? h('details', { class: 'fold graph-fold' }, [h('summary', null, [h('span', { class: 'fold-title' }, '节点列表（键盘 / 读屏替代入口）'), h('span', { class: 'sub' }, '按关联数排序，回车选中并定位')]), h('div', { class: 'fold-body' }, nodeListEl)]) : null,
   ])
 
   if (data.nodes.length) {

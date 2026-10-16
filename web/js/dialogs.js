@@ -40,10 +40,12 @@ export function guard(controls, fn) {
   return async (...args) => {
     if (running) return undefined
     running = true
+    const src = args[0]?.currentTarget // 作为点击监听器时，被点的按钮显示加载转圈（纯视觉标记）
     for (const c of list) { c.disabled = true; c.setAttribute('aria-busy', 'true') }
+    if (src && list.includes(src)) src.setAttribute('data-spin', '')
     try { return await fn(...args) } finally {
       running = false
-      for (const c of list) { c.disabled = false; c.removeAttribute('aria-busy') }
+      for (const c of list) { c.disabled = false; c.removeAttribute('aria-busy'); c.removeAttribute('data-spin') }
     }
   }
 }

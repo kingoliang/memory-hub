@@ -24,7 +24,7 @@ function actionButton(label, cls, handler, ctx) {
 export function renderCardDetail(card, ctx = {}) {
   const rawMode = { v: false }
   const bodyHost = h('div', { class: 'body-host' }, renderMarkdown(card.body || ''))
-  const toggle = h('button', { type: 'button', class: 'btn btn-ghost' }, '查看原文')
+  const toggle = h('button', { type: 'button', class: 'btn btn-sm' }, '查看原文')
   toggle.addEventListener('click', () => {
     rawMode.v = !rawMode.v
     while (bodyHost.firstChild) bodyHost.removeChild(bodyHost.firstChild)
@@ -144,7 +144,8 @@ export function renderCardDetail(card, ctx = {}) {
       h('div', { class: 'detail-badges' }, [kindBadge(card.kind), statusBadge(card.status)]),
       h('h1', null, card.title || '（无标题）'),
       h('code', { class: 'path' }, card.path),
-      h('div', { class: 'detail-actions' }, actions),
+      h('p', { class: 'detail-meta sub' }, ['创建 ', timeEl(card.createdAt), ' · 更新 ', timeEl(card.updatedAt), ` · ${fmtNum((card.body || '').length)} 字符`]),
+      h('div', { class: 'detail-actions', role: 'group', 'aria-label': '卡片操作' }, actions),
     ]),
     card.redacted ? notice('warn', '检测到疑似明文密钥', `界面已把命中内容遮蔽为 [已遮蔽:类型]（类型：${card.secretTypes.map(secretLabel).join('、')}）。请到源头吊销该密钥并改写这张卡。`) : null,
     card.status === 'deleted' && card.retention ? notice('info', `回收站 · 还剩 ${card.retention.daysLeft} 天`, `将于 ${fmtDate(card.retention.expiresAt)} 自动永久清除（保留 ${card.retention.days} 天）。`) : null,
