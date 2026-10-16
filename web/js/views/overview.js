@@ -44,9 +44,17 @@ export default async function render(ctx) {
       pending ? h('span', { class: 'ov-hint' }, ['进入后 ', kbd('j'), kbd('k'), ' 切换 ', kbd('a'), ' 批准']) : null,
     ]),
   ])
-  const status = !o.alerts.length && !pending
-    ? notice('ok', '一切正常', '没有待审卡，也没有需要处理的告警')
-    : null
+  // 待审为 0：压缩成一行状态条（小号数字 + 一句说明 + 次要按钮；无告警时把"一切正常"并进同一行）。有待审 / 有告警仍走醒目样式。
+  const rejectedNote = o.quarantine.rejected ? `；另有 ${fmtNum(o.quarantine.rejected)} 张已驳回` : ''
+  const calmBlock = h('div', { class: 'ov-calm' + (o.alerts.length ? '' : ' ok'), role: 'status' }, [
+    h('span', { class: 'lab' }, 'A1 · 待审 Quarantine'),
+    h('span', { class: 'calm-num', 'aria-label': '0 张卡等待审核' }, '0'),
+    h('span', { class: 'calm-text' }, [
+      o.alerts.length ? '队列已清空' : [icon('ok'), h('strong', null, '一切正常 · 队列已清空')],
+      h('span', { class: 'calm-sub' }, o.alerts.length ? `没有待审卡${rejectedNote}。` : `没有待审卡，也没有需要处理的告警${rejectedNote}。`),
+    ]),
+    h('a', { class: 'btn btn-sm', href: '#/queue' }, ['查看队列', h('span', { 'aria-hidden': 'true' }, '→')]),
+  ])
 
   // ② 规模：编号指标格（B1…B5）
   const metric = (no, label, value, { hint, href, tone = '', unit } = {}) => h(href ? 'a' : 'div', { class: `metric ${tone}`, ...(href ? { href } : {}) }, [
@@ -63,10 +71,9 @@ export default async function render(ctx) {
 
   return h('div', { class: 'page overview' }, [
     pageHead('01', 'Overview', '总览', '先看有没有要处理的事，再看规模与近期活动。'),
-    h('section', { class: 'ov-a', 'aria-label': '待办' }, [
-      pendingBlock,
-      status || (o.alerts.length ? alertList(o.alerts) : null),
-    ]),
+    pending
+      ? h('section', { class: 'ov-a', 'aria-label': '待办' }, [pendingBlock, o.alerts.length ? alertList(o.alerts) : null])
+      : h('section', { class: 'ov-a ov-a-compact', 'aria-label': '待办' }, [calmBlock, o.alerts.length ? alertList(o.alerts) : null]),
     h('section', { class: 'metrics', 'aria-label': '规模' }, [
       metric('B1', '卡片总数', fmtNum(o.cards.total), { hint: `近 7 天新增 ${fmtNum(o.cards.recent7d)}`, href: '#/cards' }),
       metric('B2', '回收站', fmtNum(o.quarantine.deleted), { hint: '保留 30 天后清除', href: '#/recycle' }),

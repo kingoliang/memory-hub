@@ -937,6 +937,15 @@ a.bar-row, .bar-row:hover { background: transparent; }
 /* ---- 总览 ---- */
 .ov-a { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(420px, 100%), 1fr)); gap: 32px 48px; }
 .ov-pending { border-top: 3px solid var(--line-strong); padding-top: 12px; display: flex; flex-direction: column; gap: 12px; }
+.ov-a-compact { grid-template-columns: minmax(0, 1fr); gap: 16px; }
+.ov-calm { border-top: 3px solid var(--line-strong); border-bottom: 1px solid var(--line); padding: 10px 0; display: flex; align-items: center; gap: 8px 16px; flex-wrap: wrap; }
+.ov-calm .lab { flex: none; }
+.calm-num { font-size: 28px; line-height: 1; font-weight: 800; letter-spacing: -.03em; font-variant-numeric: tabular-nums; }
+.calm-text { flex: 1 1 260px; min-width: 0; display: flex; flex-wrap: wrap; align-items: center; gap: 2px 10px; }
+.calm-text .icon { color: var(--ok); }
+.calm-text strong { font-weight: 700; }
+.calm-sub { color: var(--muted); font-size: var(--fs-md); }
+.ov-calm .btn { margin-left: auto; }
 .big-row { display: flex; align-items: flex-end; gap: 20px; flex-wrap: wrap; }
 .big-num { font-size: clamp(120px, 16vw, 200px); line-height: .8; font-weight: 800; letter-spacing: -.05em; color: var(--accent); font-variant-numeric: tabular-nums; }
 .big-num.zero { color: var(--text); }
