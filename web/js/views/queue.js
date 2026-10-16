@@ -98,7 +98,7 @@ export default async function render(ctx) {
       h('div', { class: 'desk-meta' }, `${it.agent}${it.tags.length ? ' · ' + it.tags.join(', ') : ''}`),
       it.tags.length ? h('div', { class: 'card-row-tags' }, it.tags.slice(0, 8).map((t) => tagChip(t, `#/cards?tag=${encodeURIComponent(t)}`))) : null,
       reasonBox ? h('label', { class: 'desk-reason', for: 'desk-reason' }, [h('span', { class: 'lab' }, '驳回理由（可选，会记录在状态流转里；Shift+Enter 换行）'), reasonBox]) : null,
-      h('div', { class: 'desk-actions' }, [...both, h('a', { class: 'desk-more', href: `#/card?path=${encodeURIComponent(it.path)}` }, '查看全文 →')]),
+      h('div', { class: 'desk-actions' }, [aBtn, rBtn, h('a', { class: 'desk-more', href: `#/card?path=${encodeURIComponent(it.path)}` }, '查看全文 →')]),
     ]))
   }
   const rows = new Map()
