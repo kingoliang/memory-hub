@@ -1045,3 +1045,20 @@ a.metric:hover { background: var(--surface-2); text-decoration: none; }
 /* 表格单元格 / 列表内的卡片路径链接：不用标题级字号，避免撑破行高与相邻徽章 */
 td .card-link, .plain-list .card-link { font-size: var(--fs-md); font-weight: 600; line-height: 1.4; letter-spacing: 0; }
 .plain-list li { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; }
+
+/* 次要页面（回收站 / 标签 / 健康 / 活跃度 / 令牌 / 审计 / 账户）：12 列网格 + 编号分区 */
+.g12 { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 40px 32px; align-items: start; }
+.g12 > * { min-width: 0; }
+.g12 > .c12 { grid-column: span 12; }
+.g12 > .c7 { grid-column: span 7; }
+.g12 > .c6 { grid-column: span 6; }
+.g12 > .c5 { grid-column: span 5; }
+.stack { display: grid; gap: 12px; }
+.sec-no { margin-bottom: 4px; }
+.g12 > section > .sh { margin-bottom: 14px; }
+.g12 .table th { border-bottom: 1px solid var(--line-strong); }
+.g12 .table tbody tr:last-child td { border-bottom: 0; }
+@media (max-width: 860px) {
+  .g12 { grid-template-columns: minmax(0, 1fr); gap: 32px; }
+  .g12 > .c12, .g12 > .c7, .g12 > .c6, .g12 > .c5 { grid-column: auto; }
+}

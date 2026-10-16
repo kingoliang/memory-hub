@@ -3,7 +3,7 @@
 
 import { h } from '../dom.js'
 import { get, post, patch, del } from '../api.js'
-import { notice, table, badge, timeEl, tagChip, icon } from '../ui.js'
+import { notice, table, badge, timeEl, tagChip, icon, pageHead, secHead } from '../ui.js'
 import { fmtDate, fmtNum } from '../format.js'
 import { guard, toast, errText, confirmDialog, formDialog, openModal } from '../dialogs.js'
 
@@ -101,9 +101,10 @@ export default async function render(ctx) {
   }
 
   return h('div', { class: 'page' }, [
-    h('div', { class: 'page-head page-head-row' }, [h('div', null, [h('h1', null, '令牌'), h('p', { class: 'sub' }, `${d.total} 枚 · 每个 Agent 一枚，署名即令牌名`)]), create]),
-    notice('info', '不显示令牌明文与哈希', '明文只在创建时显示一次。丢了请撤销后重建。撤销立即生效。'),
-    table([
+    pageHead('12', 'Tokens', '令牌', `${d.total} 枚 · 每个 Agent 一枚，署名即令牌名`, create),
+    h('div', { class: 'g12' }, [
+    h('section', { class: 'c12' }, [secHead('A1', '明文策略'), notice('info', '不显示令牌明文与哈希', '明文只在创建时显示一次。丢了请撤销后重建。撤销立即生效。')]),
+    h('section', { class: 'c12' }, [secHead('B1', '令牌列表', `${d.total} 枚`), table([
       { label: '名称', render: (t) => h('strong', null, t.name) },
       { label: '范围', render: (t) => h('span', { class: 'inline' }, t.scopes.map((s) => tagChip(s))) },
       { label: '状态', render: (t) => badge(label[t.status], tone[t.status]) },
@@ -113,6 +114,7 @@ export default async function render(ctx) {
       { label: '吊销', render: (t) => (t.revokedAt ? fmtDate(t.revokedAt) : '—') },
       { label: '近 30 天调用', cls: 'num', render: (t) => fmtNum(t.calls30d) },
       { label: '操作', render: (t) => (t.status === 'revoked' ? '—' : h('span', { class: 'inline' }, [edit(t), revoke(t)])) },
-    ], d.items, { emptyText: '还没有令牌' }),
+    ], d.items, { emptyText: '还没有令牌' })]),
+    ]),
   ])
 }

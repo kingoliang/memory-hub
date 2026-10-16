@@ -3,7 +3,7 @@
 import { h } from '../dom.js'
 import { get, post } from '../api.js'
 import { cardRow } from './cards.js'
-import { notice, pager, empty } from '../ui.js'
+import { notice, pager, empty, pageHead, secHead } from '../ui.js'
 import { fmtDate } from '../format.js'
 import { createSelection, bulkBar, reportBatch } from '../bulk.js'
 import { guard, toast, errText, confirmDialog } from '../dialogs.js'
@@ -30,10 +30,10 @@ export default async function render(ctx) {
   }
 
   return h('div', { class: 'page' }, [
-    h('div', { class: 'page-head' }, [h('h1', null, '回收站'), h('p', { class: 'sub' }, `共 ${d.total} 张 · 保留 ${d.retentionDays} 天后自动永久清除`)]),
-    notice('info', '软删的卡可以恢复', '永久删除需要进入卡片详情页，输入卡片标题确认。'),
-    d.items.length ? bar : null,
-    d.items.length
+    pageHead('04', 'Recycle', '回收站', `共 ${d.total} 张 · 保留 ${d.retentionDays} 天后自动永久清除`),
+    h('div', { class: 'g12' }, [
+      h('section', { class: 'c12' }, [secHead('A1', '保留规则'), notice('info', '软删的卡可以恢复', '永久删除需要进入卡片详情页，输入卡片标题确认。')]),
+      h('section', { class: 'c12' }, [secHead('A2', '待恢复的卡片', `${d.total} 张`), d.items.length ? bar : null, d.items.length
       ? h('div', { class: 'card-list' }, d.items.map((it) => {
         const pct = Math.max(0, Math.min(100, Math.round((it.daysLeft / d.retentionDays) * 100)))
         const tone = it.daysLeft <= 3 ? 'bad' : it.daysLeft <= 10 ? 'warn' : 'ok'
@@ -49,6 +49,7 @@ export default async function render(ctx) {
         })
       }))
       : empty('回收站是空的', '软删的卡会在这里保留一段时间，之后自动永久清除', h('a', { class: 'btn', href: '#/cards' }, '返回卡片'), 'trash'),
-    d.total > limit ? pager(d, (o) => ctx.go(`#/recycle?offset=${o}`)) : null,
+      d.total > limit ? pager(d, (o) => ctx.go(`#/recycle?offset=${o}`)) : null]),
+    ]),
   ])
 }

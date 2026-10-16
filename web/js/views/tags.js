@@ -3,7 +3,7 @@
 
 import { h } from '../dom.js'
 import { get, post } from '../api.js'
-import { panel, notice, empty, badge, icon } from '../ui.js'
+import { panel, notice, empty, badge, icon, pageHead, secHead } from '../ui.js'
 import { fmtNum } from '../format.js'
 import { guard, toast, errText, openModal } from '../dialogs.js'
 
@@ -93,8 +93,9 @@ export default async function render(ctx) {
   ])
   const btn = (label, fn, cls = 'btn-ghost') => { const b = h('button', { type: 'button', class: `btn btn-sm ${cls}` }, label); b.addEventListener('click', fn); return b }
   return h('div', { class: 'page' }, [
-    h('div', { class: 'page-head' }, [h('h1', null, '标签'), h('p', { class: 'sub' }, `${fmtNum(d.distinct)} 种 · 仅出现一次的 ${fmtNum(d.singletonCount)} 种 · 疑似同义组 ${d.synonymGroups.length} 个`)]),
-    panel(null, form, { cls: 'panel-filters' }),
+    pageHead('05', 'Tags', '标签', `${fmtNum(d.distinct)} 种 · 仅出现一次的 ${fmtNum(d.singletonCount)} 种 · 疑似同义组 ${d.synonymGroups.length} 个`),
+    h('div', { class: 'g12' }, [
+    h('section', { class: 'c12' }, [secHead('A1', '搜索'), form]),
     d.synonymGroups.length
       ? panel('疑似同义标签', h('div', { class: 'syn-groups' }, d.synonymGroups.map((g) => h('div', { class: 'syn' }, [
         h('div', { class: 'syn-variants' }, g.variants.map((v) => h('a', { class: 'tag', href: `#/cards?tag=${encodeURIComponent(v.tag)}` }, [v.tag, h('b', null, fmtNum(v.count))]))),
@@ -102,9 +103,9 @@ export default async function render(ctx) {
           h('div', { class: 'sub' }, ['建议统一为 ', h('strong', null, g.suggested), `（共影响 ${g.cards} 张卡）`]),
           btn('合并…', () => tagOpDialog({ op: 'merge', from: g.variants.map((v) => v.tag), to: g.suggested }, ctx), 'btn-primary'),
         ]),
-      ]))), { sub: '大小写 / 空格 / 连字符差异的变体；合并前会预览影响的卡数，确认后才执行' })
+      ]))), { no: 'B1', cls: 'c12', sub: '大小写 / 空格 / 连字符差异的变体；合并前会预览影响的卡数，确认后才执行' })
       : null,
-    h('nav', { class: 'tabs' }, [
+    h('section', { class: 'c12' }, [secHead('C1', '全部标签', `${fmtNum(d.total)} 个`), h('nav', { class: 'tabs' }, [
       h('a', { class: 'tab' + (only ? '' : ' active'), href: `#/tags${q ? '?q=' + encodeURIComponent(q) : ''}` }, '全部'),
       h('a', { class: 'tab' + (only === 'singleton' ? ' active' : ''), href: `#/tags?only=singleton${q ? '&q=' + encodeURIComponent(q) : ''}` }, ['仅出现一次', badge(fmtNum(d.singletonCount), 'warn')]),
     ]),
@@ -121,6 +122,7 @@ export default async function render(ctx) {
         ]),
       ])))
       : empty('没有匹配的标签'),
-    d.total > d.items.length ? notice('info', null, `仅显示前 ${d.items.length} 个，共 ${d.total} 个；用搜索缩小范围。`) : null,
+    d.total > d.items.length ? notice('info', null, `仅显示前 ${d.items.length} 个，共 ${d.total} 个；用搜索缩小范围。`) : null]),
+    ]),
   ])
 }

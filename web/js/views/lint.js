@@ -2,7 +2,7 @@
 
 import { h } from '../dom.js'
 import { get } from '../api.js'
-import { panel, stat, badge, notice, cardLink, empty, icon } from '../ui.js'
+import { panel, stat, badge, notice, cardLink, empty, icon, pageHead, secHead } from '../ui.js'
 import { fmtNum, fmtBytes, fmtDate, secretLabel } from '../format.js'
 
 const row = (label, value, tone) => h('li', null, [h('span', null, label), tone ? badge(String(value), tone) : h('strong', null, String(value))])
@@ -17,18 +17,18 @@ export default async function render(ctx) {
     m.kindMisplaced ? `${m.kindMisplaced} 张卡 kind 与路径前缀不一致` : null,
   ].filter(Boolean)
   return h('div', { class: 'page' }, [
-    h('div', { class: 'page-head' }, [h('h1', null, '健康报告'), h('p', { class: 'sub' }, `${fmtNum(m.total)} 张卡 · 重复阈值 ${m.threshold}`)]),
-    ok ? notice('ok', '数据库完整性正常', `integrity_check=ok，主库不变量通过（主库 ${fmtNum(m.invariant.mainTotal)} 张全部为 approved）`) : notice('bad', '发现完整性问题', `integrity_check=${m.integrity}；主库违规 ${JSON.stringify(m.invariant.violations)}`),
-    issues.length ? notice('warn', '需要关注', issues.join('；')) : null,
-    h('div', { class: 'stats' }, [
+    pageHead('08', 'Health', '健康报告', `${fmtNum(m.total)} 张卡 · 重复阈值 ${m.threshold}`),
+    h('div', { class: 'g12' }, [
+    h('section', { class: 'c12' }, [secHead('A1', '状态'), h('div', { class: 'stack' }, [ok ? notice('ok', '数据库完整性正常', `integrity_check=ok，主库不变量通过（主库 ${fmtNum(m.invariant.mainTotal)} 张全部为 approved）`) : notice('bad', '发现完整性问题', `integrity_check=${m.integrity}；主库违规 ${JSON.stringify(m.invariant.violations)}`),
+    issues.length ? notice('warn', '需要关注', issues.join('；')) : null])]),
+    h('section', { class: 'c12' }, [secHead('B1', '核心指标'), h('div', { class: 'stats' }, [
       stat('噪声卡', m.noise, { tone: m.noise ? 'tone-warn' : '' }),
       stat('近似重复组', m.duplicateGroups, { hint: `可吸收 ${m.duplicateAbsorbable} 张` }),
       stat('标签种类', m.tagsDistinct, { hint: `仅一次 ${m.tagsSingleton} · 变体组 ${m.tagVariantGroups}` }),
       stat('密钥疑似', m.secretSuspects, { tone: m.secretSuspects ? 'tone-bad' : '' }),
       stat('隔离区', m.quarantine.pending + m.quarantine.rejected + m.quarantine.deleted, { hint: `待审 ${m.quarantine.pending} · 回收 ${m.quarantine.deleted}` }),
       stat('备份', m.backups.count, { hint: m.backups.last ? `最近 ${fmtDate(m.backups.last.at)} · ${fmtBytes(m.backups.last.bytes)}` : '尚无备份' }),
-    ]),
-    h('div', { class: 'grid-2' }, [
+    ])]),
       panel('指标明细', h('ul', { class: 'kv-list' }, [
         row('噪声卡', m.noise, m.noise ? 'warn' : 'ok'),
         row('近似重复组 / 可吸收', `${m.duplicateGroups} / ${m.duplicateAbsorbable}`, m.duplicateGroups ? 'warn' : 'ok'),
@@ -39,12 +39,12 @@ export default async function render(ctx) {
         row('kind 错放', m.kindMisplaced, m.kindMisplaced ? 'warn' : 'ok'),
         row('超大 raw 卡', m.oversizeRaw.length, m.oversizeRaw.length ? 'warn' : 'ok'),
         row('回收站最早删除', m.recycleOldest ? fmtDate(m.recycleOldest) : '—'),
-      ])),
+      ]), { no: 'C1', cls: 'c7' }),
       panel('明文密钥疑似卡', m.secrets.length
         ? h('ul', { class: 'plain-list' }, m.secrets.map((x) => h('li', null, [icon('lock', 'icon-sm'), cardLink(x.path, x.path), ' ', x.types.map((t) => badge(secretLabel(t), 'bad'))])))
-        : empty('没有发现'), { sub: '只显示卡路径与类型，不含值' }),
+        : empty('没有发现'), { no: 'C2', cls: 'c5', sub: '只显示卡路径与类型，不含值' }),
+    m.kindMisplacedList.length ? panel('kind 错放', h('ul', { class: 'plain-list' }, m.kindMisplacedList.map((k) => h('li', null, [cardLink(k.path, k.path), h('span', { class: 'sub' }, ` kind=${k.kind} → 路径暗示 ${k.expectedKind}`)]))), { no: 'D1', cls: 'c6' }) : null,
+    m.oversizeRaw.length ? panel('超大 raw 卡', h('ul', { class: 'plain-list' }, m.oversizeRaw.map((r) => h('li', null, [cardLink(r.path, r.path), h('span', { class: 'sub' }, ` ${fmtNum(r.chars)} 字（门槛 ${fmtNum(m.rawMaxChars)}）`)]))), { no: 'D2', cls: 'c6' }) : null,
     ]),
-    m.kindMisplacedList.length ? panel('kind 错放', h('ul', { class: 'plain-list' }, m.kindMisplacedList.map((k) => h('li', null, [cardLink(k.path, k.path), h('span', { class: 'sub' }, ` kind=${k.kind} → 路径暗示 ${k.expectedKind}`)])))) : null,
-    m.oversizeRaw.length ? panel('超大 raw 卡', h('ul', { class: 'plain-list' }, m.oversizeRaw.map((r) => h('li', null, [cardLink(r.path, r.path), h('span', { class: 'sub' }, ` ${fmtNum(r.chars)} 字（门槛 ${fmtNum(m.rawMaxChars)}）`)])))) : null,
   ])
 }

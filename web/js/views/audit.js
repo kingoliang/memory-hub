@@ -2,7 +2,7 @@
 
 import { h } from '../dom.js'
 import { get } from '../api.js'
-import { panel, table, badge, pager, icon } from '../ui.js'
+import { table, badge, pager, icon, pageHead, secHead } from '../ui.js'
 import { fmtDate, OUTCOME_LABEL } from '../format.js'
 
 export default async function render(ctx) {
@@ -27,9 +27,10 @@ export default async function render(ctx) {
     h('a', { class: 'btn btn-ghost', href: '#/audit' }, '重置'),
   ])
   return h('div', { class: 'page' }, [
-    h('div', { class: 'page-head' }, [h('h1', null, '审计日志'), h('p', { class: 'sub' }, `共 ${d.total} 条 · 不记录正文与令牌`)]),
-    panel(null, form, { cls: 'panel-filters' }),
-    table([
+    pageHead('13', 'Audit', '审计日志', `共 ${d.total} 条 · 不记录正文与令牌`),
+    h('div', { class: 'g12' }, [
+    h('section', { class: 'c12' }, [secHead('A1', '过滤'), form]),
+    h('section', { class: 'c12' }, [secHead('B1', '写入日志', `${d.total} 条`), table([
       { label: '时间', render: (r) => fmtDate(r.ts) },
       { label: '类型', render: (r) => r.actorType },
       { label: '谁', render: (r) => r.actorName || '—' },
@@ -39,6 +40,7 @@ export default async function render(ctx) {
       { label: '结果', render: (r) => badge(OUTCOME_LABEL[r.outcome] || r.outcome, r.outcome === 'ok' ? 'ok' : r.outcome === 'dup' ? 'neutral' : 'bad') },
       { label: 'IP', render: (r) => r.ip || '—' },
     ], d.items, { emptyText: '没有符合条件的日志' }),
-    d.total > limit ? pager(d, (offset) => go({ offset })) : null,
+    d.total > limit ? pager(d, (offset) => go({ offset })) : null]),
+    ]),
   ])
 }

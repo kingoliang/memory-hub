@@ -75,12 +75,15 @@ export const tagChip = (tag, href) => (href
 /** 已应用的筛选条件：点击 × 移除该条件（纯链接，可回退、可分享）。 */
 export const filterChip = (label, href) => h('a', { class: 'chip-filter', href, title: '移除该筛选' }, [label, icon('x', 'icon-xs')])
 
-export function panel(title, body, { actions, cls = '', sub } = {}) {
+export function panel(title, body, { actions, cls = '', sub, no } = {}) {
   return h('section', { class: 'panel ' + cls }, [
-    title || actions ? h('header', { class: 'panel-head' }, [h('div', null, [h('h2', null, title), sub ? h('p', { class: 'sub' }, sub) : null]), actions ? h('div', { class: 'panel-actions' }, actions) : null]) : null,
+    title || actions ? h('header', { class: 'panel-head' }, [h('div', null, [no ? h('div', { class: 'lab sec-no' }, no) : null, h('h2', null, title), sub ? h('p', { class: 'sub' }, sub) : null]), actions ? h('div', { class: 'panel-actions' }, actions) : null]) : null,
     h('div', { class: 'panel-body' }, body),
   ])
 }
+
+/** 编号分区标题（Swiss）：3px 粗线顶边 + 标题 + 右侧编号/标注。用于不带面板的分区。 */
+export const secHead = (no, title, hint) => h('div', { class: 'sh' }, [h('h2', null, title), h('span', { class: 'lab' }, hint ? `${no} · ${hint}` : no)])
 
 export function stat(label, value, { hint, tone = '', href, cls = '' } = {}) {
   const inner = [h('div', { class: 'stat-label' }, label), h('div', { class: 'stat-value' }, typeof value === 'number' ? fmtNum(value) : value), hint ? h('div', { class: 'stat-hint' }, hint) : null]

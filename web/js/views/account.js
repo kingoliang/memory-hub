@@ -2,7 +2,7 @@
 
 import { h } from '../dom.js'
 import * as api from '../api.js'
-import { panel, notice } from '../ui.js'
+import { panel, notice, pageHead, secHead } from '../ui.js'
 import { guard, toast, errText } from '../dialogs.js'
 
 export default async function render(ctx) {
@@ -30,8 +30,10 @@ export default async function render(ctx) {
     h('div', { class: 'edit-actions' }, submit),
   ])
   return h('div', { class: 'page' }, [
-    h('div', { class: 'page-head' }, [h('h1', null, '账户'), h('p', { class: 'sub' }, '单管理员口令')]),
-    notice('warn', '修改后所有会话立即失效', '包括当前这个：修改成功后会回到登录页，用新口令重新登录。连续输错旧口令会被限流。'),
-    panel('修改管理员口令', form),
+    pageHead('09', 'Account', '账户', '单管理员口令'),
+    h('div', { class: 'g12' }, [
+      panel('修改管理员口令', form, { no: 'A1', cls: 'c6' }),
+      h('section', { class: 'c6' }, [secHead('A2', '须知'), notice('warn', '修改后所有会话立即失效', '包括当前这个：修改成功后会回到登录页，用新口令重新登录。连续输错旧口令会被限流。')]),
+    ]),
   ])
 }
