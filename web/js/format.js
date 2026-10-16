@@ -51,3 +51,33 @@ export function fmtBytes(n) {
 export const fmtNum = (n) => (Number.isFinite(Number(n)) ? Number(n).toLocaleString('zh-CN') : '—')
 export const fmtPct = (x) => `${Math.round(x * 100)}%`
 export const secretLabel = (t) => SECRET_TYPE_LABEL[t] || t
+
+/** 摘要展示层：剥掉 Markdown 记号（只改显示，不改数据）。标题 #、粗斜体、行内代码、[[wiki]]、[文字](链接)、引用 >、列表符。 */
+export function plainExcerpt(text) {
+  let t = String(text ?? '')
+  t = t.replace(/```[\w+#.-]*/g, ' ')
+  t = t.replace(/\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g, (_, a, b) => b || a)
+  t = t.replace(/!?\[([^\]]*)\]\((?:[^)\s]*)\)/g, '$1')
+  t = t.replace(/(^|\s)#{1,6}\s+/g, '$1')
+  t = t.replace(/(^|\s)>\s+/g, '$1')
+  t = t.replace(/(^|\s)[-*+]\s+/g, '$1')
+  t = t.replace(/(\*\*|__)(.+?)\1/g, '$2')
+  t = t.replace(/(^|[\s(（])[*_]([^*_\s][^*_]*?)[*_](?=$|[\s.,;:!?)）。，、；：！？])/g, '$1$2')
+  t = t.replace(/`([^`]+)`/g, '$1')
+  t = t.replace(/\s+/g, ' ').trim()
+  return t
+}
+
+/** 本地日期键 YYYY-MM-DD（按浏览器时区，用于“按天分组”）。 */
+export function dayKey(iso) {
+  const d = new Date(iso)
+  return Number.isNaN(d.getTime()) ? '' : `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
+}
+
+export const fmtClock = (iso) => {
+  const d = new Date(iso)
+  return Number.isNaN(d.getTime()) ? '—' : `${pad(d.getHours())}:${pad(d.getMinutes())}`
+}
+
+const WEEK = ['日', '一', '二', '三', '四', '五', '六']
+export const weekdayLabel = (key) => { const d = new Date(key + 'T00:00:00'); return Number.isNaN(d.getTime()) ? '' : '星期' + WEEK[d.getDay()] }

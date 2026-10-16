@@ -37,15 +37,29 @@ const ICONS = {
   plus: 'M12 5v14M5 12h14',
   minus: 'M5 12h14',
   fit: 'M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5',
+  command: 'M9 6a3 3 0 10-3 3h12a3 3 0 10-3-3v12a3 3 0 103-3H6a3 3 0 103 3V6z',
+  list: 'M4 6h16M4 12h16M4 18h16',
+  grid: 'M4 4h7v7H4V4zm9 0h7v7h-7V4zM4 13h7v7H4v-7zm9 0h7v7h-7v-7z',
+  more: 'M5 12h.01M12 12h.01M19 12h.01',
+  down: 'M6 9l6 6 6-6',
+  user: 'M12 12a4 4 0 100-8 4 4 0 000 8zM4 21c0-4 3.6-7 8-7s8 3 8 7',
 }
 
 export function icon(name, cls = '') {
-  return s('svg', { class: 'icon ' + cls, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', 'stroke-width': '1.7', 'stroke-linecap': 'round', 'stroke-linejoin': 'round', 'aria-hidden': 'true', focusable: 'false' },
+  return s('svg', { class: 'icon ' + cls, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', 'stroke-width': '1.5', 'stroke-linecap': 'round', 'stroke-linejoin': 'round', 'aria-hidden': 'true', focusable: 'false' },
     s('path', { d: ICONS[name] || ICONS.info }))
 }
 
 export const badge = (text, tone = 'neutral', title) => h('span', { class: `badge badge-${tone}`, title }, text)
 export const kindBadge = (k) => h('span', { class: `badge kind kind-${k}` }, kindLabel(k))
+/** 键帽提示（快捷键）。 */
+export const kbd = (...keys) => h('span', { class: 'kbd-group' }, keys.map((k) => h('kbd', null, k)))
+/** 页头（Swiss 版式）：编号 / 英文标注 + 大号标题 + 一句说明 + 右侧附加内容。 */
+export const pageHead = (no, en, title, sub, extra) => h('header', { class: 'page-head page-hero' }, [
+  h('div', { class: 'hero-title' }, [h('div', { class: 'lab' }, `${no} / ${en}`), h('h1', null, title)]),
+  sub ? h('p', { class: 'hero-sub' }, sub) : null,
+  extra ? h('div', { class: 'hero-extra' }, extra) : null,
+])
 export function statusBadge(st) {
   const tone = { approved: 'ok', pending: 'warn', rejected: 'bad', deleted: 'mute' }[st] || 'neutral'
   return badge(statusLabel(st), tone)
@@ -79,8 +93,24 @@ export function notice(kind, title, text, action) {
   return h('div', { class: `notice notice-${kind}`, role: kind === 'bad' ? 'alert' : 'note' }, [icon(ic), h('div', { class: 'notice-text' }, [title ? h('strong', null, title) : null, text ? h('p', null, text) : null]), action ? h('div', { class: 'notice-action' }, action) : null])
 }
 
-/** 空状态：图标 + 说明 + 可选的下一步操作（链接或按钮）。 */
-export const empty = (text, sub, action, iconName = 'inbox') => h('div', { class: 'empty' }, [h('div', { class: 'empty-art', 'aria-hidden': 'true' }, icon(iconName)), h('p', { class: 'empty-title' }, text), sub ? h('p', { class: 'sub' }, sub) : null, action ? h('div', { class: 'empty-action' }, action) : null])
+/** 空状态插画：同一套“档案盒”线稿语言（墨线 + 朱砂小章），按场景换细节。纯 SVG，无外部资源。 */
+function illustration(name) {
+  const base = [
+    s('path', { d: 'M14 34h52v30a3 3 0 01-3 3H17a3 3 0 01-3-3V34z', class: 'il-ink' }),
+    s('path', { d: 'M10 26h60v8H10z', class: 'il-ink' }),
+    s('path', { d: 'M32 45h16', class: 'il-ink' }),
+  ]
+  const extra = {
+    ok: [s('circle', { cx: '58', cy: '20', r: '11', class: 'il-seal' }), s('path', { d: 'M52.5 20l4 4 7-8', class: 'il-seal-line' })],
+    trash: [s('path', { d: 'M22 12l8 8M30 12l-8 8', class: 'il-seal-line' }), s('path', { d: 'M24 54h32', class: 'il-ink' })],
+    search: [s('circle', { cx: '56', cy: '20', r: '9', class: 'il-seal' }), s('path', { d: 'M63 27l6 6', class: 'il-seal-line' })],
+    inbox: [s('path', { d: 'M22 14h36M26 8h28', class: 'il-ink il-faint' }), s('rect', { x: '50', y: '48', width: '10', height: '10', class: 'il-seal' })],
+  }
+  return s('svg', { class: 'illus', viewBox: '0 0 80 76', fill: 'none', 'aria-hidden': 'true', focusable: 'false' }, [...base, ...(extra[name] || extra.inbox)])
+}
+
+/** 空状态：插画 + 说明 + 可选的下一步操作（链接或按钮）。 */
+export const empty = (text, sub, action, iconName = 'inbox') => h('div', { class: 'empty' }, [h('div', { class: 'empty-art', 'aria-hidden': 'true' }, illustration(iconName === 'ok' || iconName === 'trash' || iconName === 'search' ? iconName : 'inbox')), h('p', { class: 'empty-title' }, text), sub ? h('p', { class: 'sub' }, sub) : null, action ? h('div', { class: 'empty-action' }, action) : null])
 
 /** 加载态：状态文字 + 与真实内容形状相近的骨架（读屏只读状态文字）。 */
 export const loading = (text = '加载中…') => h('div', { class: 'loading', role: 'status' }, [

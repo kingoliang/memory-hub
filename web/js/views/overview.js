@@ -4,7 +4,7 @@
 import { h } from '../dom.js'
 import { get } from '../api.js'
 import { fmtBytes, fmtNum, kindLabel, OUTCOME_LABEL, relTime } from '../format.js'
-import { panel, notice, barRow, sparkline, badge, table, timeEl, empty, icon } from '../ui.js'
+import { panel, notice, barRow, badge, table, timeEl, empty, icon, kbd, pageHead } from '../ui.js'
 
 /** 提醒列表：warn 在前；每条一行，左侧色条 + 图标 + 文本（颜色之外有图标与"需处理/提示"文字）。 */
 function alertList(alerts) {
@@ -31,50 +31,65 @@ export default async function render(ctx) {
   const last = o.vault.lastBackup
   const pending = o.quarantine.pending
 
-  // ① 行动区：有待审时给出显眼的入口；一切正常时只给一行安心的状态
-  const todo = pending
-    ? h('a', { class: 'callout callout-warn', href: '#/queue' }, [
-      h('span', { class: 'callout-icon' }, icon('queue')),
-      h('div', { class: 'callout-text' }, [h('strong', null, `${fmtNum(pending)} 张卡等待审核`), h('span', null, `批准后其他 Agent 才能检索到${o.quarantine.rejected ? `；另有 ${fmtNum(o.quarantine.rejected)} 张已驳回` : ''}`)]),
-      h('span', { class: 'callout-go' }, ['去审核', icon('arrow', 'icon-sm')]),
-    ])
-    : null
+  // ① 行动区（A1 待审大数字 + A2 提醒）：有待审时给出显眼入口；一切正常时只给一行安心的状态
+  const pendingBlock = h('div', { class: 'ov-pending' }, [
+    h('div', { class: 'lab' }, 'A1 · 待审 Quarantine'),
+    h('div', { class: 'big-row' }, [
+      h('span', { class: 'big-num' + (pending ? '' : ' zero'), 'aria-label': `${fmtNum(pending)} 张卡等待审核` }, fmtNum(pending)),
+      h('span', { class: 'big-cap' }, pending ? ['张卡', h('br'), '等待审核'] : ['队列', h('br'), '已清空']),
+    ]),
+    h('p', { class: 'sub' }, pending ? `批准后其他 Agent 才能检索到${o.quarantine.rejected ? `；另有 ${fmtNum(o.quarantine.rejected)} 张已驳回` : ''}。` : `没有待审卡${o.quarantine.rejected ? `；另有 ${fmtNum(o.quarantine.rejected)} 张已驳回` : ''}。`),
+    h('div', { class: 'ov-actions' }, [
+      h('a', { class: 'btn btn-primary', href: '#/queue' }, [pending ? '去审核' : '查看队列', h('span', { 'aria-hidden': 'true' }, '→')]),
+      pending ? h('span', { class: 'ov-hint' }, ['进入后 ', kbd('j'), kbd('k'), ' 切换 ', kbd('a'), ' 批准']) : null,
+    ]),
+  ])
   const status = !o.alerts.length && !pending
     ? notice('ok', '一切正常', '没有待审卡，也没有需要处理的告警')
     : null
 
-  const total = h('section', { class: 'kpi kpi-hero', 'aria-label': '卡片总数与近 30 天新增' }, [
-    h('div', { class: 'kpi-main' }, [
-      h('div', { class: 'stat-label' }, '卡片总数'),
-      h('div', { class: 'kpi-value' }, fmtNum(o.cards.total)),
-      h('div', { class: 'stat-hint' }, `近 7 天新增 ${fmtNum(o.cards.recent7d)}`),
-      h('a', { class: 'kpi-link', href: '#/cards' }, ['浏览全部卡片', icon('arrow', 'icon-sm')]),
-    ]),
-    h('div', { class: 'kpi-chart' }, [h('div', { class: 'kpi-chart-title' }, ['近 30 天新增', h('span', { class: 'sub' }, '按创建日期（UTC）')]), sparkline(o.daily.map((d) => ({ label: d.date.slice(5), value: d.count })), { label: '每日新增卡片', height: 84 })]),
+  // ② 规模：编号指标格（B1…B5）
+  const metric = (no, label, value, { hint, href, tone = '', unit } = {}) => h(href ? 'a' : 'div', { class: `metric ${tone}`, ...(href ? { href } : {}) }, [
+    h('span', { class: 'lab' }, `${no} · ${label}`),
+    h('span', { class: 'metric-value' }, unit ? [value, h('small', null, ` ${unit}`)] : value),
+    hint ? h('span', { class: 'metric-hint' }, hint) : null,
   ])
+  const size = fmtBytes(o.vault.dbBytes).split(' ')
+  const bytesParts = size.length === 2 ? size : [size[0], '']
 
-  const mini = (label, value, { hint, href, tone = '' } = {}) => h(href ? 'a' : 'div', { class: `kpi kpi-mini ${tone}`, ...(href ? { href } : {}) }, [
-    h('div', { class: 'stat-label' }, label),
-    h('div', { class: 'kpi-value kpi-value-sm' }, value),
-    hint ? h('div', { class: 'stat-hint' }, hint) : null,
-  ])
+  // ③ 近 30 天新增：柱状列（高度走 CSSOM 变量）
+  const dailyMax = Math.max(1, ...o.daily.map((d) => d.count))
+  const cols = h('div', { class: 'cols', role: 'img', 'aria-label': `近 30 天每日新增卡片柱状图，峰值 ${dailyMax}` }, o.daily.map((d) => h('i', { class: d.count ? '' : 'zero', title: `${d.date}：${d.count}`, css: { '--h': Math.round((d.count / dailyMax) * 100) + '%' } })))
 
   return h('div', { class: 'page overview' }, [
-    h('div', { class: 'page-head' }, [h('h1', null, '总览'), h('p', { class: 'sub' }, '先看有没有要处理的事，再看规模与近期活动')]),
-    todo,
-    status,
-    o.alerts.length ? alertList(o.alerts) : null,
-    h('div', { class: 'kpi-grid' }, [
-      total,
-      mini('待审', fmtNum(pending), { tone: pending ? 'tone-warn' : '', hint: pending ? `已驳回 ${fmtNum(o.quarantine.rejected)}` : '队列已清空', href: '#/queue' }),
-      mini('回收站', fmtNum(o.quarantine.deleted), { hint: '保留 30 天后清除', href: '#/recycle' }),
-      mini('标签', fmtNum(o.cards.tags), { hint: '去重后的种类', href: '#/tags' }),
-      mini('库大小', fmtBytes(o.vault.dbBytes), { hint: o.vault.walBytes ? `WAL ${fmtBytes(o.vault.walBytes)}` : '无 WAL 积压' }),
-      mini('备份', last ? relTime(last.at) : '暂无', { tone: last ? '' : 'tone-warn', hint: last ? `${fmtBytes(last.bytes)} · 共 ${o.vault.backupCount} 份` : '服务运行后自动备份' }),
+    pageHead('01', 'Overview', '总览', '先看有没有要处理的事，再看规模与近期活动。'),
+    h('section', { class: 'ov-a', 'aria-label': '待办' }, [
+      pendingBlock,
+      status || (o.alerts.length ? alertList(o.alerts) : null),
     ]),
-    h('div', { class: 'grid-2' }, [
-      panel('类型分布', kinds.length ? h('div', { class: 'bars' }, kinds.map(([k, n]) => barRow(kindLabel(k), n, maxKind, { href: `#/cards?kind=${encodeURIComponent(k)}` }))) : empty('还没有卡片', '让 Agent 调用 memory_capture 沉淀第一张卡'), { sub: '点击类型可筛选卡片' }),
-      panel('署名分布', o.agents.length ? h('div', { class: 'bars' }, o.agents.slice(0, 10).map((a) => barRow(a.name, a.cards, maxAgent, { tone: 'teal', href: a.name === '(未署名)' ? '#/cards?agent=__none__' : `#/cards?agent=${encodeURIComponent(a.name)}` }))) : empty('没有署名数据'), { sub: '主库已批准卡片，按 submitted_by' }),
+    h('section', { class: 'metrics', 'aria-label': '规模' }, [
+      metric('B1', '卡片总数', fmtNum(o.cards.total), { hint: `近 7 天新增 ${fmtNum(o.cards.recent7d)}`, href: '#/cards' }),
+      metric('B2', '回收站', fmtNum(o.quarantine.deleted), { hint: '保留 30 天后清除', href: '#/recycle' }),
+      metric('B3', '标签', fmtNum(o.cards.tags), { hint: '去重后的种类', href: '#/tags' }),
+      metric('B4', '库大小', bytesParts[0], { unit: bytesParts[1], hint: o.vault.walBytes ? `WAL ${fmtBytes(o.vault.walBytes)}` : '无 WAL 积压' }),
+      metric('B5', '备份', last ? relTime(last.at) : '暂无', { tone: last ? '' : 'tone-warn', hint: last ? `${fmtBytes(last.bytes)} · 共 ${o.vault.backupCount} 份` : '服务运行后自动备份' }),
+    ]),
+    h('section', { class: 'ov-cols' }, [
+      h('div', null, [
+        h('div', { class: 'sh' }, [h('h2', null, '近 30 天新增'), h('span', { class: 'lab' }, 'C1 · 按创建日期 UTC')]),
+        cols,
+        h('div', { class: 'lab cols-cap' }, [h('span', null, o.daily[0]?.date.slice(5) || ''), h('span', null, `峰值 ${dailyMax}`), h('span', null, o.daily[o.daily.length - 1]?.date.slice(5) || '')]),
+      ]),
+      h('div', null, [
+        h('div', { class: 'sh' }, [h('h2', null, '类型分布'), h('span', { class: 'lab' }, 'C2 · 点击筛选卡片')]),
+        kinds.length ? h('div', { class: 'bars' }, kinds.map(([k, n]) => barRow(kindLabel(k), n, maxKind, { href: `#/cards?kind=${encodeURIComponent(k)}` }))) : empty('还没有卡片', '让 Agent 调用 memory_capture 沉淀第一张卡'),
+      ]),
+    ]),
+    h('section', { class: 'ov-cols' }, [
+      h('div', null, [
+        h('div', { class: 'sh' }, [h('h2', null, '署名分布'), h('span', { class: 'lab' }, 'D1 · submitted_by')]),
+        o.agents.length ? h('div', { class: 'bars' }, o.agents.slice(0, 10).map((a) => barRow(a.name, a.cards, maxAgent, { href: a.name === '(未署名)' ? '#/cards?agent=__none__' : `#/cards?agent=${encodeURIComponent(a.name)}` }))) : empty('没有署名数据'),
+      ]),
     ]),
     panel('最近写入记录', table([
       { label: '时间', render: (r) => timeEl(r.ts) },

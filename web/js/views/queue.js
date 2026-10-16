@@ -1,10 +1,11 @@
 // 待审队列：批准 / 驳回（单个与批量），驳回可填理由。auditMode=all 时未批准的卡搜不到，所以批准要快。
 
-import { h } from '../dom.js'
+import { h, mount } from '../dom.js'
 import { get, post } from '../api.js'
-import { cardRow } from './cards.js'
-import { notice, pager, empty, badge, icon } from '../ui.js'
-import { fmtNum } from '../format.js'
+import { cardRow, isWide, rememberSel } from './cards.js'
+import { pager, empty, badge, kbd, pageHead, kindBadge, tagChip } from '../ui.js'
+import { renderMarkdown } from '../markdown.js'
+import { fmtNum, plainExcerpt } from '../format.js'
 import { createSelection, bulkBar, reportBatch } from '../bulk.js'
 import { guard, toast, errText, confirmDialog, formDialog } from '../dialogs.js'
 
@@ -17,7 +18,7 @@ export default async function render(ctx) {
   const sel = createSelection()
   const tab = (key, label, n) => h('a', { class: 'tab' + (status === key ? ' active' : ''), href: `#/queue?status=${key}`, ...(status === key ? { 'aria-current': 'page' } : {}) }, [label, badge(fmtNum(n), key === 'pending' && n ? 'warn' : 'neutral')])
   // 等待时间分级：≥14 天红、≥7 天橙（文字里始终带天数，颜色只是辅助）
-  const ageChip = (days) => h('span', { class: 'age ' + (days >= 14 ? 'age-bad' : days >= 7 ? 'age-warn' : '') }, [icon('pulse', 'icon-sm'), `已等待 ${days} 天`])
+  const ageChip = (days) => h('span', { class: 'age ' + (days >= 14 ? 'age-bad' : days >= 7 ? 'age-warn' : '') }, `已等待 ${days} 天`)
 
   const approve = async (paths) => {
     const multi = paths.length > 1
@@ -35,12 +36,18 @@ export default async function render(ctx) {
     if (!ok) return false
   }
 
+  // 单张的批准 / 驳回：行内按钮（窄屏）、审阅台按钮、键盘 a / r 都走这两个函数（即上面的 approve / reject）
+  const items = d.items
+  const rememberNext = (it) => { const i = items.indexOf(it); rememberSel((items[i + 1] || items[i - 1])?.path || '') }
+  const runApprove = async (it) => { try { if ((await approve([it.path])) !== false) { rememberNext(it); ctx.reload() } } catch (e) { toast('bad', errText(e)) } }
+  const runReject = async (it) => { try { if ((await reject([it.path])) !== false) { rememberNext(it); ctx.reload() } } catch (e) { toast('bad', errText(e)) } }
+
   const rowActions = (it) => {
     const a = h('button', { type: 'button', class: 'btn btn-primary btn-sm' }, '批准')
     const r = it.status === 'pending' ? h('button', { type: 'button', class: 'btn btn-ghost btn-sm' }, '驳回…') : null
     const both = [a, r].filter(Boolean)
-    a.addEventListener('click', guard(both, async () => { try { if ((await approve([it.path])) !== false) ctx.reload() } catch (e) { toast('bad', errText(e)) } }))
-    r?.addEventListener('click', guard(both, async () => { try { if ((await reject([it.path])) !== false) ctx.reload() } catch (e) { toast('bad', errText(e)) } }))
+    a.addEventListener('click', guard(both, () => runApprove(it)))
+    r?.addEventListener('click', guard(both, () => runReject(it)))
     return both
   }
 
@@ -49,23 +56,100 @@ export default async function render(ctx) {
     { label: '驳回所选…', tone: 'danger', run: reject },
   ], { reload: ctx.reload })
 
-  return h('div', { class: 'page' }, [
-    h('div', { class: 'page-head' }, [h('h1', null, '待审队列'), h('p', { class: 'sub' }, d.items.length ? `按等待时间排序，最久的在前（最久已等待 ${Math.max(...d.items.map((i) => i.ageDays))} 天）` : '按等待时间排序，最久的在前')]),
-    notice('info', '批准后才能被检索到', 'auditMode=all 时，未批准的卡不会被 memory_recall 搜到。可勾选多张批量批准 / 驳回；点卡片标题查看全文。'),
-    h('nav', { class: 'tabs' }, [tab('all', '全部', d.counts.pending + d.counts.rejected), tab('pending', '待审', d.counts.pending), tab('rejected', '已驳回', d.counts.rejected)]),
-    d.items.length ? bar : null,
-    d.items.length
-      ? h('div', { class: 'card-list' }, d.items.map((it) => cardRow(it, {
-        select: sel.checkbox(it.path, it.title),
-        actions: rowActions(it),
-        excerptLines: 3,
-        cls: 'queue-row',
-        extra: [
-          ageChip(it.ageDays),
-          it.reason ? h('span', { class: 'meta-reason' }, `原因：${it.reason}`) : null,
-        ],
-      })))
+  // ---- 审阅台（右栏）：显示选中的卡；批准 / 驳回按钮与快捷键 a / r 共用 runApprove / runReject ----
+  const desk = h('article', { class: 'split-pane', 'aria-label': '审阅台', 'aria-live': 'polite' })
+  const cache = new Map()
+  let cur = null
+  let approveBtn = null
+  let rejectBtn = null
+  const renderDesk = (it, card) => {
+    const aBtn = h('button', { type: 'button', class: 'btn btn-primary', 'aria-keyshortcuts': 'a' }, ['批准 ', kbd('a')])
+    const rBtn = it.status === 'pending' ? h('button', { type: 'button', class: 'btn btn-danger-ghost', 'aria-keyshortcuts': 'r' }, ['驳回… ', kbd('r')]) : null
+    const both = [aBtn, rBtn].filter(Boolean)
+    aBtn.addEventListener('click', guard(both, () => runApprove(it)))
+    rBtn?.addEventListener('click', guard(both, () => runReject(it)))
+    approveBtn = aBtn
+    rejectBtn = rBtn
+    const body = card ? h('div', { class: 'desk-body md' }, renderMarkdown(card.body || '')) : h('p', { class: 'desk-body' }, it.excerpt ? plainExcerpt(it.excerpt) : '加载正文…')
+    mount(desk, h('div', { class: 'desk' }, [
+      h('div', { class: 'desk-top' }, [h('span', { class: 'lab pane-no' }, [kindBadge(it.kind), ` · ${String(items.indexOf(it) + 1 + offset).padStart(2, '0')}`]), h('span', { class: 'lab' }, it.status === 'pending' ? `已等待 ${it.ageDays} 天` : '已驳回')]),
+      h('h2', null, it.title || '（无标题）'),
+      body,
+      it.reason ? h('p', { class: 'meta-reason' }, `原因：${it.reason}`) : null,
+      h('div', { class: 'desk-meta' }, `${it.agent}${it.tags.length ? ' · ' + it.tags.join(', ') : ''}`),
+      it.tags.length ? h('div', { class: 'card-row-tags' }, it.tags.slice(0, 8).map((t) => tagChip(t, `#/cards?tag=${encodeURIComponent(t)}`))) : null,
+      h('div', { class: 'desk-actions' }, [...both, h('a', { class: 'desk-more', href: `#/card?path=${encodeURIComponent(it.path)}` }, '查看全文 →')]),
+    ]))
+  }
+  const rows = new Map()
+  const pick = async (it, { remember = true } = {}) => {
+    cur = it
+    for (const [pth, row] of rows) { row.classList.toggle('is-selected', pth === it.path); if (pth === it.path) row.setAttribute('aria-current', 'true'); else row.removeAttribute('aria-current') }
+    if (remember) rememberSel(it.path)
+    if (!isWide()) return
+    renderDesk(it, cache.get(it.path))
+    if (cache.has(it.path)) return
+    try {
+      const card = await get('card', { path: it.path })
+      cache.set(it.path, card)
+      if (cur === it) renderDesk(it, card)
+    } catch { /* 正文拉取失败：保留摘要，批准 / 驳回仍可用 */ }
+  }
+  const move = (delta) => {
+    if (!items.length) return
+    const i = Math.max(0, Math.min(items.length - 1, items.indexOf(cur) + delta))
+    pick(items[i])
+    rows.get(items[i].path)?.scrollIntoView({ block: 'nearest' })
+  }
+
+  // 键盘：j / k 上下切换，a 批准，r 驳回。输入框 / 对话框打开 / 带修饰键时不触发；页面被换掉后自动卸载监听。
+  const root = h('div', { class: 'page' }, [])
+  const onKey = (e) => {
+    if (!root.isConnected) { document.removeEventListener('keydown', onKey); return }
+    if (e.metaKey || e.ctrlKey || e.altKey || e.repeat || !isWide()) return
+    const t = e.target
+    if (t && (/^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName) || t.isContentEditable)) return
+    if (document.querySelector('.modal-layer .modal')) return
+    if (e.key === 'j') { e.preventDefault(); move(1) } else if (e.key === 'k') { e.preventDefault(); move(-1) } else if (e.key === 'a') { if (approveBtn) { e.preventDefault(); approveBtn.click() } } else if (e.key === 'r') { if (rejectBtn) { e.preventDefault(); rejectBtn.click() } }
+  }
+  document.addEventListener('keydown', onKey)
+
+  const list = h('div', { class: 'card-list' }, items.map((it, i) => {
+    const row = cardRow(it, {
+      select: sel.checkbox(it.path, it.title),
+      actions: rowActions(it),
+      cls: 'queue-row',
+      no: String(offset + i + 1).padStart(2, '0'),
+      pick,
+      extra: [
+        ageChip(it.ageDays),
+        it.reason ? h('span', { class: 'meta-reason' }, `原因：${it.reason}`) : null,
+      ],
+    })
+    rows.set(it.path, row)
+    return row
+  }))
+  const initial = items.find((it) => it.path === ctx.params.get('sel')) || items[0]
+  if (initial) pick(initial, { remember: false })
+  const mq = globalThis.matchMedia?.('(min-width: 1101px)')
+  mq?.addEventListener?.('change', (e) => { if (e.matches && desk.isConnected && cur) pick(cur, { remember: false }) })
+
+  const subText = items.length ? `按等待时间排序，最久的在前（最久已等待 ${Math.max(...items.map((i) => i.ageDays))} 天）。批准后才能被 memory_recall 检索到。` : '按等待时间排序，最久的在前。批准后才能被 memory_recall 检索到。'
+  const children = [
+    pageHead('03', 'Review', '待审队列', subText),
+    h('div', { class: 'queue-toolbar' }, [
+      h('nav', { class: 'tabs', 'aria-label': '队列状态' }, [tab('all', '全部', d.counts.pending + d.counts.rejected), tab('pending', '待审', d.counts.pending), tab('rejected', '已驳回', d.counts.rejected)]),
+      h('div', { class: 'kbd-hints', 'aria-label': '键盘快捷键' }, [
+        h('span', null, [kbd('j'), kbd('k'), ' 上下切换']),
+        h('span', null, [kbd('a'), ' 批准']),
+        h('span', null, [kbd('r'), ' 驳回']),
+      ]),
+    ]),
+    items.length
+      ? h('section', { class: 'split split-queue' }, [h('div', { class: 'split-list' }, [bar, list]), desk])
       : empty('队列是空的', '没有待审或被驳回的卡片，Agent 新沉淀的卡会出现在这里', h('a', { class: 'btn', href: '#/cards' }, '去看已批准的卡片'), 'ok'),
     d.total > limit ? pager(d, (o) => ctx.go(`#/queue?status=${status}&offset=${o}`)) : null,
-  ])
+  ]
+  for (const c of children) if (c) root.appendChild(c)
+  return root
 }

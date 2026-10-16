@@ -3,7 +3,7 @@
 
 import { h } from '../dom.js'
 import { get, post } from '../api.js'
-import { panel, stat, notice, empty, badge, cardLink, icon, table } from '../ui.js'
+import { panel, stat, notice, empty, badge, cardLink, icon, table, pageHead } from '../ui.js'
 import { fmtNum, secretLabel, fmtDate } from '../format.js'
 import { guard, toast, errText, confirmDialog } from '../dialogs.js'
 
@@ -62,8 +62,7 @@ export default async function render(ctx) {
   ])
   const more = (k, n) => (d.truncated[k] ? h('p', { class: 'sub' }, `仅显示前 ${n} 项，共 ${c[{ noise: 'noise', duplicates: 'duplicateGroups', tags: 'tagChanges', kindMisplaced: 'kindMisplaced', secrets: 'secrets', oversizeRaw: 'oversizeRaw' }[k]]} 项`) : null)
   return h('div', { class: 'page' }, [
-    h('div', { class: 'page-head' }, [h('h1', null, '整理中心'), h('p', { class: 'sub' }, ['planId ', h('code', null, d.planId), ` · ${fmtNum(d.totals.cards)} 张卡`])]),
-    notice('ok', '预览不会修改任何数据', '下面先是计划预览（与 memory_tidy_plan 同一套逻辑）；要执行请用"执行整理"面板：先演练 → 再输入确认词 → 才会真正修改，且执行前自动备份、批后自检、失败自动回滚。'),
+    pageHead('04', 'Tidy', '整理中心', '预览不会修改任何数据。要执行：先演练，再输入确认词，才会真正改库；执行前自动备份，批后自检，失败自动回滚。', h('span', { class: 'lab' }, ['planId ', h('code', null, d.planId), ` · ${fmtNum(d.totals.cards)} 张卡`])),
     h('div', { class: 'stats' }, [
       stat('噪声卡', c.noise, { tone: c.noise ? 'tone-warn' : '' }),
       stat('近似重复组', c.duplicateGroups, { hint: `可吸收 ${c.duplicateAbsorbable} 张` }),

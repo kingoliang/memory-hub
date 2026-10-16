@@ -65,12 +65,13 @@ function buildShell() {
     if (open) nav.querySelector('a')?.focus()
     else if (sidebar.contains(document.activeElement)) menu.focus()
   }
+  let navNo = 0 // 导航编号：01、02… 贯穿所有分组
   const nav = h('nav', { class: 'nav', 'aria-label': '主导航' }, NAV.map((g) => h('div', { class: 'nav-group' }, [
     h('div', { class: 'nav-title' }, g.group),
     ...g.items.map(([key, label, ic]) => {
       const b = h('span', { class: 'nav-badge', hidden: true })
       badges[key] = b
-      const a = h('a', { class: 'nav-link', href: `#/${key}`, 'data-key': key, on: { click: () => setNav(false) } }, [icon(ic), h('span', { class: 'nav-text' }, label), b])
+      const a = h('a', { class: 'nav-link', href: `#/${key}`, 'data-key': key, on: { click: () => setNav(false) } }, [h('span', { class: 'nav-no', 'aria-hidden': 'true' }, String(++navNo).padStart(2, '0')), h('span', { class: 'nav-text' }, label), b])
       links[key] = a
       return a
     }),

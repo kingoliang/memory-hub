@@ -5,7 +5,7 @@
 import { h } from '../dom.js'
 import { get } from '../api.js'
 import { kindLabel, fmtNum, fmtDate } from '../format.js'
-import { panel, notice, empty, kindBadge, tagChip, icon } from '../ui.js'
+import { panel, notice, empty, kindBadge, tagChip, icon, pageHead } from '../ui.js'
 import {
   EDGE_LABEL, kindColor, nodeRadius, filterGraph, searchMatches, adjacency, tagCounts,
   createLayout, stepLayout, runLayout, LAYOUT_DONE, fitView, screenToWorld, zoomAt, hitTest, topLabelIds, clampZoom,
@@ -423,10 +423,7 @@ export default async function render(ctx) {
     if (shown.nodes.length > top.length) nodeListEl.append(h('p', { class: 'sub' }, `仅列出关联数最高的 ${top.length} 个，共 ${fmtNum(shown.nodes.length)} 个；可用搜索或过滤缩小范围。`))
   }
 
-  const head = h('div', { class: 'page-head page-head-row' }, [
-    h('div', null, [h('h1', null, '知识图谱'), h('p', { class: 'sub' }, `主库 ${fmtNum(data.stats.totalCards)} 张卡 · 边 = [[链接]] / 共享标签 Top-6 / 正文相似（≥0.42）· 只读`)]),
-    h('div', { class: 'inline' }, [countEl, focus ? h('button', { type: 'button', class: 'btn btn-sm', on: { click: () => nav({ focus: '' }) } }, '返回全图') : null]),
-  ])
+  const head = pageHead('05', 'Graph', '知识图谱', `主库 ${fmtNum(data.stats.totalCards)} 张卡 · 边 = [[链接]] / 共享标签 Top-6 / 正文相似（≥0.42）· 只读`, [countEl, focus ? h('button', { type: 'button', class: 'btn btn-sm', on: { click: () => nav({ focus: '' }) } }, '返回全图') : null])
 
   const root = h('div', { class: 'page graph-page' }, [
     head,
