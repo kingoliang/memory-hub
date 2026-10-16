@@ -15,6 +15,7 @@ import { DEFAULT_LLM_TIMEOUT_MS } from '../config.js'
 import { resolveDedupConfig } from './dedup-config.js'
 import { enforceAudit, getDb } from './db.js'
 import { detectSecrets } from './tidy.js'
+import { truncateAtBoundary, normalizeLiteralEscapes } from './vault.js'
 import { getLogger } from '../logger.js'
 
 /**
@@ -108,7 +109,7 @@ export async function runStandaloneCapture(vaultRoot, text, { source = '', submi
   }
   const out = await captureCard(vaultRoot, rawCard, dupOpts)
   if (out.ok) return { ok: true, action: 'created', path: out.path ?? out.rel, degraded: true }
-  if (out.duplicate) return { ...(await handleDuplicate(vaultRoot, out.duplicate, clean, dd, clean.slice(0, 400), rawCard, log)), degraded: true }
+  if (out.duplicate) return { ...(await handleDuplicate(vaultRoot, out.duplicate, clean, dd, truncateAtBoundary(clean, 400), rawCard, log)), degraded: true }
   return { ok: false, action: 'failed', reason: String(out.reason || 'write failed') }
 }
 
@@ -173,7 +174,7 @@ async function distillWithRetry(llmClient, route, clean, neighbors, log) {
  *  - 命中主库卡 → merge 开：并入独特行（返回 merged 条数）；merge 关：旧行为，追加更新记录。
  * action 仍是 'appended'（与 v0.10.8 对调用方的约定兼容），新增字段 merged / via 仅供参考。
  */
-async function handleDuplicate(vaultRoot, dup, text, dd, legacyText = text.slice(0, 400), card = {}, log = getLogger()) {
+async function handleDuplicate(vaultRoot, dup, text, dd, legacyText = truncateAtBoundary(normalizeLiteralEscapes(text), 400), card = {}, log = getLogger()) {
   if (dup.store === 'quarantine') {
     log.info('capture 跳过：待审队列已有近似卡', { path: dup.path, similarity: Number(dup.score.toFixed(2)) })
     return { ok: true, action: 'skipped', reason: `待审队列已有近似卡：${dup.path}`, path: dup.path }

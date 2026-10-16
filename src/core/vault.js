@@ -663,6 +663,74 @@ export async function appendUpdate(root, rel, updateText) {
 export const MERGE_SECTION_TITLE = '## 合并补充（来自已合并的近似卡）'
 
 /**
+ * 把「字面」转义序列（反斜杠 + n/r/t，模型输出被二次转义的产物）规整成真实换行 / 空白。
+ * 只处理围栏代码块（```…```）和行内代码（`…`）**之外**的部分，代码里合法的 \n 保持原样；
+ * 紧跟在 `:` `/` `\` 后面的（Windows 路径如 C:\new）也不动。
+ */
+export function normalizeLiteralEscapes(text) {
+  const parts = String(text ?? '').split(/(```[\s\S]*?```|`[^`\n]*`)/)
+  return parts.map((part, i) => {
+    if (i % 2 === 1) return part // 代码片段
+    // 字面转义前后都是 [A-Za-z0-9_] 时视为路径 / 标识符（new\table、foo\nbar），不动；紧跟在 : / \ 后的同样不动。
+    return part.replace(/\\(r\\n|[nrt])/g, (m, k, off, str) => {
+      const prev = str[off - 1] ?? ''
+      const next = str[off + m.length] ?? ''
+      if (/[:/\\]/.test(prev) || (/[A-Za-z0-9_]/.test(prev) && /[A-Za-z0-9_]/.test(next))) return m
+      return k === 't' ? ' ' : '\n'
+    })
+  }).join('')
+}
+
+const SENTENCE_END = /[。！？；!?;]/
+const CLOSERS = /[」』）)”"'】\]]/
+const wordSegmenter = (() => { try { return new Intl.Segmenter('zh', { granularity: 'word' }) } catch { return null } })()
+
+/**
+ * 超长文本按边界截取（上限数值由调用方给定，这里只决定「切在哪」）：
+ *  1. 句末标点（。！？；!?; 以及后面跟空白的英文句点）及紧随的收尾引号 / 括号，整句保留，不加省略号；
+ *  2. 换行（行 / 段边界）；
+ *  3. 词边界（Intl.Segmenter 中文分词 / 英文单词），末尾加「…」——绝不切在一个词中间；
+ *  4. 实在没有任何边界才按字符硬切，同样加「…」。
+ * 前三种边界都要求保留至少一半上限长度，避免为了贴边界而丢掉大半内容。
+ */
+export function truncateAtBoundary(text, max) {
+  const s = String(text ?? '')
+  if (s.length <= max) return s
+  const floor = Math.floor(max / 2)
+  const win = s.slice(0, max)
+  // 1. 句末
+  for (let i = win.length - 1; i >= floor; i--) {
+    const c = win[i]
+    const next = s[i + 1]
+    const isEnd = SENTENCE_END.test(c) || (c === '.' && (next === undefined || /\s/.test(next)))
+    if (!isEnd) continue
+    let end = i + 1
+    while (end < s.length && end < max + 1 && CLOSERS.test(s[end])) end++
+    if (end > max) end = i + 1
+    return s.slice(0, end).trimEnd()
+  }
+  // 2. 换行
+  const nl = win.lastIndexOf('\n')
+  if (nl >= floor) return win.slice(0, nl).trimEnd()
+  // 3. 词边界（给「…」留 1 个字符）
+  const room = max - 1
+  if (wordSegmenter) {
+    let cut = -1
+    for (const seg of wordSegmenter.segment(s.slice(0, room + 40))) {
+      const end = seg.index + seg.segment.length
+      if (end <= room) cut = end
+      else break
+    }
+    if (cut >= floor) return s.slice(0, cut).trimEnd() + '…'
+  } else {
+    const ws = s.slice(0, room + 1).search(/\s\S*$/)
+    if (ws >= floor) return s.slice(0, ws).trimEnd() + '…'
+  }
+  // 4. 字符硬切
+  return s.slice(0, room).trimEnd() + '…'
+}
+
+/**
  * 找出 incoming 中「目标正文里没有」的独特行（逐行与目标各行做 bigram Jaccard，
  * 最相近的一行 < lineSim 才算独特）。纯函数。标题行(#)与过短行(<= 8 字)不参与。
  */
@@ -671,9 +739,9 @@ export function uniqueLinesAgainst(targetBody, incoming, { lineSim = 0.35, max =
   const have = split(targetBody).map((l) => bigramHashSet(l))
   const out = []
   const seen = new Set()
-  for (const raw of split(incoming).slice(0, scanLimit)) {
+  for (const raw of split(normalizeLiteralEscapes(incoming)).slice(0, scanLimit)) {
     if (out.length >= max) break
-    const l = raw.slice(0, maxLineLen)
+    const l = truncateAtBoundary(raw, maxLineLen)
     if (seen.has(l)) continue
     const s = bigramHashSet(l)
     let best = 0
