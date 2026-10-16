@@ -212,6 +212,20 @@ test('蒸馏 skip（预筛判定无复用信号）→ 降级并留 INFO 决策�
   } finally { await srv.close() }
 })
 
+test('模型返回 append_to 指令（无 save 字段）→ 降级并留 WARN 日志（此前完全静默）', async () => {
+  const srv = await fakeServer(() => ({ content: JSON.stringify({ append_to: '04-Content/某张已有卡.md', update: '补充一段足够长的更新说明文字。' }) }))
+  const sink = logSink()
+  try {
+    await withHub(async (h) => {
+      const out = await runStandaloneCapture(h.home, durableText('追加指令'), { llm: createOpenAiLlm({ baseUrl: srv.baseUrl, model: 'm' }), submittedBy: 'a', log: createLogger({ level: 'debug', stream: sink.stream }) })
+      assert.equal(out.degraded, true)
+      const w = sink.lines().map((l) => JSON.parse(l)).find((r) => r.level === 'WARN' && /蒸馏结果未被处理/.test(r.msg))
+      assert.ok(w, sink.text())
+      assert.equal(w.hasAppendTo, true)
+    })
+  } finally { await srv.close() }
+})
+
 // -- 5. 解析兜底 -------------------------------------------------------------
 test('解析：多对象并排取第一个有效对象；尾部多余字符忽略；围栏与单对象不受影响', () => {
   const a = JSON.stringify({ save: true, title: '第一个对象标题', kind: 'knowledge', tags: [], body: '# 第一个对象标题\n\n正文内容一二三四五' })

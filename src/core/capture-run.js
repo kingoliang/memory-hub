@@ -81,6 +81,9 @@ export async function runStandaloneCapture(vaultRoot, text, { source = '', submi
         return { ok: false, action: 'failed', reason: String(out.reason || 'write failed') }
       }
       if (result && result.save === false) return { ok: true, action: 'skipped', reason: 'model judged not durable' }
+      // 第三条静默降级：模型给出 append_to 追加指令时，cardFromParsedJson 返回的对象没有 save 字段，
+      // 上面两个分支都不命中，会无声落入原文卡。本次只补可见性日志，不改行为（是否真正执行追加需另行决策）。
+      if (result) log.warn('蒸馏结果未被处理（无 save 字段，如 append_to 追加指令），降级为原文卡', { keys: Object.keys(result), hasAppendTo: !!result.append_to, inputChars: clean.length })
     } catch (error) {
       // LLM 失败 → 落入降级路径，不能让一次网络抖动丢掉沉淀
       const timedOut = error?.name === 'TimeoutError' || error?.name === 'AbortError'
