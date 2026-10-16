@@ -5,14 +5,28 @@
 // 对外只读节点位置（{x,y,c,id}），不改图谱布局；绘制层与命中测试无关，不会拦截任何指针事件。
 
 const TAU = Math.PI * 2
-export const LEG_COUNT = 18
 export const BODY_R = 15 // 屏幕像素：随缩放不变
-const REACH_PX = 86 // 触手基础伸展长度（屏幕像素）
 export const THROW_AT = 0.4 // 脚踩到命中节点后，停留进行到该比例时把卡片“扔出去”
 const TRAIL_MAX = 80
 
 const clamp = (v, a, b) => Math.min(b, Math.max(a, v))
 export const easeInOut = (p) => (p < 0.5 ? 4 * p * p * p : 1 - Math.pow(-2 * p + 2, 3) / 2)
+/** 正弦缓入缓出：端点速度为 0，峰值速度 = π/2 × 平均速度（立方缓动是 3×，同样时长下更急冲）。 */
+export const easeSine = (p) => 0.5 - 0.5 * Math.cos(Math.PI * p)
+/** 簇间跳转 = 屏幕距离 > HOP_PX 的一段。时长 = max(最小时长, 路径长 / 平均速度)：随距离增长，且有下限，不会闪现。 */
+export const HOP_PX = 170
+export const HOP_MIN_MS = 250
+export const STEP_MIN_MS = 90 // 簇内短步最小时长
+/** 各段平均速度上限（屏幕 px/s）。正弦缓动峰值 = π/2 × 平均，所以跳转峰值 ≤ ~3300px/s，簇内短步峰值 ≤ ~1250px/s。 */
+export const HOP_VAVG_MAX = 2100
+export const STEP_VAVG_MAX = 800
+export const TURN_RATE_MAX = 25 // rad/s（理论上限 ≈ 24°/帧@60fps，实测更小：转弯主要发生在缓入的低速段）
+export const TOUR_MAX_MS = 6300 // 搜索巡游总时长上限
+export const TOUR_SCAN_MS = 400 // 开场扫描
+export const LEG_SLOTS = 18 // 腿槽位数（上限）
+export const LEG_COUNT = LEG_SLOTS
+export const LEG_MIN = 3
+export const LEG_RHO_PX = 140 // 统计“附近节点数”/ 选落脚点的屏幕半径
 export const easeOutBack = (p) => { const c1 = 1.70158; const c3 = c1 + 1; return 1 + c3 * Math.pow(p - 1, 3) + c1 * Math.pow(p - 1, 2) }
 
 // ---------------------------------------------------------------------------
@@ -75,6 +89,122 @@ export function orderPath(start, pts) {
 }
 
 /**
+ * 受曲率限制的转向路径（纯函数）：从 p0 出发，初始航向 h0（C1 连续），每走 ds 最多转 ds/R，朝 p1 追踪（先按最大曲率转弯、对准后直线切过去）。
+ * R = min(rMin, 0.9·d/(2|sinα|))：目标必在转弯圆之外，保证收敛、不绕圈；峰值转角率 = 速度 / R，由路径长度与时长共同限定（见 buildTourPlan）。
+ * 返回 {pts:[x0,y0,x1,y1…], cum:[累计弧长], len, endDir}；h0 为空时直接朝向 p1。
+ */
+export function steerPath(p0, h0, p1, { zoom = 1, rMinPx = 160, k = 0.9 } = {}) {
+  const L = Math.hypot(p1.x - p0.x, p1.y - p0.y)
+  const hh = h0 && Math.hypot(h0.x, h0.y) > 1e-9 ? h0 : null
+  let th = hh ? Math.atan2(hh.y, hh.x) : Math.atan2(p1.y - p0.y, p1.x - p0.x)
+  if (L < 1e-9) return { pts: [p0.x, p0.y], cum: [0], len: 0, endDir: { x: Math.cos(th), y: Math.sin(th) }, R: Infinity }
+  // 恒定最大曲率半径 R：目标在转弯圆之外（R < d / (2|sin α|)）才能“先转弯、再直线切过去”而不绕圈
+  const alpha = Math.atan2(Math.sin(Math.atan2(p1.y - p0.y, p1.x - p0.x) - th), Math.cos(Math.atan2(p1.y - p0.y, p1.x - p0.x) - th))
+  const R = Math.min(rMinPx / zoom, (k * L) / (2 * Math.max(Math.abs(Math.sin(alpha)), 0.05)))
+  const ds = Math.max(L / 240, 0.4 / zoom)
+  const lim = ds / R
+  const pts = [p0.x, p0.y]
+  let x = p0.x; let y = p0.y
+  for (let i = 0; i < 8000; i++) {
+    const dx = p1.x - x; const dy = p1.y - y; const d = Math.hypot(dx, dy)
+    if (d <= ds * 1.01) break
+    const phi = Math.atan2(dy, dx)
+    const dth = clamp(Math.atan2(Math.sin(phi - th), Math.cos(phi - th)), -lim, lim)
+    th += dth; x += Math.cos(th) * ds; y += Math.sin(th) * ds
+    pts.push(x, y)
+  }
+  pts.push(p1.x, p1.y)
+  const cum = [0]
+  for (let i = 2; i < pts.length; i += 2) cum.push(cum[cum.length - 1] + Math.hypot(pts[i] - pts[i - 2], pts[i + 1] - pts[i - 1]))
+  const n = pts.length
+  let ex = pts[n - 2] - pts[n - 4]; let ey = pts[n - 1] - pts[n - 3]
+  const el = Math.hypot(ex, ey)
+  if (el < 1e-9) { ex = Math.cos(th); ey = Math.sin(th) } else { ex /= el; ey /= el }
+  return { pts, cum, len: cum[cum.length - 1], endDir: { x: ex, y: ey }, R }
+}
+/** 路径上弧长 s 处的位置与单位切线。 */
+export function pathAt(path, s) {
+  const { pts, cum } = path
+  if (cum.length < 2) return { x: pts[0], y: pts[1], dx: path.endDir.x, dy: path.endDir.y }
+  const t = clamp(s, 0, path.len)
+  let lo = 0; let hi = cum.length - 1
+  while (hi - lo > 1) { const m = (lo + hi) >> 1; if (cum[m] <= t) lo = m; else hi = m }
+  const seg = cum[hi] - cum[lo] || 1
+  const f = (t - cum[lo]) / seg
+  const x0 = pts[lo * 2]; const y0 = pts[lo * 2 + 1]; const x1 = pts[hi * 2]; const y1 = pts[hi * 2 + 1]
+  const l = Math.hypot(x1 - x0, y1 - y0) || 1
+  return { x: x0 + (x1 - x0) * f, y: y0 + (y1 - y0) * f, dx: (x1 - x0) / l, dy: (y1 - y0) / l }
+}
+
+/**
+ * 腿数（纯函数）：附近（屏幕半径 LEG_RHO_PX 内）节点数 n 越多腿越多。目标 = clamp(round(1.6·√n), 3, 18)，再 ≤ n（腿数绝不超过节点数，不允许悬空腿）。
+ * 滞回：与上一次腿数 prev 比，1.6·√n 偏离 prev 不到 0.9（= 0.5 的四舍五入带 + 0.4 的滞回）时保持 prev，避免节点数在阈值附近波动时腿数抖动。
+ * 对应：n=1…2 → n；n=4 → 3；n=9 → 5；n=25 → 8；n=64 → 13；n≥127 → 18。
+ */
+export function legCount(n, prev) {
+  const raw = 1.6 * Math.sqrt(Math.max(0, n))
+  let k = prev === undefined || prev === null || prev < 0 ? Math.round(raw) : Math.abs(raw - prev) < 0.9 ? prev : Math.round(raw)
+  k = clamp(k, LEG_MIN, LEG_SLOTS)
+  return Math.min(k, Math.max(0, Math.floor(n)))
+}
+/** 槽位启用顺序：黄金角间隔，任意前缀都近似均匀分布在圆周上；k 增减一条 = 只翻转一个槽位。 */
+const SLOT_ORDER = (() => {
+  const free = Array.from({ length: LEG_SLOTS }, (_, i) => i); const out = []
+  for (let j = 0; j < LEG_SLOTS; j++) {
+    const pos = ((j * 0.6180339887) % 1) * LEG_SLOTS
+    let bi = 0; let bd = Infinity
+    free.forEach((slot, k) => { const d = Math.min(Math.abs(slot - pos), LEG_SLOTS - Math.abs(slot - pos)); if (d < bd - 1e-9) { bd = d; bi = k } })
+    out.push(free.splice(bi, 1)[0])
+  }
+  return out
+})()
+/** 从 LEG_SLOTS 个槽位里均匀挑 k 个“在用”的腿。 */
+export function activeSlots(k, total = LEG_SLOTS) {
+  const kk = clamp(Math.round(k), 0, total)
+  const out = new Array(total).fill(false)
+  for (let j = 0; j < kk; j++) out[SLOT_ORDER[j]] = true
+  return out
+}
+/**
+ * 脚点分配（纯函数）：每条腿一个互不相同的节点（节点下标 = nodes 的下标）。
+ * 每条腿的理想落点 = 身体 + 方向 angles[i] × reach；所有(腿,节点)按理想点距离升序贪心配对。pin = {腿下标: 节点下标} 先占位（检查腿踩目标节点）。
+ * 只考虑离身体 ≤ rho 的节点；节点不够时该腿为 -1（调用方应减少腿数，不画悬空腿）。
+ */
+export function assignFeet(body, nodes, angles, { reach = 90, rho = Infinity, pin = {} } = {}) {
+  const out = new Array(angles.length).fill(-1)
+  const taken = new Set()
+  for (const [li, ni] of Object.entries(pin)) { out[Number(li)] = ni; taken.add(ni) }
+  const pairs = []
+  angles.forEach((a, li) => {
+    if (out[li] >= 0) return
+    const ix = body.x + Math.cos(a) * reach; const iy = body.y + Math.sin(a) * reach
+    for (let ni = 0; ni < nodes.length; ni++) {
+      if (taken.has(ni)) continue
+      const n = nodes[ni]
+      if (Math.hypot(n.x - body.x, n.y - body.y) > rho) continue
+      pairs.push([Math.hypot(n.x - ix, n.y - iy), li, ni])
+    }
+  })
+  pairs.sort((p, q) => p[0] - q[0] || p[1] - q[1] || p[2] - q[2])
+  for (const [, li, ni] of pairs) if (out[li] < 0 && !taken.has(ni)) { out[li] = ni; taken.add(ni) }
+  return out
+}
+/** 单条腿换脚：离理想点 (ix,iy) 最近、离身体 ≤ rho、未被占用的节点；没有则 -1。 */
+export function pickStep(nodes, ix, iy, taken, body, rho) {
+  let best = -1; let bd = Infinity
+  const r2 = rho * rho
+  for (let i = 0; i < nodes.length; i++) {
+    if (taken.has(i)) continue
+    const n = nodes[i]
+    const bx = n.x - body.x; const by = n.y - body.y
+    if (bx * bx + by * by > r2) continue
+    const d = (n.x - ix) * (n.x - ix) + (n.y - iy) * (n.y - iy)
+    if (d < bd) { bd = d; best = i }
+  }
+  return best
+}
+
+/**
  * 平滑转向的弧线控制点：沿“上一段结束时的行进方向”起飞（C1 连续），与弦方向的夹角超过 maxTurn 时向弦方向收拢（限制转角变化率）。
  * heading 为空（第一段）时退化为对称弧。
  */
@@ -100,10 +230,10 @@ export function smoothControl(p0, p1, heading, { k = 0.42, maxTurn = Math.PI * 0
  */
 export function buildTourPlan(start, hits, candidates, o = {}) {
   const zoom = o.zoom || 1
-  const maxMs = o.maxMs || 12000
+  const maxMs = o.maxMs || TOUR_MAX_MS
   const maxDecoys = o.maxDecoys ?? 6
   const maxPerLeg = o.maxPerLeg ?? 2
-  const scanMs = o.scanMs ?? 900
+  const scanMs = o.scanMs ?? TOUR_SCAN_MS
   const hitIds = new Set(hits.map((x) => x.id))
   // 1. 簇优先
   const groups = new Map()
@@ -155,35 +285,58 @@ export function buildTourPlan(start, hits, candidates, o = {}) {
     ordered.forEach((h, i) => { for (const d of chosen.get(i) || []) if (keep.has(d.id)) out.push({ ...d }); out.push({ ...h, kind: 'hit' }) })
     return out
   }
-  // 3. 时间表
+  // 3. 时间表：每段路径用 steerPath 实际生成（受曲率限制、C1 连续），时长按路径长度算
+  const OFF = 34 / zoom // 身体停在离节点 34 屏幕像素处（检查腿伸过去踩节点中心）
   const timeline = (stops, { hop, step, hitDwell, decoyDwell }) => {
-    let c = { x: start.x, y: start.y }; let t = scanMs
+    let c = { x: start.x, y: start.y }; let body = { x: start.x, y: start.y }; let hdg = o.heading || null
+    let t = scanMs
     return stops.map((st) => {
       const dPx = dist(c, st) * zoom
-      const isHop = dPx > 170
-      const travel = Math.max(isHop ? 380 : 220, (dPx / (isHop ? hop : step)) * 1000)
+      const isHop = dPx > HOP_PX
+      const l0 = dist(body, st) || 1
+      const end = { x: st.x + ((body.x - st.x) / l0) * OFF, y: st.y + ((body.y - st.y) / l0) * OFF }
+      const path = steerPath(body, hdg, end, { zoom })
+      const pathPx = path.len * zoom
+      // 时长 = 按平均速度算的时长，且不得短到让“峰值速度 / 转弯半径”超过 TURN_RATE_MAX（急转弯的段给更多时间，转角变化 ≤ ~20°/帧@60fps）
+      const turnMs = ((Math.PI / 2) * pathPx) / (TURN_RATE_MAX * Math.max(1, path.R * zoom)) * 1000
+      const travel = Math.max(turnMs, isHop
+        ? Math.max(HOP_MIN_MS, (pathPx / Math.min(hop, HOP_VAVG_MAX)) * 1000)
+        : Math.max(STEP_MIN_MS, (pathPx / Math.min(step, STEP_VAVG_MAX)) * 1000))
       const dwell = st.kind === 'hit' ? hitDwell : decoyDwell
       const arriveMs = t + travel
       t = arriveMs + dwell
-      c = st
-      return { ...st, hop: isHop, travelMs: travel, dwellMs: dwell, arriveMs, leaveMs: t }
+      c = st; body = end; hdg = path.endDir
+      return { ...st, hop: isHop, distPx: dPx, pathPx, path, travelMs: travel, dwellMs: dwell, arriveMs, leaveMs: t }
     })
   }
-  let params = { hop: 680, step: 340, hitDwell: 800, decoyDwell: 260 }
+  // 时间不够时的顺序：先减干扰节点 → 再压缩停顿（命中停顿最低 250ms）并加快步速 → 最后只等比压缩“停顿 / 扫描 / 短步”，簇间跳转保持限速
+  let params = { hop: 1500, step: 620, hitDwell: 320, decoyDwell: 150 }
   const nAll = [...chosen.values()].reduce((a, b) => a + b.length, 0)
   let n = nAll
   let stops = timeline(compose(n), params)
   const total = (st) => (st.length ? st[st.length - 1].leaveMs : scanMs)
   while (total(stops) > maxMs && n > 0) { n--; stops = timeline(compose(n), params) }
-  for (let k = 0; k < 3 && total(stops) > maxMs; k++) {
-    params = { hop: params.hop * 1.4, step: params.step * 1.4, hitDwell: Math.max(420, params.hitDwell * 0.75), decoyDwell: 160 }
+  for (let k = 0; k < 4 && total(stops) > maxMs; k++) {
+    params = { hop: params.hop * 1.15, step: params.step * 1.25, hitDwell: Math.max(250, params.hitDwell * 0.9), decoyDwell: 110 }
     stops = timeline(compose(n), params)
   }
   let scaled = false
   const tot = total(stops)
   if (tot > maxMs) {
-    const f = maxMs / tot; scaled = true
-    stops = stops.map((st) => ({ ...st, travelMs: st.travelMs * f, dwellMs: st.dwellMs * f, arriveMs: st.arriveMs * f, leaveMs: st.leaveMs * f }))
+    scaled = true
+    const hopSum = stops.filter((x) => x.hop).reduce((a, x) => a + x.travelMs, 0)
+    // 只压缩非跳转部分；跳转本身已占去绝大部分预算时才退回整体等比压缩
+    const keepHops = hopSum < maxMs * 0.7
+    const f = keepHops ? (maxMs - hopSum) / (tot - hopSum) : maxMs / tot
+    let t = 0; let prev = 0
+    stops = stops.map((st) => {
+      const gap = st.arriveMs - st.travelMs - prev // 上一站离开 → 本站出发之间的间隔（首站为扫描时间）
+      const travel = keepHops && st.hop ? st.travelMs : st.travelMs * f
+      const dwell = st.dwellMs * f
+      t += gap * f + travel
+      const arriveMs = t; t += dwell; prev = st.leaveMs
+      return { ...st, travelMs: travel, dwellMs: dwell, arriveMs, leaveMs: t }
+    })
     return { stops, scanMs: scanMs * f, totalMs: total(stops), scaled, decoyCount: stops.filter((x) => x.kind === 'decoy').length }
   }
   return { stops, scanMs, totalMs: total(stops), scaled, decoyCount: stops.filter((x) => x.kind === 'decoy').length }
@@ -271,7 +424,8 @@ export function createSpider(env) {
     enabled: true, inited: false, x: 0, y: 0, rot: rand() * TAU, T: 0,
     mode: 'wander', seg: null, dwell: 1, lastCluster: '', preferCluster: '',
     trail: [], trailT: 0, trailColor: '#2ee6c8',
-    legs: Array.from({ length: LEG_COUNT }, (_, i) => ({ fx: 0, fy: 0, node: -1, pin: -1, t: 0, life: 1.2 + rand() * 1.6, seed: rand() * TAU, init: false, i })),
+    legs: Array.from({ length: LEG_SLOTS }, (_, i) => ({ fx: 0, fy: 0, node: -1, pin: -1, a: 0, air: false, fl: null, t: 0, life: 0.6 + rand() * 1.0, seed: rand() * TAU, starvedUntil: 0, i })),
+    legInit: false, legWant: undefined, legCur: 0, legStepT: 0, slots: activeSlots(0),
     cursor: 0, ripples: [],
     collected: new Map(), // id → { rank, t0 }
     tour: null, // { queue:[hit...], cur:hit|null }
@@ -299,7 +453,6 @@ export function createSpider(env) {
     S.ripples.push({ x, y, t0: S.T, color, big })
     if (S.ripples.length > 28) S.ripples.shift()
   }
-  const reachWorld = () => REACH_PX / S.view.zoom
 
   // ---- 行为：游走 ----
   function startSegment(target, { dur, ease = true, bend = 0.28, offDir = null, kind = 'point', nodeIdx = -1, smooth = true }) {
@@ -325,14 +478,14 @@ export function createSpider(env) {
     return { x: n.x, y: n.y, color: cl.color, idx }
   }
   function beginWander() {
-    S.mode = 'wander'; S.seg = null; S.dwell = 0.8 + rand() * 1.6
+    S.mode = 'wander'; S.seg = null; S.dwell = 0.4 + rand() * 0.8
   }
   function nextWanderSeg() {
     const t = pickWanderTarget()
     if (!t) { S.dwell = 2; return }
     const dScreen = Math.hypot(t.x - S.x, t.y - S.y) * S.view.zoom
     S.trailColor = t.color
-    startSegment({ x: t.x, y: t.y }, { dur: clamp(dScreen / 52, 3.5, 14), ease: true, bend: 0.3 })
+    startSegment({ x: t.x, y: t.y }, { dur: clamp(dScreen / 104, 1.8, 7), ease: true, bend: 0.3 })
   }
 
   // ---- 行为：巡游（路线与时间表来自纯函数 buildTourPlan）----
@@ -344,12 +497,11 @@ export function createSpider(env) {
     const n = i === undefined ? null : nodes()[i]
     if (!n) { nextTourStop(); return }
     S.tour.cur = stop
-    const len = Math.hypot(n.x - S.x, n.y - S.y) || 1
-    const offDir = { x: (S.x - n.x) / len, y: (S.y - n.y) / len }
     S.mode = 'tour'
     S.trailColor = colorOf(n)
-    startSegment({ x: n.x, y: n.y }, { dur: Math.max(0.12, stop.travelMs / 1000), ease: true, offDir, kind: 'node', nodeIdx: i })
-    S.seg.stop = stop
+    // 路径来自计划（steerPath：受曲率限制、起飞方向 = 上一段结束方向）；没有时（理论上不会）现场生成
+    const path = stop.path || steerPath({ x: S.x, y: S.y }, S.heading, { x: n.x, y: n.y }, { zoom: S.view.zoom })
+    S.seg = { path, t0: S.T, dur: Math.max(0.08, stop.travelMs / 1000), ease: easeSine, kind: 'path', nodeIdx: i, stop }
   }
   function arriveTour() {
     const stop = S.seg.stop
@@ -357,13 +509,13 @@ export function createSpider(env) {
     const n = i === undefined ? null : nodes()[i]
     S.seg = null
     if (!n) { nextTourStop(); return }
-    // 英雄腿：方向最接近“身体→节点”的那条，钉在节点上（脚踩上去）
+    // 检查腿：在用的腿里方向最接近“身体→节点”的那条，钉在节点中心上（脚踩上去）
     const a = Math.atan2(n.y - S.y, n.x - S.x)
-    let hero = 0; let bd = Infinity
-    S.legs.forEach((l, k) => { const d = Math.abs(Math.atan2(Math.sin(legAngle(k) - a), Math.cos(legAngle(k) - a))); if (d < bd) { bd = d; hero = k } })
+    let hero = -1; let bd = Infinity
+    S.legs.forEach((l, k) => { if (!S.slots[k] && l.a < 1) return; const d = Math.abs(Math.atan2(Math.sin(legAngle(k) - a), Math.cos(legAngle(k) - a))); if (d < bd) { bd = d; hero = k } })
+    if (hero < 0) hero = 0
     S.legs.forEach((l) => { if (l.pin >= 0) l.pin = -1 })
     S.legs[hero].pin = i
-    S.legs[hero].node = i
     S.mode = 'inspect'
     const decoy = stop.kind !== 'hit'
     S.inspect = { id: stop.id, rank: stop.rank, title: stop.title || stop.id, t0: S.T, dur: Math.max(0.1, stop.dwellMs / 1000), thrown: false, hero, idx: i, decoy }
@@ -394,59 +546,102 @@ export function createSpider(env) {
     api.on.done?.()
   }
 
-  function legAngle(i) { return (i / LEG_COUNT) * TAU + S.rot * 0.35 }
-
-  // ---- 腿 ----
+  const legAngle = (i) => (i / LEG_SLOTS) * TAU + S.rot * 0.35
+  const legRho = () => LEG_RHO_PX / S.view.zoom
+  function releaseLeg(l) { l.node = -1; l.fl = null }
+  /** 首次 / 重建后：按节点密度一次性站好（每条腿一个互不相同的节点）。 */
+  function initLegs() {
+    const nn = nodes(); const rho = legRho()
+    const near = []
+    for (let i = 0; i < nn.length; i++) if (Math.hypot(nn[i].x - S.x, nn[i].y - S.y) <= rho) near.push(i)
+    S.legWant = legCount(near.length, undefined); S.legCur = S.legWant
+    S.slots = activeSlots(S.legCur)
+    const idxs = S.legs.map((_, i) => i).filter((i) => S.slots[i])
+    const feet = assignFeet({ x: S.x, y: S.y }, near.map((i) => nn[i]), idxs.map(legAngle), { reach: rho * 0.62, rho })
+    for (const l of S.legs) { l.node = -1; l.a = 0; l.fl = null; l.air = false; l.fx = S.x; l.fy = S.y }
+    idxs.forEach((li, k) => { const ni = feet[k] >= 0 ? near[feet[k]] : -1; const l = S.legs[li]; if (ni >= 0) { l.node = ni; l.fx = nn[ni].x; l.fy = nn[ni].y; l.a = 1; l.t = S.T - rand() * 0.6 } })
+    S.legInit = true
+  }
   function updateLegs(dt) {
-    const z = S.view.zoom
-    const busy = S.mode === 'think' || S.mode === 'inspect' || S.mode === 'scan'
-    const reach = reachWorld() * (S.mode === 'scan' ? 1.4 : 1)
-    const pulseAmp = reduced ? 0 : busy ? 0.26 : 0.14
-    const pulseF = busy ? (S.mode === 'think' ? 6.5 : S.mode === 'scan' ? 5 : 4.2) : 2
-    const nn = nodes()
-    // 已被占用的节点
+    if (!S.legInit) initLegs()
+    const nn = nodes(); const rho = legRho(); const z = S.view.zoom
+    const body = { x: S.x, y: S.y }
+    // 1. 附近节点数 → 腿数（带滞回；逐条增减，间隔 ≥ 70ms）
+    let nNear = 0; const r2 = rho * rho
+    for (let i = 0; i < nn.length; i++) { const dx = nn[i].x - S.x; const dy = nn[i].y - S.y; if (dx * dx + dy * dy <= r2) nNear++ }
+    S.legWant = legCount(nNear, S.legWant)
+    if (reduced) S.legCur = S.legWant
+    else if (S.legCur !== S.legWant && S.T - S.legStepT >= 0.07) { S.legCur += Math.sign(S.legWant - S.legCur); S.legStepT = S.T }
+    S.legCur = Math.min(S.legCur, Math.max(0, nNear))
+    S.slots = activeSlots(S.legCur)
+    // 2. 占用表 + 检查腿先占位
     const taken = new Set()
     for (const l of S.legs) if (l.node >= 0) taken.add(l.node)
-    let budget = reduced && !S.legsReady ? LEG_COUNT : 4
-    for (let k = 0; k < LEG_COUNT && budget > 0; k++) {
-      const i = (S.cursor + k) % LEG_COUNT
-      const l = S.legs[i]
-      if (l.pin >= 0) continue
-      const a = legAngle(i)
-      const R = reach * (0.85 + 0.15 * Math.sin(S.T * 0.7 + l.seed))
-      const ix = S.x + Math.cos(a) * R; const iy = S.y + Math.sin(a) * R
-      let need = !l.init || (l.node < 0 && S.T - l.t > 0.55) || S.T - l.t > l.life
-      if (!need && l.node >= 0) {
-        const d = Math.hypot(l.fx - S.x, l.fy - S.y) * z
-        if (d > REACH_PX * 1.45 || d < REACH_PX * 0.3) need = true
-        const nd = nn[l.node]
-        if (!nd) need = true
+    for (const l of S.legs) {
+      if (l.pin < 0) continue
+      if (l.node !== l.pin) {
+        for (const o of S.legs) if (o !== l && o.node === l.pin) releaseLeg(o)
+        if (l.node >= 0) taken.delete(l.node)
+        l.node = l.pin; taken.add(l.pin); l.t = S.T
+        if (reduced) { l.fl = null } else l.fl = { t0: S.T, dur: 0.08, x0: l.a > 0 ? l.fx : S.x, y0: l.a > 0 ? l.fy : S.y }
       }
-      if (!need) continue
-      budget--
-      if (l.node >= 0) taken.delete(l.node)
-      const j = pickFoot(nn, ix, iy, (REACH_PX * 0.5) / z, taken)
-      if (j >= 0) {
-        taken.add(j)
-        if (j !== l.node) { const n = nn[j]; pushRipple(n.x, n.y, colorOf(n)) }
-      }
-      l.node = j; l.t = S.T; l.life = 1.3 + rand() * 1.8
-      if (!l.init) { l.fx = j >= 0 ? nn[j].x : ix; l.fy = j >= 0 ? nn[j].y : iy; l.init = true }
+      l.a = 1
     }
-    S.cursor = (S.cursor + 4) % LEG_COUNT
-    if (reduced) S.legsReady = true
+    // 3. 在用 / 收起
+    const R0 = rho * 0.62
+    const flying = () => S.legs.reduce((c, l) => c + (l.fl && l.pin < 0 ? 1 : 0), 0)
+    const cap = Math.max(1, Math.floor(S.legCur / 3))
     for (const l of S.legs) {
       const i = l.i
-      let gx; let gy
-      const tn = l.pin >= 0 ? nn[l.pin] : l.node >= 0 ? nn[l.node] : null
-      if (tn) { gx = tn.x; gy = tn.y } else {
-        const a = legAngle(i); const R = reach * (0.85 + 0.15 * Math.sin(S.T * 0.7 + l.seed))
-        gx = S.x + Math.cos(a) * R; gy = S.y + Math.sin(a) * R
+      const want = (S.slots[i] || l.pin >= 0) && S.T >= l.starvedUntil
+      if (want) l.a = reduced ? 1 : Math.min(1, l.a + dt / 0.2)
+      else {
+        if (l.node >= 0) { taken.delete(l.node); releaseLeg(l) }
+        l.a = reduced ? 0 : Math.max(0, l.a - dt / 0.2)
+        if (l.a === 0) { l.fx = S.x; l.fy = S.y }
       }
-      const k = reduced ? 1 : Math.min(1, dt * (l.pin >= 0 ? 16 : 10))
-      l.fx += (gx - l.fx) * k; l.fy += (gy - l.fy) * k
-      l.ext = 1 - pulseAmp * (0.5 + 0.5 * Math.sin(S.T * pulseF + l.seed * 3 + i * 0.6))
-      if (l.pin >= 0) l.ext = 1
+      if (want && l.node < 0 && l.pin < 0) {
+        const ang = legAngle(i)
+        const j = pickStep(nn, S.x + Math.cos(ang) * R0, S.y + Math.sin(ang) * R0, taken, body, rho)
+        if (j >= 0) { l.node = j; taken.add(j); l.t = S.T; l.fl = reduced ? null : { t0: S.T, dur: 0.18, x0: l.a > 0 ? l.fx : S.x, y0: l.a > 0 ? l.fy : S.y }; if (reduced) { l.fx = nn[j].x; l.fy = nn[j].y } } else l.starvedUntil = S.T + 0.3
+      }
+    }
+    // 4. 步态：轮流检查几条落地腿，太远 / 太久就抬脚换到更合适的节点（同时在空中的腿不超过 cap）
+    let budget = reduced ? LEG_SLOTS : 3
+    let nFly = flying()
+    for (let k = 0; k < LEG_SLOTS && budget > 0; k++) {
+      const l = S.legs[(S.cursor + k) % LEG_SLOTS]
+      if (l.fl || l.node < 0 || l.a < 1 || l.pin >= 0) continue
+      const tn = nn[l.node]
+      if (!tn) { releaseLeg(l); continue }
+      budget--
+      const fd = Math.hypot(tn.x - S.x, tn.y - S.y)
+      const stretch = fd > rho * 1.05
+      const aged = S.T - l.t > l.life
+      if (!stretch && !aged) continue
+      if (!reduced && nFly >= cap && !stretch) continue
+      const ang = legAngle(l.i); const R = R0 * (0.85 + 0.15 * Math.sin(S.T * 1.4 + l.seed))
+      taken.delete(l.node)
+      const j = pickStep(nn, S.x + Math.cos(ang) * R, S.y + Math.sin(ang) * R, taken, body, rho)
+      if (j < 0 && stretch) { releaseLeg(l); l.starvedUntil = S.T + 0.3; continue }
+      l.t = S.T; l.life = 0.6 + rand() * 1.0
+      if (j < 0 || j === l.node) { taken.add(l.node); continue }
+      l.node = j; taken.add(j)
+      if (!reduced) { l.fl = { t0: S.T, dur: 0.11, x0: l.fx, y0: l.fy }; nFly++ } else { l.fx = nn[j].x; l.fy = nn[j].y }
+    }
+    S.cursor = (S.cursor + 3) % LEG_SLOTS
+    // 5. 脚的位置：落地腿 = 节点中心（世界坐标，随缩放 / 布局跟随）；空中腿 = 起点→节点的插值 + 抬脚弧
+    for (const l of S.legs) {
+      const tn = l.node >= 0 ? nn[l.node] : null
+      if (tn && l.fl) {
+        const p = clamp((S.T - l.fl.t0) / l.fl.dur, 0, 1)
+        const e = easeInOut(p)
+        const dx = tn.x - l.fl.x0; const dy = tn.y - l.fl.y0; const d = Math.hypot(dx, dy) || 1
+        const lift = Math.min(16 / z, d * 0.25) * Math.sin(p * Math.PI)
+        l.fx = l.fl.x0 + dx * e - (dy / d) * lift; l.fy = l.fl.y0 + dy * e + (dx / d) * lift
+        if (p >= 1) { l.fl = null; l.fx = tn.x; l.fy = tn.y }
+      } else if (tn) { l.fx = tn.x; l.fy = tn.y; if (l.fl) l.fl = null }
+      l.air = !!l.fl || l.a < 1
     }
   }
 
@@ -474,20 +669,18 @@ export function createSpider(env) {
     } else if (S.mode === 'inspect') tickInspect()
     if (S.seg) {
       const sg = S.seg
-      let p1 = sg.p1
-      if (sg.kind === 'node') {
-        const n = nodes()[sg.nodeIdx]
-        if (n) { const off = 34 / S.view.zoom; p1 = { x: n.x + sg.offDir.x * off, y: n.y + sg.offDir.y * off } }
-      }
       const u = clamp((S.T - sg.t0) / sg.dur, 0, 1)
-      const e = sg.ease ? easeInOut(u) : u
-      const pos = bezier2(sg.p0, sg.c, p1, e)
-      const tg = bezier2Tangent(sg.p0, sg.c, p1, Math.min(0.999, e))
-      if (Math.hypot(tg.x, tg.y) > 1e-6) S.heading = tg
-      S.x = pos.x; S.y = pos.y
-      if (u >= 1) {
-        if (S.mode === 'tour') arriveTour()
-        else { S.seg = null; S.dwell = 1.2 + rand() * 2.4 }
+      if (sg.path) {
+        const pos = pathAt(sg.path, easeSine(u) * sg.path.len)
+        S.x = pos.x; S.y = pos.y; S.heading = { x: pos.dx, y: pos.dy }
+        if (u >= 1) arriveTour()
+      } else {
+        const e = typeof sg.ease === 'function' ? sg.ease(u) : sg.ease ? easeInOut(u) : u
+        const pos = bezier2(sg.p0, sg.c, sg.p1, e)
+        const tg = bezier2Tangent(sg.p0, sg.c, sg.p1, Math.min(0.999, e))
+        if (Math.hypot(tg.x, tg.y) > 1e-6) S.heading = tg
+        S.x = pos.x; S.y = pos.y
+        if (u >= 1) { S.seg = null; S.dwell = 0.6 + rand() * 1.2 }
       }
     }
     // 拖尾：按时间采样
@@ -540,7 +733,7 @@ export function createSpider(env) {
     if (!S.enabled || !S.inited) return
     const z = view.zoom
     const bx = S.x * z + view.panX; const by = S.y * z + view.panY
-    const margin = REACH_PX * 1.8
+    const margin = LEG_RHO_PX * 1.4
     if (bx < -margin || bx > w + margin || by < -margin || by > h + margin) return
     g.save()
     g.lineCap = 'round'; g.lineJoin = 'round'
@@ -569,25 +762,24 @@ export function createSpider(env) {
     const legPath = new Path2D(); const heroPath = new Path2D(); let hasHero = false
     const footDots = new Path2D()
     for (const l of S.legs) {
-      if (!l.init) continue
-      const a = legAngle(l.i)
-      const sx0 = bx + Math.cos(a) * BODY_R * 0.92; const sy0 = by + Math.sin(a) * BODY_R * 0.92
-      let ex = l.fx * z + view.panX; let ey = l.fy * z + view.panY
-      const ext = l.ext ?? 1
-      ex = sx0 + (ex - sx0) * ext; ey = sy0 + (ey - sy0) * ext
-      const dx = ex - sx0; const dy = ey - sy0; const len = Math.hypot(dx, dy)
-      if (len < 3) continue
-      // 触手弯曲：垂直方向的缓慢摆动，近似“有弹性的肢体”
-      const bend = (reduced ? 0.1 : 0.16 * Math.sin(S.T * 1.3 + l.seed)) + 0.08
+      if (l.a < 0.01 || (l.node < 0 && !l.fl && l.a >= 1)) continue
+      // 脚尖 = 落点节点的屏幕位置（世界坐标 → 屏幕，随缩放跟随）；仅伸出 / 收起过渡中（a<1）按比例缩短
+      let ex = bx + (l.fx * z + view.panX - bx) * l.a; let ey = by + (l.fy * z + view.panY - by) * l.a
+      const dx0 = ex - bx; const dy0 = ey - by; const l0 = Math.hypot(dx0, dy0)
+      if (l0 < 3) continue
+      const sx0 = bx + (dx0 / l0) * BODY_R * 0.92; const sy0 = by + (dy0 / l0) * BODY_R * 0.92
+      const dx = ex - sx0; const dy = ey - sy0
+      // 触手弯曲：垂直方向的缓慢摆动（只摆中间，不动脚尖）；抬脚时弯得更明显
+      const bend = (reduced ? 0.1 : 0.16 * Math.sin(S.T * 2.6 + l.seed)) + 0.08 + (l.fl ? 0.18 : 0)
       const cx = (sx0 + ex) / 2 - dy * bend; const cy = (sy0 + ey) / 2 + dx * bend
       const target = l.pin >= 0 ? heroPath : legPath
       if (l.pin >= 0) hasHero = true
       target.moveTo(sx0, sy0); target.quadraticCurveTo(cx, cy, ex, ey)
-      footDots.moveTo(ex + 1.9, ey); footDots.arc(ex, ey, 1.9, 0, TAU)
+      if (!l.fl) { footDots.moveTo(ex + 1.9, ey); footDots.arc(ex, ey, 1.9, 0, TAU) }
     }
     g.globalAlpha = alpha * 0.9
     g.strokeStyle = '#ffffff'; g.lineWidth = 1.6
-    g.setLineDash([0.1, 4.6]); g.lineDashOffset = reduced ? 0 : -(S.T * (think ? 38 : 14))
+    g.setLineDash([0.1, 4.6]); g.lineDashOffset = reduced ? 0 : -(S.T * (think ? 76 : 28))
     g.stroke(legPath)
     if (hasHero) { g.globalAlpha = alpha; g.lineWidth = 2.4; g.setLineDash([0.1, 3.6]); g.strokeStyle = '#ffe3f6'; g.stroke(heroPath) }
     g.setLineDash([]); g.lineDashOffset = 0
@@ -654,18 +846,20 @@ export function createSpider(env) {
   Object.defineProperty(api, 'reduced', { get: () => reduced })
   api.setPreferCluster = (key) => { S.preferCluster = key || '' }
   /** 清掉对旧布局的引用（图谱重建后调用）：落脚点重新选取。 */
-  api.reset = () => { for (const l of S.legs) { l.node = -1; l.pin = -1; l.init = false } S.legsReady = false; S.seg = null; S.inited = false; S.trail = []; if (S.tour || S.inspect) { S.tour = null; S.inspect = null; S.mode = 'wander' } }
+  api.reset = () => { for (const l of S.legs) { l.node = -1; l.pin = -1; l.a = 0; l.fl = null } S.legInit = false; S.seg = null; S.inited = false; S.trail = []; if (S.tour || S.inspect) { S.tour = null; S.inspect = null; S.mode = 'wander' } }
+  /** 相机跟随用：蜘蛛身体、当前目标、接下来 2 个目标（世界坐标）。 */
+  api.cameraFocus = () => ({ body: { x: S.x, y: S.y }, cur: S.tour?.cur ? { x: S.tour.cur.x, y: S.tour.cur.y } : null, ahead: (S.tour?.queue || []).slice(0, 2).map((q) => ({ x: q.x, y: q.y })), touring: !!S.tour })
   api.hasResults = () => S.collected.size > 0 || !!S.tour
   api.isBusy = () => !!S.tour || S.mode === 'think' || S.mode === 'inspect'
   api.collectedIds = () => [...S.collected.keys()]
   /** 巡游：依次走过干扰节点与全部命中节点（见 buildTourPlan）。hits: [{id, rank, title}]（须已在图中）。返回计划，失败返回 null。 */
-  api.startTour = (hits, { maxMs = 12000 } = {}) => {
+  api.startTour = (hits, { maxMs = TOUR_MAX_MS, zoom } = {}) => {
     if (!S.enabled || reduced || !S.inited || !hits.length) return null
     const nn = nodes()
     const pts = hits.map((h) => { const i = env.indexOf(h.id); const n = i === undefined ? null : nn[i]; return n ? { ...h, x: n.x, y: n.y, cluster: n.c?.key || '' } : null }).filter(Boolean)
     if (!pts.length) return null
     S.collected.clear(); S.inspect = null; S.thinking = false
-    const plan = buildTourPlan({ x: S.x, y: S.y }, pts, nn, { zoom: S.view.zoom, maxMs })
+    const plan = buildTourPlan({ x: S.x, y: S.y }, pts, nn, { zoom: zoom || env.planZoom || S.view.zoom, maxMs, heading: S.heading })
     S.plan = plan
     S.tour = { queue: plan.stops.slice(), cur: null }
     // 开场先在原地“扫描”（触手展开），再按计划出发
@@ -678,6 +872,6 @@ export function createSpider(env) {
   api.think = (ms = 0) => { if (!S.enabled || reduced) return; S.tour = null; S.inspect = null; S.seg = null; S.mode = 'think'; S.thinking = true; S.thinkUntil = ms > 0 ? S.T + ms / 1000 : 0 }
   api.release = () => { if (S.mode === 'think') { S.thinking = false; S.thinkUntil = 0; beginWander(); S.dwell = 0.5 } }
   api.clearResults = () => { S.collected.clear(); S.tour = null; S.inspect = null; for (const l of S.legs) l.pin = -1; if (S.mode === 'tour' || S.mode === 'inspect' || S.mode === 'scan') { S.seg = null; beginWander() } }
-  api.snapshot = () => ({ x: S.x, y: S.y, mode: S.mode, T: S.T, planted: S.legs.filter((l) => l.node >= 0).length, legs: S.legs.length, collected: [...S.collected.keys()], inspect: S.inspect?.id || null, plan: S.plan ? { total: S.plan.totalMs, stops: S.plan.stops.length, decoys: S.plan.decoyCount } : null, dim: S.dim, thinking: S.thinking, trail: S.trail.length, enabled: S.enabled })
+  api.snapshot = () => ({ x: S.x, y: S.y, mode: S.mode, T: S.T, planted: S.legs.filter((l) => l.node >= 0 && !l.air).length, legs: S.legs.filter((l) => l.a > 0.01).length, legWant: S.legWant, heading: S.heading ? { ...S.heading } : null, feet: S.legs.filter((l) => l.a > 0.01).map((l) => ({ x: l.fx, y: l.fy, air: l.air, node: l.node, pin: l.pin >= 0, a: l.a })), collected: [...S.collected.keys()], inspect: S.inspect?.id || null, plan: S.plan ? { total: S.plan.totalMs, stops: S.plan.stops.length, decoys: S.plan.decoyCount } : null, dim: S.dim, thinking: S.thinking, trail: S.trail.length, enabled: S.enabled })
   return api
 }

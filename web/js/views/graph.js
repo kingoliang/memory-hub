@@ -8,6 +8,7 @@ import { h } from '../dom.js'
 import { get } from '../api.js'
 import { createSpider } from '../graph-spider.js'
 import { createSpiderSearch } from '../graph-spider-ui.js'
+import { visibleBox, viewToCam, camToView, followStep, fitPoints, boxCenter } from '../graph-camera.js'
 import { kindLabel, fmtNum, fmtDate } from '../format.js'
 import { panel, notice, empty, kindBadge, tagChip, icon, pageHead } from '../ui.js'
 import { s as svg } from '../dom.js'
@@ -217,9 +218,39 @@ export default async function render(ctx) {
   try { spiderOn = globalThis.localStorage?.getItem(SPIDER_KEY) !== '0' } catch { /* 隐私模式等 */ }
   const spider = createSpider({
     nodes: () => L?.nodes || [], clusters: () => L?.cl || [], indexOf: (id) => L?.idx.get(id), reduced, mono: MONO,
-    colorOf: (n) => n.c.color,
+    colorOf: (n) => n.c.color, planZoom: 1,
   })
   spider.setEnabled(spiderOn)
+  // 相机：可见舞台区（扣掉右侧 / 底部结果面板）、蜘蛛跟随（巡游 look-ahead 运镜 / 走完停在全部命中点 / 游走轻微平移）
+  let panelNode = null // 结果面板元素（创建后赋值）
+  let box = { x: 0, y: 0, w: 0, h: 0 }
+  const followSt = { on: true } // “跟随蜘蛛”开关：用户手动操作后置 false，不自动恢复
+  let cam = null // 相机状态（graph-camera.js）
+  let camView = null // 相机上一次写出的 view（view 被别处改写时据此重新同步）
+  let camTour = false // 巡游进行中
+  let camHold = null // 巡游结束后的目标视野（全部命中点装进可见区）
+  let holdIds = []
+  let followBtn = null
+  let limCache = null
+  const CAM_LIMITS = () => (limCache ||= { zMin: Math.max(0.25, fitView(L.nodes, box.w, box.h).zoom * 0.9), zMax: 2.5, zClose: 1.6, marginPx: 80 })
+  function refreshBox() {
+    let pr = null
+    if (panelNode && !panelNode.hasAttribute('hidden')) {
+      const sr = stage.getBoundingClientRect(); const r = panelNode.getBoundingClientRect()
+      pr = { x: r.left - sr.left, y: r.top - sr.top, w: r.width, h: r.height }
+    }
+    box = visibleBox(w, hgt, pr)
+    limCache = null
+    if (holdIds.length && L) camHold = holdTarget()
+  }
+  function holdTarget() {
+    const pts = holdIds.map((id) => { const i = L.idx.get(id); return i === undefined ? null : { x: L.nodes[i].x, y: L.nodes[i].y } }).filter(Boolean)
+    if (!pts.length) return null
+    const lim = CAM_LIMITS()
+    const f = fitPoints(pts, box, { marginPx: 70, zMin: lim.zMin, zMax: 1.8 })
+    return f ? { cx: f.cx, cy: f.cy, zoom: f.zoom } : null
+  }
+  function stopFollow() { if (followSt.on) { followSt.on = false; followBtn?.setAttribute('aria-pressed', 'false') } }
   let spAlpha = 0.92
   let lastT = 0
   let lastDraw = 0
@@ -259,7 +290,9 @@ export default async function render(ctx) {
   }
   function fitNow() {
     if (!w || !hgt || !L) return
-    view = fitView(L.nodes, w, hgt)
+    refreshBox()
+    const fv = fitView(L.nodes, box.w, box.h)
+    view = { zoom: fv.zoom, panX: fv.panX + box.x, panY: fv.panY + box.y }
     fitted = true
     tween = null
     dirty = true
@@ -272,16 +305,20 @@ export default async function render(ctx) {
   // ---------- 相机 ----------
   function flyTo(cx, cy, zoom, dur = 650) {
     const z1 = clampZoom(zoom)
-    if (reduced || !w) { view = { zoom: z1, panX: w / 2 - cx * z1, panY: hgt / 2 - cy * z1 }; tween = null; dirty = true; kick(); return }
-    const c0 = screenToWorld(view, w / 2, hgt / 2)
-    tween = { t0: performance.now(), dur, z0: view.zoom, z1, x0: c0.x, y0: c0.y, x1: cx, y1: cy }
+    stopFollow() // flyTo 只来自用户操作（点节点 / 簇 / 引用）
+    refreshBox()
+    const bc = boxCenter(box)
+    if (reduced || !w) { view = { zoom: z1, panX: bc.x - cx * z1, panY: bc.y - cy * z1 }; tween = null; dirty = true; kick(); return }
+    const c0 = screenToWorld(view, bc.x, bc.y)
+    tween = { t0: performance.now(), dur, z0: view.zoom, z1, x0: c0.x, y0: c0.y, x1: cx, y1: cy, bc }
     userMoved = true
     kick()
   }
   function flyToCluster(c) {
     const bw = Math.max(80, c.bx1 - c.bx0) + 120
     const bh = Math.max(80, c.by1 - c.by0) + 120
-    flyTo((c.bx0 + c.bx1) / 2, (c.by0 + c.by1) / 2, Math.min(w / bw, hgt / bh, 3.5))
+    refreshBox()
+    flyTo((c.bx0 + c.bx1) / 2, (c.by0 + c.by1) / 2, Math.min(box.w / bw, box.h / bh, 3.5))
   }
 
   // ---------- 绘制 ----------
@@ -582,7 +619,7 @@ export default async function render(ctx) {
       const zz = Math.exp(Math.log(tween.z0) + (Math.log(tween.z1) - Math.log(tween.z0)) * e)
       const cx = tween.x0 + (tween.x1 - tween.x0) * e
       const cy = tween.y0 + (tween.y1 - tween.y0) * e
-      view = { zoom: zz, panX: w / 2 - cx * zz, panY: hgt / 2 - cy * zz }
+      view = { zoom: zz, panX: tween.bc.x - cx * zz, panY: tween.bc.y - cy * zz }
       if (pr >= 1) tween = null
       active = true; dirty = true
     }
@@ -598,6 +635,17 @@ export default async function render(ctx) {
     const nowT = performance.now()
     const dtS = lastT ? (nowT - lastT) / 1000 : 0
     lastT = nowT
+    // 相机跟随：蜘蛛（巡游 look-ahead / 走完停在命中点 / 游走轻微平移）；与 tween（用户点击飞行）互斥
+    if (L && w && !tween && followSt.on && !reduced) {
+      if (view !== camView || !cam) { cam = viewToCam(view, box); camView = view }
+      const mode = camTour ? 'tour' : camHold ? 'hold' : (spiderOn && !spiderUi.active && !selected && !focusCluster) ? 'wander' : 'off'
+      const nc = followStep(followSt, cam, { dt: dtS, mode, focus: spider.cameraFocus(), box, limits: CAM_LIMITS(), hold: camHold })
+      if (nc !== cam) {
+        const moved = Math.hypot(nc.cx - cam.cx, nc.cy - cam.cy) * Math.exp(nc.lz) > 0.01 || Math.abs(nc.lz - cam.lz) > 1e-5
+        cam = nc
+        if (moved) { view = camToView(cam, box); camView = view; dirty = true; active = true }
+      }
+    }
     let spiderAnim = false
     if (L && w) spiderAnim = spider.update(dtS, view)
     if (spiderAnim) {
@@ -622,6 +670,7 @@ export default async function render(ctx) {
     if (nw === w && nh === hgt) return
     const first = !w
     w = nw; hgt = nh
+    refreshBox()
     const dpr = Math.max(1, globalThis.devicePixelRatio || 1)
     canvas.width = Math.round(w * dpr); canvas.height = Math.round(hgt * dpr)
     if (first || !userMoved) fitNow()
@@ -653,7 +702,7 @@ export default async function render(ctx) {
     const s = pos(e)
     if (drag) {
       if (Math.abs(s.x - drag.sx) + Math.abs(s.y - drag.sy) > 3) drag.moved = true
-      if (drag.mode === 'pan') { if (drag.moved) tween = null; view = { ...view, panX: drag.panX + s.x - drag.sx, panY: drag.panY + s.y - drag.sy }; userMoved = true }
+      if (drag.mode === 'pan') { if (drag.moved) tween = null; view = { ...view, panX: drag.panX + s.x - drag.sx, panY: drag.panY + s.y - drag.sy }; userMoved = true; if (drag.moved) stopFollow() }
       else if (drag.moved) {
         const wp = screenToWorld(view, s.x, s.y)
         const n = L.nodes[drag.i]
@@ -700,15 +749,16 @@ export default async function render(ctx) {
     const s = pos(e)
     tween = null
     view = zoomAt(view, s.x, s.y, Math.exp(-e.deltaY * 0.0015))
+    stopFollow()
     userMoved = true; dirty = true; kick()
   }, { passive: false })
   canvas.addEventListener('keydown', (e) => {
     if (e.key === '+' || e.key === '=') zoomBtn(1.25)
     else if (e.key === '-') zoomBtn(0.8)
-    else if (e.key === '0') { userMoved = false; fitNow(); kick() }
+    else if (e.key === '0') { stopFollow(); userMoved = false; fitNow(); kick() }
     else if (e.key === 'Escape') { if (selected || focusCluster || !spiderUi.active) clearFocus(); else spiderUi.clear() }
   })
-  function zoomBtn(f) { tween = null; view = zoomAt(view, w / 2, hgt / 2, f); userMoved = true; dirty = true; kick() }
+  function zoomBtn(f) { stopFollow(); tween = null; view = zoomAt(view, w / 2, hgt / 2, f); userMoved = true; dirty = true; kick() }
 
   function select(id) {
     selected = id
@@ -808,7 +858,18 @@ export default async function render(ctx) {
     colorOf: neon, kindLabel,
     onFocus: (path, inGraph) => { if (inGraph) { select(path); centerOn(path) } else nav({ focus: path, tag: '', kind: '' }) },
     onChange: () => { dirty = true; kick() },
+    // 巡游开始：跟随强制开启；不播动画（减少动画 / 蜘蛛关闭）时一次性定位到“全部命中点装进可见区”
+    onTourStart: (ids, animated) => {
+      followSt.on = true; followBtn?.setAttribute('aria-pressed', 'true')
+      tween = null; holdIds = ids; camHold = null; camTour = animated; refreshBox()
+      if (!animated) { camHold = holdTarget(); if (camHold) { const c = { cx: camHold.cx, cy: camHold.cy, lz: Math.log(camHold.zoom), vx: 0, vy: 0, vlz: 0 }; view = camToView(c, box); camView = view; cam = c; userMoved = true } }
+      dirty = true; kick()
+    },
+    onTourEnd: () => { camTour = false; refreshBox(); kick() }, // 走完 / 跳过：相机平滑移到“全部命中点装进可见区”
+    onClear: () => { camTour = false; camHold = null; holdIds = []; refreshBox(); kick() },
+    onLayout: () => { refreshBox(); kick() },
   })
+  panelNode = spiderUi.panel
   stage.append(spiderUi.panel)
 
   // ---------- 工具栏 ----------
@@ -890,9 +951,13 @@ export default async function render(ctx) {
     svg('circle', { cx: '12', cy: '12', r: '3.2' }), svg('path', { d: 'M12 8.8V3M12 15.2V21M8.8 12H3M15.2 12H21M9.7 9.7L5 5M14.3 14.3L19 19M14.3 9.7L19 5M9.7 14.3L5 19' })))
   const zoomBar = h('div', { class: 'graph-zoom', role: 'group', 'aria-label': '画布缩放' }, [
     zbtn('放大（+）', () => zoomBtn(1.25), 'plus'), zbtn('缩小（-）', () => zoomBtn(0.8), 'minus'),
-    zbtn('适应窗口（0）', () => { userMoved = false; fitNow(); kick() }, 'fit'),
+    zbtn('适应窗口（0）', () => { stopFollow(); userMoved = false; fitNow(); kick() }, 'fit'),
     zbtn('重新布局', () => { L.alpha = 1; userMoved = false; kick() }, 'refresh'),
     spiderToggle,
+    followBtn = h('button', { type: 'button', class: 'graph-zbtn', title: '跟随蜘蛛（相机随蜘蛛运镜；手动拖拽 / 缩放后自动关闭，可再点开）', 'aria-label': '跟随蜘蛛', 'aria-pressed': 'true',
+      on: { click: () => { followSt.on = !followSt.on; followBtn.setAttribute('aria-pressed', followSt.on ? 'true' : 'false'); cam = null; kick() } } },
+    svg('svg', { class: 'icon', viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', 'stroke-width': '1.5', 'stroke-linecap': 'round', 'aria-hidden': 'true', focusable: 'false' },
+      svg('rect', { x: '5', y: '5', width: '14', height: '14' }), svg('path', { d: 'M12 2v3M12 19v3M2 12h3M19 12h3' }), svg('circle', { cx: '12', cy: '12', r: '2' }))),
   ])
   stage.append(zoomBar)
 
@@ -935,6 +1000,9 @@ export default async function render(ctx) {
     spider: () => spider.snapshot(),
     spiderUi: () => spiderUi.state(),
     spiderObj: spider,
+    get box() { return box },
+    camera: () => ({ follow: followSt.on, tour: camTour, hold: !!camHold, cam: cam ? { ...cam } : null }),
+    nodePoints: () => (L ? L.nodes.map((n) => ({ x: n.x * view.zoom + view.panX, y: n.y * view.zoom + view.panY, id: n.id })) : []),
   }
   return root
 }

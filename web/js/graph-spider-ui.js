@@ -5,7 +5,7 @@
 import { h } from './dom.js'
 import { post } from './api.js'
 
-const FLY_MS = 1000
+const FLY_MS = 650
 const FLY_W = 210
 
 const plain = (t, n) => { const s = String(t ?? '').replace(/\s+/g, ' ').trim(); return s.length > n ? s.slice(0, n - 1) + '…' : s }
@@ -17,6 +17,8 @@ const plain = (t, n) => { const s = String(t ?? '').replace(/\s+/g, ' ').trim();
 export function createSpiderSearch(o) {
   const { spider, host, nodeScreen, hasNode, colorOf, kindLabel, onFocus } = o
   const onChange = o.onChange || (() => {})
+  const hook = (name, ...a) => { try { o[name]?.(...a) } catch { /* 相机钩子失败不影响搜索 */ } }
+  const flies = new Set() // 进行中的飞行卡片 { el, anim }
   let token = 0
   let hits = []
   let collapsed = false
@@ -43,6 +45,7 @@ export function createSpiderSearch(o) {
     toggle.setAttribute('aria-expanded', v ? 'false' : 'true')
     toggle.setAttribute('aria-label', v ? '展开结果面板' : '收起结果面板')
     toggle.textContent = v ? '▸' : '▾'
+    hook('onLayout')
   }
   const say = (t) => { live.textContent = ''; live.textContent = t }
   const total = () => hits.length
@@ -89,12 +92,14 @@ export function createSpiderSearch(o) {
     const sx = (lr.width || FLY_W) / FLY_W
     const anim = el.animate([
       { transform: `translate(${dx}px, ${dy}px) scale(.2) rotate(-8deg)`, opacity: 0, offset: 0 },
-      { transform: `translate(${dx}px, ${dy - 18}px) scale(1.08) rotate(0deg)`, opacity: 1, offset: 0.2 },
-      { transform: `translate(${dx}px, ${dy - 18}px) scale(1) rotate(0deg)`, opacity: 1, offset: 0.36 },
+      { transform: `translate(${dx}px, ${dy - 96}px) scale(1.08) rotate(0deg)`, opacity: 1, offset: 0.2 },
+      { transform: `translate(${dx}px, ${dy - 96}px) scale(1) rotate(0deg)`, opacity: 1, offset: 0.36 },
       { transform: `translate(${dx * 0.35}px, ${dy * 0.2 - 40}px) scale(.8) rotate(5deg)`, opacity: 1, offset: 0.7 },
       { transform: `translate(0px, 0px) scale(${sx}) rotate(0deg)`, opacity: 1, offset: 1 },
     ], { duration: FLY_MS, easing: 'cubic-bezier(.3,.7,.25,1)', fill: 'forwards' })
-    const done = () => { el.remove(); li.style.removeProperty('visibility'); li.classList.add('sp-in') }
+    const fl = { el, anim }
+    flies.add(fl)
+    const done = () => { flies.delete(fl); el.remove(); li.style.removeProperty('visibility'); li.classList.add('sp-in') }
     anim.onfinish = done
     anim.oncancel = done
   }
@@ -120,7 +125,12 @@ export function createSpiderSearch(o) {
     say(`AI 汇总完成：${r.points?.length || 0} 条要点`)
   }
 
-  function clearFly() { for (const el of host.querySelectorAll?.('.sp-fly') || []) el.remove() }
+  /** 立刻清掉所有飞行卡片（取消动画 → oncancel 会还原面板里那张卡的可见性）；再兜底移除残留节点。 */
+  function clearFly() {
+    for (const fl of [...flies]) { try { fl.anim.cancel() } catch { /* 忽略 */ } fl.el.remove() }
+    flies.clear()
+    for (const el of host.querySelectorAll?.('.sp-fly') || []) el.remove()
+  }
 
   function clear() {
     token++
@@ -132,6 +142,7 @@ export function createSpiderSearch(o) {
     hits = []; shown.clear()
     list.textContent = ''; sum.textContent = ''; status.textContent = ''
     panel.setAttribute('hidden', '')
+    hook('onClear')
     onChange()
   }
 
@@ -148,7 +159,7 @@ export function createSpiderSearch(o) {
     spider.on = {}
     spider.clearResults(); clearFly()
     hits = []; shown.clear(); list.textContent = ''
-    panel.removeAttribute('hidden'); setCollapsed(false)
+    panel.removeAttribute('hidden'); setCollapsed(false); hook('onLayout')
     status.textContent = '蜘蛛出动中…'
     showLoading('蜘蛛正在图谱里搜索…')
     onChange()
@@ -190,13 +201,15 @@ export function createSpiderSearch(o) {
     currentFinish = finish
     const byPath = new Map(hits.map((x) => [x.path, x]))
     const animated = spider.enabled && !spider.reduced && inGraph.length > 0
+    hook('onTourStart', inGraph.map((x) => x.path), animated)
     if (animated) {
       spider.on = {
         throw: ({ id }) => { if (my === token && byPath.has(id)) addCard(byPath.get(id), { fly: true }) },
-        done: () => { if (my === token) setTimeout(() => { for (const x of hits) if (!hasNode(x.path)) addCard(x); finish() }, FLY_MS * 0.5) }, // 让最后一张卡飞完再收尾；不在图里的卡最后列入
+        done: () => { if (my === token) hook('onTourEnd'); if (my === token) setTimeout(() => { for (const x of hits) if (!hasNode(x.path)) addCard(x); finish() }, FLY_MS * 0.5) }, // 让最后一张卡飞完再收尾；不在图里的卡最后列入
       }
       if (spider.startTour(inGraph.map((x) => ({ id: x.path, rank: x.rank, title: x.title })))) { skipBtn.removeAttribute('hidden'); return true }
       spider.on = {}
+      hook('onTourStart', inGraph.map((x) => x.path), false)
     }
     flushAll()
     await finish()
@@ -207,7 +220,7 @@ export function createSpiderSearch(o) {
     panel, run, clear,
     get active() { return !panel.hasAttribute('hidden') },
     /** 蜘蛛开关被关掉时调用：把没播完的巡游收尾。 */
-    interrupt: () => { if (hits.length && shown.size < hits.length) { spider.on = {}; spider.clearResults(); flushAll(); currentFinish?.() } },
+    interrupt: () => { if (hits.length && shown.size < hits.length) { spider.on = {}; spider.clearResults(); clearFly(); flushAll(); hook('onTourEnd'); currentFinish?.() } },
     state: () => ({ hits: hits.length, shown: shown.size, active: !panel.hasAttribute('hidden') }),
   }
   return api

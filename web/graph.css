@@ -16,7 +16,7 @@
 .graph-spider-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .graph-stage .graph-zbtn[aria-pressed="false"] { color: #6c7488; }
 .graph-stage .graph-zbtn[aria-pressed="true"] { color: #2ee6c8; }
-.spider-panel { position: absolute; z-index: 3; top: 64px; right: 12px; bottom: 12px; width: min(330px, calc(100% - 24px)); max-height: calc(100% - 76px); display: flex; flex-direction: column; border: 1px solid rgba(46, 230, 200, .45); background: rgba(6, 9, 16, .92); color: #dde4f2; font-family: ui-monospace, "SF Mono", Menlo, Consolas, "Noto Sans Mono CJK SC", monospace; box-shadow: 0 0 22px rgba(46, 230, 200, .12); backdrop-filter: blur(5px); }
+.spider-panel { position: absolute; z-index: 3; top: 64px; right: 12px; bottom: 12px; width: clamp(240px, 38%, 330px); max-height: calc(100% - 76px); display: flex; flex-direction: column; border: 1px solid rgba(46, 230, 200, .45); background: rgba(6, 9, 16, .92); color: #dde4f2; font-family: ui-monospace, "SF Mono", Menlo, Consolas, "Noto Sans Mono CJK SC", monospace; box-shadow: 0 0 22px rgba(46, 230, 200, .12); backdrop-filter: blur(5px); }
 .spider-panel[hidden] { display: none; }
 .spider-panel:focus-visible { outline: 2px solid #2ee6ff; outline-offset: 2px; }
 .spider-panel:has(.sp-body[hidden]) { bottom: auto; }
