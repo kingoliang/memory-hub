@@ -33,6 +33,12 @@ export const DEFAULT_CAPTURE_MAX_TOKENS = 2000
 /** 蒸馏输出上限的硬顶（与 api.js 的 NUM_RANGE.captureMaxTokens 一致）。 */
 export const MAX_CAPTURE_MAX_TOKENS = 4000
 
+/**
+ * 蒸馏重试阶梯的硬顶。推理模型的思考会吃掉输出预算（实测 2000 时空 content / JSON 被截断，
+ * 8000 以上基本不再失败），所以重试阶梯 2000→4000→8000 允许超过 MAX_CAPTURE_MAX_TOKENS（后者只约束手动配置的起点）。
+ */
+export const DISTILL_RETRY_CEILING = 8000
+
 // 沉淀预筛：仅当对话含「可复用」信号时才调用 LLM，避免对纯闲聊/寒暄发起昂贵的 LLM 判定。
 const DURABLE_SIGNALS = /(#{1,3}\s|```|\[\[|\]|\(https?:|\.(md|ts|js|py|json|yml|yaml|sh|sql)\b|`|\b\d{2,}\b|选择|决定|采用|方案|结论|原因|根因|问题|解决|修复|报错|错误|教训|架构|设计|配置|部署|流程|步骤|算法|原理|函数|接口|参数|命令|依赖|版本|坑|踩|优化|性能|数据库|索引|模型|token|推荐|偏好|约定|规范)/
 
@@ -244,21 +250,30 @@ export async function summarizeTurnDetailed(llm, route, conversation, opts = {})
     maxTokens,
     ...(effort ? { reasoningEffort: effort } : {}),
     purpose: 'memory-capture',
-    signal: opts.signal ?? AbortSignal.timeout(45000),
+    signal: opts.signal ?? AbortSignal.timeout(90000),
   }
   for await (const chunk of llm.stream(options)) assembler.push(chunk)
   // finish 块才是失败真相（见上）；没有 finish 的兼容适配器按 stop 处理。
   const finish = assembler.finish && typeof assembler.finish === 'object' ? assembler.finish : { kind: 'stop' }
+  // 诊断字段：只含长度 / finish_reason / usage 数字，绝不含原文正文。
+  const diag = {
+    inputChars: text.length,
+    maxTokens,
+    finishReason: assembler.finishReason ?? (finish.kind === 'stop' ? 'stop' : String(finish.kind)),
+    usage: normalizeUsage(assembler.usage),
+  }
   if (finish.kind === 'error' || finish.kind === 'aborted') {
     const f = finish.failure || {}
     return {
       failure: {
         code: String(f.code || f.kind || finish.kind),
         message: String(f.message || f.detail || '模型调用失败'),
+        category: 'error',
+        ...diag,
       },
     }
   }
-  // #18 根因 1：撞到输出上限时 finish.kind === 'max-tokens'（dsh-llm 的 FinishReasonMap）。
+  // #18 根因 1：撞到输出上限时 finish.kind === 'max-tokens'（dsh-llm 的 FinishReasonMap；llm-openai 适配器的 finish_reason=length 同样映射到它）。
   // 旧实现只认 error/aborted，于是截断的 JSON 一路落到 parseCaptureJson 上被误报成
   // UNPARSEABLE_OUTPUT —— 真实原因（输出被截断）被完全掩盖。这里给独立错误码。
   if (finish.kind === 'max-tokens') {
@@ -266,19 +281,27 @@ export async function summarizeTurnDetailed(llm, route, conversation, opts = {})
       failure: {
         code: 'MAX_TOKENS',
         message: `输出撞到 maxTokens=${maxTokens} 上限被截断（不是解析失败）：调大「蒸馏输出上限」captureMaxTokens，或缩短会话输入`,
+        category: 'length',
+        ...diag,
       },
     }
   }
   const out = assembler.blocks().filter((b) => b.type === 'text').map((b) => b.text).join('').trim()
   const parsed = parseCaptureJsonDetailed(out)
   if (!parsed.card) {
-    const why = out ? '模型输出无法解析为 JSON' : '模型返回空文本'
     // 括号没闭合 = 截断的强特征：即便宿主没给 max-tokens finish，也把方向指对（#18 建议 1）
-    const hint = out && looksTruncatedJson(out) ? '（JSON 括号未闭合，疑似输出被截断）' : ''
+    const truncated = !!out && looksTruncatedJson(out)
+    const hint = truncated ? '（JSON 括号未闭合，疑似输出被截断）' : ''
     // #24：JSON.parse 的原始报错（如 Bad control character in string literal at position N）
     // 以前被两个裸 catch{} 完全吞掉，排查只能靠猜；现场摘要也从「只留前 160 字」改成首尾各留一段。
     const raw = parsed.error ? '（JSON.parse 原始报错：' + parsed.error + '）' : ''
-    return { failure: { code: 'UNPARSEABLE_OUTPUT', message: why + hint + raw + (out ? '：' + describeOutputExcerpt(out) : '') } }
+    if (parsed.parsed) {
+      // JSON 解析成功但内容不合格（缺标题 / 正文过短 / append_to 无更新文本）：与「无法解析」分开，便于排查。
+      return { failure: { code: 'INVALID_CARD', message: '模型输出是合法 JSON 但内容不合格（缺标题 / 正文过短 / 追加更新为空）：' + describeOutputExcerpt(out), category: 'invalid_card', ...diag } }
+    }
+    const why = out ? '模型输出无法解析为 JSON' : '模型返回空文本'
+    const category = !out ? 'empty' : truncated ? 'truncated' : 'invalid_json'
+    return { failure: { code: 'UNPARSEABLE_OUTPUT', message: why + hint + raw + (out ? '：' + describeOutputExcerpt(out) : ''), category, ...diag } }
   }
   // repaired=true = 走了「字符串内裸控制字符转义」这条容错路径（#24），排障时能看到它真的生效了。
   return { card: parsed.card, repaired: parsed.repaired }
@@ -375,8 +398,15 @@ async function importLlmHelpers() {
   {
     return {
       BlockAssembler: class {
-        constructor() { this.parts = [] }
+        constructor() { this.parts = []; this.finish = null; this.finishReason = null; this.usage = null }
         push(chunk) {
+          if (chunk && typeof chunk === 'object' && chunk.type === 'finish') {
+            // llm-openai 适配器末尾的 finish 块：{ reason:{kind}, finishReason, usage }
+            this.finish = chunk.reason ?? null
+            this.finishReason = chunk.finishReason ?? null
+            this.usage = chunk.usage ?? null
+            return
+          }
           if (typeof chunk === 'string') this.parts.push(chunk)
           else if (chunk && typeof chunk.text === 'string') this.parts.push(chunk.text)
           else if (chunk && typeof chunk.delta?.text === 'string') this.parts.push(chunk.delta.text)
@@ -389,6 +419,19 @@ async function importLlmHelpers() {
       createUserMessage: (msg) => ({ role: 'user', content: msg?.content ?? msg, source: msg?.source }),
     }
   }
+}
+
+/** usage → 只留数字字段（prompt / completion / reasoning），其余丢弃，便于安全写日志。 */
+export function normalizeUsage(usage) {
+  if (!usage || typeof usage !== 'object') return null
+  const n = (v) => (Number.isFinite(Number(v)) && v !== null && v !== undefined ? Number(v) : undefined)
+  const out = {
+    prompt: n(usage.prompt_tokens ?? usage.input_tokens),
+    completion: n(usage.completion_tokens ?? usage.output_tokens),
+    reasoning: n(usage.completion_tokens_details?.reasoning_tokens ?? usage.output_tokens_details?.reasoning_tokens),
+  }
+  for (const k of Object.keys(out)) if (out[k] === undefined) delete out[k]
+  return Object.keys(out).length ? out : null
 }
 
 /**
@@ -515,6 +558,8 @@ export function parseCaptureJsonDetailed(text) {
   const start = cleaned.indexOf('{')
   const end = cleaned.lastIndexOf('}')
   if (start >= 0 && end > start) bases.push(cleaned.slice(start, end + 1))
+  // 多对象并排 / 尾部多余字符：按括号配对逐个切出顶层对象，依次作为候选（取第一个能解析的）。
+  for (const obj of splitTopLevelObjects(cleaned)) if (!bases.includes(obj)) bases.push(obj)
   const candidates = []
   for (const base of bases) candidates.push({ text: base, repaired: false })
   for (const base of bases) {
@@ -533,6 +578,35 @@ export function parseCaptureJsonDetailed(text) {
     return { card: cardFromParsedJson(parsed), parsed: true, error: '', repaired: candidate.repaired }
   }
   return { card: null, parsed: false, error: lastError || '输出不是合法 JSON', repaired: false }
+}
+
+/**
+ * 从文本里按括号配对依次切出顶层 `{…}` 片段（字符串内的括号不计）。
+ * 未闭合的尾段丢弃。用于「两个对象并排」「JSON 后面跟着多余说明」这类模型输出。
+ */
+function splitTopLevelObjects(text) {
+  const s = String(text || '')
+  const out = []
+  let depth = 0
+  let inStr = false
+  let esc = false
+  let begin = -1
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i]
+    if (inStr) {
+      if (esc) esc = false
+      else if (ch === '\\') esc = true
+      else if (ch === '"') inStr = false
+      continue
+    }
+    if (ch === '"' && depth > 0) inStr = true
+    else if (ch === '{') { if (depth === 0) begin = i; depth++ }
+    else if (ch === '}' && depth > 0) {
+      depth--
+      if (depth === 0 && begin >= 0) { out.push(s.slice(begin, i + 1)); begin = -1 }
+    }
+  }
+  return out
 }
 
 /** 兼容旧签名：解析成卡片；解析失败 / 内容不合格返回 null。 */

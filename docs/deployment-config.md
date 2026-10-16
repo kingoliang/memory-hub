@@ -9,6 +9,13 @@
 | `MEMORY_LLM_MODEL` | 蒸馏模型名 | `deepseek-v4.1-flash`（来源：PLAN.md 记录的 58 上 `cordis.patch.yml:309-330` 的 `captureProvider: deepseek-official` / `captureModel: deepseek-v4.1-flash`） |
 | `MEMORY_LLM_BASE_URL` | OpenAI 兼容端点（不含 `/chat/completions`） | **部署阶段由用户提供**，或由部署人员从 58 现有配置**只读核实**后再填 |
 | `MEMORY_LLM_KEY` | API key | **部署阶段由用户提供**或只读核实后填；只能放在 0600 的 `EnvironmentFile` / `memory-hub.json`，不得进仓库、日志、命令行参数 |
+| `MEMORY_LLM_REASONING_EFFORT` | 可选。`none`/`low`/`medium`/`high` 或留空；非空时写入请求体 `reasoning_effort`。**留空 = 不传**（兼容不认识该字段的网关） | 58 生产：`none`（推理模型 `deepseek-v4.1-flash` 的思考会吃光 `max_tokens`，导致空输出 / JSON 截断；实测 `none` 后 14/14 成功，耗时 33s→4–6s） |
+| `MEMORY_LLM_EXTRA_BODY` | 可选。JSON 对象字符串，原样合并进请求体（如 `{"chat_template_kwargs":{"enable_thinking":false}}`）。**不得含 `model`/`messages`/`stream`/`max_tokens`**（`max_tokens` 由重试阶梯控制）；JSON 非法或含保留字段 → 启动即报错，不静默忽略 | 不设 |
+| `MEMORY_LLM_TIMEOUT_MS` | 可选。单次蒸馏调用超时（毫秒），默认 `90000`，范围 1000~600000 | 不设（用默认） |
+
+配置文件等价键（环境变量优先，解析结果在 `config.llmRequest`）：`llm.reasoningEffort` / `llm.extraBody`（对象）/ `llm.timeoutMs`。
+
+蒸馏重试：输出为空 / 撞 `max_tokens` / JSON 截断时，按 `max_tokens` 2000→4000→8000 重试，总共最多 3 次调用；超时**不重试**（单次已等满超时，再试只会让摄入尾延迟翻倍）。全部失败才降级为原文卡，WARN 日志含 `category`（empty/length/truncated/invalid_json/invalid_card/timeout）、`inputChars`、`attempts`、`outBudget`、`finishReason`、`usageIn/usageOut/usageReasoning`，不含原文。
 
 规则：
 - `BASE_URL` 与 `MODEL` 缺一则视为未配置，`memory_capture` 降级为原文卡（`kind=content, tags=['raw']`），启动日志会明示"蒸馏未配置"。

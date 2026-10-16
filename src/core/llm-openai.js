@@ -8,7 +8,17 @@
 //   MEMORY_LLM_BASE_URL  OpenAI 兼容端点（不含 /chat/completions）
 //   MEMORY_LLM_MODEL     模型名
 //   MEMORY_LLM_KEY       API key（本地端点可留空；只从环境变量或 0600 配置文件读取，不写日志）
+//   MEMORY_LLM_REASONING_EFFORT / MEMORY_LLM_EXTRA_BODY / MEMORY_LLM_TIMEOUT_MS  可选请求参数，见 src/config.js
 // 缺 BASE_URL 或 MODEL 时 createLlmFromEnv() 返回 null：capture 降级为存原文卡，recall 不受影响。
+
+import { parseLlmRequestOptions, DEFAULT_LLM_TIMEOUT_MS } from '../config.js'
+
+/** OpenAI finish_reason → 蒸馏层的 finish.kind（capture.js 据此区分「撞上限」与普通结束）。 */
+function finishKindOf(reason) {
+  if (reason === 'length') return 'max-tokens'
+  if (reason === 'stop' || reason == null) return 'stop'
+  return String(reason)
+}
 
 function flatContent(content) {
   if (typeof content === 'string') return content
@@ -33,12 +43,14 @@ export function scrubUpstream(text, apiKey = '') {
     .replace(/\b(?:sk|mh)[-_][A-Za-z0-9_-]{8,}/g, '[key]')
 }
 
-export function createOpenAiLlm({ baseUrl, apiKey = '', model, purpose = 'memory-capture' } = {}) {
+export function createOpenAiLlm({ baseUrl, apiKey = '', model, purpose = 'memory-capture', reasoningEffort = '', extraBody = null, timeoutMs = DEFAULT_LLM_TIMEOUT_MS } = {}) {
   if (!baseUrl || !model) return null
   const endpoint = baseUrl.replace(/\/+$/, '') + '/chat/completions'
 
   return {
     purpose,
+    /** 单次调用超时（毫秒），由调用方（capture-run）用于构造 AbortSignal。 */
+    timeoutMs,
 
     listProviders() {
       return [{ id: 'openai-compat' }]
@@ -59,6 +71,8 @@ export function createOpenAiLlm({ baseUrl, apiKey = '', model, purpose = 'memory
         messages.push({ role: m?.role ?? 'user', content: flatContent(m?.content) })
       }
       const body = {
+        ...(extraBody ?? {}),
+        ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
         model: options.model || model,
         messages,
         max_tokens: options.maxTokens ?? 900,
@@ -77,8 +91,11 @@ export function createOpenAiLlm({ baseUrl, apiKey = '', model, purpose = 'memory
         throw new Error(`LLM ${res.status}: ${scrubUpstream(detail, apiKey).slice(0, 300)}`)
       }
       const data = await res.json()
-      const text = data?.choices?.[0]?.message?.content ?? ''
+      const choice = data?.choices?.[0]
+      const text = choice?.message?.content ?? ''
       if (text) yield text
+      // 末尾补一个 finish 块：透出 finish_reason 与 usage（含 reasoning_tokens），让上层能区分「撞上限」。
+      yield { type: 'finish', reason: { kind: finishKindOf(choice?.finish_reason) }, finishReason: choice?.finish_reason ?? null, usage: data?.usage ?? null }
     },
   }
 }
@@ -89,5 +106,5 @@ export function createLlmFromEnv(env = process.env) {
   const apiKey = env.MEMORY_LLM_KEY || ''
   const model = env.MEMORY_LLM_MODEL || ''
   if (!baseUrl || !model) return null
-  return createOpenAiLlm({ baseUrl, apiKey, model })
+  return createOpenAiLlm({ baseUrl, apiKey, model, ...parseLlmRequestOptions(env) })
 }

@@ -32,6 +32,43 @@ function parseBasePath(v) {
   return s
 }
 
+export const DEFAULT_LLM_TIMEOUT_MS = 90000
+const LLM_EFFORTS = ['none', 'low', 'medium', 'high']
+/** extra_body 不得覆盖的请求体字段：model/messages/stream 由代码控制；max_tokens 由重试阶梯控制。 */
+const LLM_RESERVED_BODY_KEYS = ['model', 'messages', 'stream', 'max_tokens']
+
+/**
+ * 蒸馏请求的可选参数（环境变量优先于配置文件 llm.*）。全部可空：空 = 不传，不破坏不支持这些参数的网关。
+ *   MEMORY_LLM_REASONING_EFFORT  none|low|medium|high，写入请求体 reasoning_effort
+ *   MEMORY_LLM_EXTRA_BODY        JSON 对象字符串，合并进请求体（如 chat_template_kwargs）；不得含保留字段
+ *   MEMORY_LLM_TIMEOUT_MS        单次调用超时，默认 90000
+ * 非法值抛 ConfigError（启动即报错，绝不静默忽略）。
+ */
+export function parseLlmRequestOptions(env = {}, fileLlm = {}) {
+  const effortRaw = String(env.MEMORY_LLM_REASONING_EFFORT ?? fileLlm?.reasoningEffort ?? '').trim().toLowerCase()
+  if (effortRaw && !LLM_EFFORTS.includes(effortRaw)) throw new ConfigError(`MEMORY_LLM_REASONING_EFFORT 必须是 ${LLM_EFFORTS.join('/')} 之一或留空：${effortRaw}`)
+
+  let extra = env.MEMORY_LLM_EXTRA_BODY ?? fileLlm?.extraBody ?? null
+  if (typeof extra === 'string') {
+    if (!extra.trim()) extra = null
+    else {
+      try { extra = JSON.parse(extra) } catch (e) { throw new ConfigError(`MEMORY_LLM_EXTRA_BODY 不是合法 JSON：${e.message}`) }
+    }
+  }
+  if (extra !== null) {
+    if (typeof extra !== 'object' || Array.isArray(extra)) throw new ConfigError('MEMORY_LLM_EXTRA_BODY 必须是 JSON 对象')
+    const bad = LLM_RESERVED_BODY_KEYS.filter((k) => Object.prototype.hasOwnProperty.call(extra, k))
+    if (bad.length) throw new ConfigError(`MEMORY_LLM_EXTRA_BODY 不得覆盖保留字段：${bad.join(', ')}`)
+    if (!Object.keys(extra).length) extra = null
+  }
+
+  const tRaw = String(env.MEMORY_LLM_TIMEOUT_MS ?? fileLlm?.timeoutMs ?? DEFAULT_LLM_TIMEOUT_MS).trim()
+  const timeoutMs = Number(tRaw)
+  if (!/^\d+$/.test(tRaw) || timeoutMs < 1000 || timeoutMs > 600000) throw new ConfigError(`MEMORY_LLM_TIMEOUT_MS 必须是 1000~600000 的整数（毫秒）：${tRaw}`)
+
+  return { reasoningEffort: effortRaw, extraBody: extra, timeoutMs }
+}
+
 /**
  * @param {NodeJS.ProcessEnv|object} env
  * @param {{warn?: (msg: string) => void}} [hooks]
@@ -80,6 +117,7 @@ export function loadConfig(env = process.env, { warn = () => {} } = {}) {
   const baseUrl = String(env.MEMORY_LLM_BASE_URL ?? file.llm?.baseUrl ?? '').trim()
   const model = String(env.MEMORY_LLM_MODEL ?? file.llm?.model ?? '').trim()
   const apiKey = String(env.MEMORY_LLM_KEY ?? (fileKeyAllowed ? file.llm?.key : '') ?? '')
+  const llmOpts = parseLlmRequestOptions(env, file.llm) // 即使未配置端点也校验，写错的值启动即报
   const llm = baseUrl && model ? { baseUrl, model, apiKey } : null
 
   // 会话文本摄入（POST {base}/api/ingest）闸门。均为非负整数；cooldownS=0 表示不设冷却。
@@ -116,6 +154,7 @@ export function loadConfig(env = process.env, { warn = () => {} } = {}) {
     trustProxy,
     ingest,
     llm,
+    llmRequest: llmOpts, // { reasoningEffort, extraBody, timeoutMs }：蒸馏请求的可选参数
     instructions,
     logLevel: String(env.MEMORY_HUB_LOG_LEVEL ?? file.logLevel ?? 'info').toLowerCase(),
   }

@@ -9,8 +9,9 @@
 //     不再读取 DSH 共享配置文件，也不读 MEMORY_AUDIT_* 环境变量；
 //   - 蒸馏 LLM 由调用方注入（通用 OpenAI 兼容端点），未配置则降级。
 
-import { captureCard, captureUpdate, pickNeighbors, summarizeTurnDetailed, routeCandidates, stripRuntimeNoise, hasUsableContent, deriveTitle, isUsableTitle } from './capture.js'
+import { captureCard, captureUpdate, pickNeighbors, summarizeTurnDetailed, routeCandidates, maxTokenLadder, DEFAULT_CAPTURE_MAX_TOKENS, DISTILL_RETRY_CEILING, stripRuntimeNoise, hasUsableContent, deriveTitle, isUsableTitle } from './capture.js'
 import { createLlmFromEnv } from './llm-openai.js'
+import { DEFAULT_LLM_TIMEOUT_MS } from '../config.js'
 import { resolveDedupConfig } from './dedup-config.js'
 import { enforceAudit } from './db.js'
 import { detectSecrets } from './tidy.js'
@@ -55,10 +56,18 @@ export async function runStandaloneCapture(vaultRoot, text, { source = '', submi
   if (llmClient && route) {
     try {
       const neighbors = await pickNeighbors(vaultRoot, { title: '', body: clean.slice(0, 400) }, 8)
-      const detailed = await summarizeTurnDetailed(llmClient, route, clean, { existing: neighbors, signal: AbortSignal.timeout(45000) })
+      const { detailed, attempts, outBudget } = await distillWithRetry(llmClient, route, clean, neighbors, log)
       const result = detailed.card
       if (detailed.failure) {
-        log.warn('蒸馏失败，降级为原文卡', { provider: route.provider, model: route.model, code: detailed.failure.code, message: detailed.failure.message })
+        const f = detailed.failure
+        log.warn(f.category === 'invalid_card' ? '蒸馏结果不合格，降级为原文卡' : '蒸馏失败，降级为原文卡', {
+          provider: route.provider, model: route.model, code: f.code, category: f.category, message: f.message,
+          inputChars: f.inputChars, attempts, outBudget, finishReason: f.finishReason,
+          usageIn: f.usage?.prompt, usageOut: f.usage?.completion, usageReasoning: f.usage?.reasoning,
+        })
+      } else if (detailed.skip) {
+        // 预筛跳过（太短 / 噪声 / 无复用信号）：没调模型，直接落原文卡。留一条决策日志，别让它静默。
+        log.info('蒸馏跳过，降级为原文卡', { reason: detailed.skip, inputChars: clean.length })
       }
       if (result && result.save === true) {
         if (result.append_to) {
@@ -74,7 +83,8 @@ export async function runStandaloneCapture(vaultRoot, text, { source = '', submi
       if (result && result.save === false) return { ok: true, action: 'skipped', reason: 'model judged not durable' }
     } catch (error) {
       // LLM 失败 → 落入降级路径，不能让一次网络抖动丢掉沉淀
-      log.warn('蒸馏调用异常，降级为原文卡', { provider: route.provider, model: route.model, error: String(error?.message || error).slice(0, 200) })
+      const timedOut = error?.name === 'TimeoutError' || error?.name === 'AbortError'
+      log.warn('蒸馏调用异常，降级为原文卡', { provider: route.provider, model: route.model, category: timedOut ? 'timeout' : 'error', inputChars: clean.length, error: String(error?.message || error).slice(0, 200) })
     }
   }
 
@@ -94,6 +104,33 @@ export async function runStandaloneCapture(vaultRoot, text, { source = '', submi
   if (out.ok) return { ok: true, action: 'created', path: out.path ?? out.rel, degraded: true }
   if (out.duplicate) return { ...(await handleDuplicate(vaultRoot, out.duplicate, clean, dd, clean.slice(0, 400), rawCard, log)), degraded: true }
   return { ok: false, action: 'failed', reason: String(out.reason || 'write failed') }
+}
+
+/** 这些失败类别是「输出预算不够 / 输出残缺」，加大 max_tokens 重试有意义。 */
+const RETRYABLE_CATEGORIES = new Set(['empty', 'length', 'truncated'])
+
+/**
+ * 蒸馏 + 阶梯重试：max_tokens 2000→4000→8000，总共最多 3 次调用。
+ *  - 只对 empty / length / truncated 重试；invalid_json / invalid_card / error 重试也大概率同样失败，直接降级。
+ *  - timeout（调用抛 TimeoutError/AbortError）**不重试**：单次已等了 timeoutMs（默认 90s），再试一次只会让
+ *    摄入请求的尾延迟翻倍，而超时通常是上游整体慢 / 不可用，重试收益低。异常向上抛，由调用方降级。
+ *  - 重试发生在任何建卡动作之前（本函数只调模型），所以不会重复建卡；幂等 / 去重 / 冷却都在其外层，不受影响。
+ */
+async function distillWithRetry(llmClient, route, clean, neighbors, log) {
+  const timeoutMs = Number(llmClient.timeoutMs) > 0 ? Number(llmClient.timeoutMs) : DEFAULT_LLM_TIMEOUT_MS
+  const budgets = [DEFAULT_CAPTURE_MAX_TOKENS, ...maxTokenLadder(DEFAULT_CAPTURE_MAX_TOKENS, DISTILL_RETRY_CEILING)]
+  let detailed
+  let attempts = 0
+  for (const maxTokens of budgets) {
+    attempts++
+    detailed = await summarizeTurnDetailed(llmClient, route, clean, { existing: neighbors, maxTokens, signal: AbortSignal.timeout(timeoutMs) })
+    const f = detailed.failure
+    if (!f || !RETRYABLE_CATEGORIES.has(f.category)) return { detailed, attempts, outBudget: maxTokens }
+    if (attempts < budgets.length) {
+      log.info('蒸馏重试：加大输出预算', { category: f.category, finishReason: f.finishReason, usageOut: f.usage?.completion, usageReasoning: f.usage?.reasoning, inputChars: f.inputChars, outBudget: maxTokens, nextOutBudget: budgets[attempts] })
+    }
+  }
+  return { detailed, attempts, outBudget: budgets[budgets.length - 1] }
 }
 
 /**

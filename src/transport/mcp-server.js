@@ -12,7 +12,7 @@ export const SERVER_VERSION = '0.1.0'
 /** 由配置构造蒸馏 LLM 适配器（通用 OpenAI 兼容端点）；未配置返回 null → capture 降级为原文卡。 */
 export function llmFromConfig(config) {
   if (!config.llm) return null
-  return createOpenAiLlm({ baseUrl: config.llm.baseUrl, apiKey: config.llm.apiKey, model: config.llm.model })
+  return createOpenAiLlm({ baseUrl: config.llm.baseUrl, apiKey: config.llm.apiKey, model: config.llm.model, ...(config.llmRequest ?? {}) })
 }
 
 /**
