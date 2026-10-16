@@ -355,7 +355,7 @@
 | Lint 健康报告 | `tidyLint` 全部指标 + integrity_check + 主库不变量；历史对比 | M2（只读） |
 | Agent 令牌管理 | 列表（名称、scope、创建/最近使用/过期/吊销）、创建（明文只显示一次）、吊销、改 scope、按令牌看写入记录 | M3（API 在 M1 CLI 已有） |
 | 审计日志 | `write_log` 检索（按 Agent/动作/结果/时间） | M2 |
-| 设置 | 审核模式（auditMode：all/none）、免审 Agent/kind、去重阈值、回收站保留天数、`exposeTidyApply` 开关（只读展示 env 值，改需重启）、LLM 连接状态检测（只显示是否已配置，不显示 key） | M3 |
+| 设置 | 审核模式（auditMode：all/none）、免审 Agent/kind、去重阈值、回收站保留天数、`exposeTidyApply` 开关（只读展示 env 值，改需重启）、LLM 连接状态检测（只显示是否已配置，不显示 key） | M3 · **已实现（范围收窄）**：审核规则（auditMode / 免审署名 / 免审类型）运行时可改；去重阈值、回收站天数、`exposeTidyApply` 等只读展示（去重阈值仅环境变量、保留天数为源码常量，运行时不可改），详见 docs/ui-design.md |
 | 知识图谱 | 沿用 `graph()` 语义（卡片节点；[[链接]]/共享标签/正文相似边）；只读，`GET /admin/api/graph` + canvas 页面；见 `docs/m4-graph.md` | **M4 已实现** |
 
 管理 API 与上游路由的对应（便于参考，不沿用路径）：`/admin/api/{overview, cards, cards/:path(GET/PATCH/DELETE), cards/:path/restore, audit/{list,approve,reject}, recycle/{list,purge}, tags/*, tidy/{plan,apply,rollback,lint}, tokens/*, write-log, settings, backup}`；卡片以 **path** 为键（1.7 #5），不暴露 id。
