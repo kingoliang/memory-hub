@@ -100,7 +100,10 @@ export default async function render(ctx) {
   }
 
   // ---------- 绘制 ----------
-  const radiusOf = (n) => nodeRadius(n.degree, maxDeg)
+  // 缩放补偿：ctx 按 zoom 放大世界坐标，节点/描边/标签若按世界单位绘制会随缩放等比暴涨。
+  // 节点屏幕半径 = 基础半径 × zoom^NODE_ZOOM_EXP（缓增），世界半径 = 屏幕半径 / zoom；描边/连线/标签字号按 1/zoom 保持屏幕恒定。
+  const NODE_ZOOM_EXP = 0.2
+  const radiusOf = (n) => nodeRadius(n.degree, maxDeg) * Math.pow(view.zoom, NODE_ZOOM_EXP - 1)
   function draw() {
     const ctx2 = canvas.getContext('2d')
     if (!ctx2 || !L) return
@@ -123,7 +126,7 @@ export default async function render(ctx) {
       const dim = (focusId && !touch) || (matches && !(matches.has(a.id) || matches.has(b.id)))
       ctx2.globalAlpha = touch ? 0.95 : dim ? 0.05 : l.type === 'link' ? (dense ? 0.5 : 0.7) : dense ? 0.22 : 0.4
       ctx2.strokeStyle = touch ? colors.accent : l.type === 'link' ? colors.link : colors.edge
-      ctx2.lineWidth = (touch ? 1.8 : l.type === 'link' ? 1.6 : 0.9) / Math.sqrt(view.zoom)
+      ctx2.lineWidth = (touch ? 1.8 : l.type === 'link' ? 1.6 : 0.9) / view.zoom
       ctx2.setLineDash(l.type === 'similar' ? [5 / view.zoom, 4 / view.zoom] : l.type === 'tag' ? [] : [])
       ctx2.beginPath(); ctx2.moveTo(a.x, a.y); ctx2.lineTo(b.x, b.y); ctx2.stroke()
     }
@@ -139,19 +142,19 @@ export default async function render(ctx) {
       ctx2.globalAlpha = faded ? 0.14 : 1
       ctx2.fillStyle = kindColor(n.kind)
       ctx2.beginPath(); ctx2.arc(n.x, n.y, r, 0, Math.PI * 2); ctx2.fill()
-      ctx2.lineWidth = 1.4 / Math.sqrt(view.zoom) // 与背景同色的细环：相邻节点不糊成一团
+      ctx2.lineWidth = 1.4 / view.zoom // 与背景同色的细环：相邻节点不糊成一团
       ctx2.strokeStyle = colors.surface
       ctx2.stroke()
       if (isSel || i === hover || (matches && hit)) {
-        if (isSel) { ctx2.save(); ctx2.globalAlpha = 0.22; ctx2.fillStyle = colors.accent; ctx2.beginPath(); ctx2.arc(n.x, n.y, r + 6 / Math.sqrt(view.zoom), 0, Math.PI * 2); ctx2.fill(); ctx2.restore() }
-        ctx2.lineWidth = 2.4 / Math.sqrt(view.zoom)
+        if (isSel) { ctx2.save(); ctx2.globalAlpha = 0.22; ctx2.fillStyle = colors.accent; ctx2.beginPath(); ctx2.arc(n.x, n.y, r + 6 / view.zoom, 0, Math.PI * 2); ctx2.fill(); ctx2.restore() }
+        ctx2.lineWidth = 2.4 / view.zoom
         ctx2.strokeStyle = isSel ? colors.text : colors.accent
         ctx2.beginPath(); ctx2.arc(n.x, n.y, r, 0, Math.PI * 2); ctx2.stroke()
       }
     }
     // 标签：特殊节点（选中/悬停/邻居/搜索命中）优先，其余按关联数从高到低；与已放置标签重叠的普通标签直接跳过，避免挤成一团
     ctx2.globalAlpha = 1
-    const fs = 12 / Math.max(0.6, Math.sqrt(view.zoom))
+    const fs = 12 / view.zoom
     ctx2.font = `${fs}px system-ui, sans-serif`
     ctx2.textAlign = 'center'
     ctx2.textBaseline = 'top'
@@ -176,7 +179,7 @@ export default async function render(ctx) {
       const box = { x: n.x - wd / 2 - 2, y, w: wd + 4, h: fs * 1.25 }
       if (!c.special && clash(box)) continue
       placed.push(box)
-      ctx2.lineWidth = 3 / Math.sqrt(view.zoom)
+      ctx2.lineWidth = 3 / view.zoom
       ctx2.strokeStyle = colors.surface
       ctx2.globalAlpha = c.special ? 1 : 0.9
       ctx2.strokeText(txt, n.x, y)
