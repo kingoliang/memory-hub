@@ -495,25 +495,31 @@ function statusLabel(status) {
 export async function deleteCard(root, rel, { permanent = false } = {}) {
   const db = getDb(root)
   if (permanent) {
-    // 先按 path 取 id（两张表共享 id 空间），再清理按 id 关联的更新记录 —— card_updates
-    // 不带外键（卡会在两表间搬家），所以级联必须在这里手工做。
-    const ids = []
-    const mainRow = db.prepare('SELECT id FROM cards WHERE path = ?').get(rel)
-    if (mainRow) ids.push(mainRow.id)
-    const qRow = db.prepare('SELECT id FROM quarantine WHERE path = ?').get(rel)
-    if (qRow) ids.push(qRow.id)
-    if (!ids.length) throw new Error('卡片不存在: ' + rel)
-    inTransaction(db, () => {
-      for (const id of ids) {
-        db.prepare('DELETE FROM card_updates WHERE card_id = ?').run(id)
-        db.prepare('DELETE FROM feedback WHERE card_path = ?').run(rel)
-      }
-      db.prepare('DELETE FROM cards WHERE path = ?').run(rel)
-      db.prepare('DELETE FROM quarantine WHERE path = ?').run(rel)
-    })
+    inTransaction(db, () => purgeCardSync(db, rel))
     return { ok: true, permanent: true }
   }
   return softDeleteCardSync(db, rel)
+}
+
+/**
+ * 永久删除的同步实现（deleteCard({permanent}) 与管理界面「立即删除」共用）：不开事务，由调用方包进事务。
+ * 先按 path 取 id（两张表共享 id 空间），再清理按 id 关联的更新记录 —— card_updates
+ * 不带外键（卡会在两表间搬家），所以级联必须在这里手工做。
+ */
+export function purgeCardSync(db, rel) {
+  const ids = []
+  const mainRow = db.prepare('SELECT id FROM cards WHERE path = ?').get(rel)
+  if (mainRow) ids.push(mainRow.id)
+  const qRow = db.prepare('SELECT id FROM quarantine WHERE path = ?').get(rel)
+  if (qRow) ids.push(qRow.id)
+  if (!ids.length) throw new Error('卡片不存在: ' + rel)
+  for (const id of ids) {
+    db.prepare('DELETE FROM card_updates WHERE card_id = ?').run(id)
+    db.prepare('DELETE FROM feedback WHERE card_path = ?').run(rel)
+  }
+  db.prepare('DELETE FROM cards WHERE path = ?').run(rel)
+  db.prepare('DELETE FROM quarantine WHERE path = ?').run(rel)
+  return { ok: true, permanent: true }
 }
 
 /**

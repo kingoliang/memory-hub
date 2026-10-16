@@ -19,6 +19,7 @@
 | `DELETE /card?path=` | 软删（进回收站，30 天可恢复；`softDeleteCardSync`，与 `deleteCard` 同语义）。 |
 | `POST /card/restore` | `{path}`，仅回收站里的卡。 |
 | `POST /card/purge` | `{path, confirmTitle}`：永久删除，仅回收站里的卡，须原样输入标题；同时清理其修订。 |
+| `POST /cards/purge` | 回收站「立即删除」（跳过 30 天保留期）：`{paths[], confirm:true}` 或 `{all:true, confirm:true}`（清空回收站）；`dryRun?`。**只删回收站里的卡**，非回收站 / 不存在的逐条进 `skipped`（`reason`: `not_in_recycle` / `not_found`，不删）；`paths` 受 `MEMORY_HUB_ADMIN_MAX_BATCH` 限制，`all` 由服务端取回收站全部卡不受限；缺 `confirm` → 400 `confirm_required`，`paths` 与 `all` 互斥；单事务物理删除（复用 `purgeCardSync`：更新记录/反馈/修订一并清除），每张卡写一条 `write_log`（action=purge，不含正文）。返回 `{affected, skipped, paths}`。 |
 | `POST /cards/batch` | `{action:'delete'\|'restore', paths[], confirm, dryRun?}` |
 | `POST /queue/approve` / `POST /queue/reject` | `{paths[], reason?, confirm?, dryRun?}`；单条无需 confirm，多条需要。批准：进 `cards`、可被 recall；驳回：留隔离区并记 `reason`；已驳回的卡可再批准。 |
 | `GET /tags/preview?op=rename\|merge\|delete&from=&to=` | 影响卡数（含待审/回收站里的卡）+ 样例路径，不改数据。 |
@@ -33,7 +34,7 @@
 
 ## 页面（M2 页面上增量）
 - 卡片详情：编辑（标题/类型/标签/正文，冲突时保留输入并提示重新载入）、历史版本（查看 + "回滚到此版本"）、软删/恢复/永久删（输入标题）、批准/驳回（待审卡）。
-- 待审队列：行内批准/驳回，多选批量批准/驳回（驳回理由对话框）。回收站：行内与批量恢复。卡片列表：按当前状态提供批量软删 / 恢复 / 批准 / 驳回。
+- 待审队列：行内批准/驳回，多选批量批准/驳回（驳回理由对话框）。回收站：行内与批量恢复；行内「立即删除」、批量「立即删除所选」与「清空回收站」（均弹确认框写明永久删除 N 张、不可恢复）。卡片列表：按当前状态提供批量软删 / 恢复 / 批准 / 驳回。
 - 标签：行内重命名/合并到…/删除，疑似同义组"合并…"；对话框先显示影响卡数与样例，勾选确认后才能执行。
 - 整理中心（原"整理预览"）：预览 → 演练 → 输入确认词"整理" → 执行 → 结果（批次、备份、回滚文件）→ 回滚；另列出可用回滚文件。
 - 令牌：创建（名称/范围/有效期）→ 弹窗显示明文（持久弹窗，带复制按钮，"仅显示一次"，勾选"已保存"才能关闭）；撤销、改名/改过期。

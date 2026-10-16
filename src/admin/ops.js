@@ -11,7 +11,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { getDb } from '../core/db.js'
 import {
-  KIND_ROOTS, findCardRow, pathTaken, inTransaction, softDeleteCardSync, restoreCardSync, setCardStatusSync, deleteCard,
+  KIND_ROOTS, findCardRow, pathTaken, inTransaction, softDeleteCardSync, restoreCardSync, setCardStatusSync, deleteCard, purgeCardSync,
 } from '../core/vault.js'
 import {
   tidyApply, tidyRollback, backupBeforeTidy, selfCheck, snapshotCounts, detectSecrets, TIDY_BATCHES,
@@ -216,6 +216,37 @@ export async function purge(root, actor, input, { log }) {
   audit(root, actor, log, { tool: 'POST /card/purge', action: 'purge', cardPath: p })
   log.warn('管理员永久删除卡片', { path: p, actor: actor.id })
   return { ok: true, path: p }
+}
+
+/**
+ * 回收站「立即删除」（跳过 30 天保留期）：{paths[], confirm:true} 或 {all:true, confirm:true}。
+ * 只删回收站里的卡；其余（非回收站 / 不存在）逐条 skipped。物理删除复用 purgeCardSync（同 /card/purge），整批单事务。
+ * all 由服务端取回收站全部卡，不受 adminMaxBatch 限制（paths 形式受限）。
+ */
+export function purgeCards(root, actor, input, { config, log }) {
+  const hasPaths = input?.paths !== undefined
+  const all = input?.all
+  if (all !== undefined && all !== true) throw bad('all 只能是 true（清空回收站）')
+  if (all === true && hasPaths) throw bad('paths 与 all 不能同时给')
+  if (all !== true && !hasPaths) throw bad('需要 paths（要永久删除的卡）或 all:true（清空回收站）')
+  let paths = input.paths
+  if (all === true) {
+    paths = getDb(root).prepare("SELECT path FROM quarantine WHERE status = 'deleted' ORDER BY id").all().map((r) => r.path)
+    if (!paths.length) {
+      if (!reqConfirm(input.confirm)) throw new HttpError(400, 'confirm_required', '清空回收站需要 confirm=true', undefined, { count: 0, willAffect: 0 })
+      return { ok: true, affected: 0, skipped: [], paths: [] }
+    }
+  }
+  return runBatch(root, actor, log, {
+    tool: 'POST /cards/purge', action: 'purge', paths, confirm: reqConfirm(input.confirm), dryRun: input.dryRun, maxBatch: all === true ? Infinity : config.adminMaxBatch, needConfirm: true,
+    labelOf: all === true ? '清空回收站（永久删除）' : '永久删除回收站卡片',
+    classify: (f) => {
+      if (!f) return { code: 'not_found', message: '卡片不存在' }
+      if (!(f.table === 'quarantine' && f.row.status === 'deleted')) return { code: 'not_in_recycle', message: '不在回收站，未删除' }
+      return null
+    },
+    exec: (db, p) => { purgeCardSync(db, p); db.prepare('DELETE FROM card_revisions WHERE card_path = ?').run(p) },
+  })
 }
 
 /** 批量执行的公共骨架：校验 → 分类（可做/跳过）→ dryRun / confirm → 单事务执行。 */

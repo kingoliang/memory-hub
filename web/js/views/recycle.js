@@ -1,4 +1,4 @@
-// 回收站：恢复（单个 / 批量）；显示剩余保留天数，快到期的在前。永久删除在卡片详情里（要输入标题确认）。
+// 回收站：恢复、立即删除（永久删除，跳过保留期；单张 / 批量 / 清空，均需二次确认）；显示剩余保留天数，快到期的在前。卡片详情里的永久删除（输入标题确认）仍保留。
 
 import { h } from '../dom.js'
 import { get, post } from '../api.js'
@@ -20,7 +20,33 @@ export default async function render(ctx) {
     const r = await post('cards/batch', { action: 'restore', paths, confirm: true })
     reportBatch(r, '已恢复')
   }
-  const bar = bulkBar(sel, [{ label: '恢复所选', tone: 'primary', run: restore }], { reload: ctx.reload })
+  // 立即删除：永久、不可恢复。确认框里明确写出张数；paths 为所选卡，all 为清空整个回收站（服务端只作用于回收站内的卡）。
+  const purge = async ({ paths, all = false, count, label }) => {
+    const n = all ? count : paths.length
+    if (!(await confirmDialog({
+      title: all ? `清空回收站：永久删除 ${n} 张卡？` : `立即永久删除 ${n} 张卡？`,
+      message: `将永久删除 ${n} 张卡（含其更新记录与历史版本），不可恢复，也不会再等保留期。`,
+      lines: label ? [label] : [],
+      danger: true, confirmText: all ? `清空并永久删除 ${n} 张` : `永久删除 ${n} 张`,
+    }))) return false
+    reportBatch(await post('cards/purge', all ? { all: true, confirm: true } : { paths, confirm: true }), '已永久删除')
+  }
+  const bar = bulkBar(sel, [
+    { label: '恢复所选', tone: 'primary', run: restore },
+    { label: '立即删除所选', tone: 'danger', run: (paths) => purge({ paths }) },
+  ], { reload: ctx.reload })
+  const clearBtn = h('button', { type: 'button', class: 'btn btn-danger-ghost', 'aria-label': `清空回收站：永久删除全部 ${d.total} 张卡` }, '清空回收站')
+  clearBtn.addEventListener('click', guard(clearBtn, async () => {
+    try { if ((await purge({ all: true, count: d.total })) !== false) ctx.reload() } catch (e) { toast('bad', errText(e)) }
+  }))
+  bar.querySelector('.bulk-actions')?.append(clearBtn)
+  const rowPurge = (it) => {
+    const b = h('button', { type: 'button', class: 'btn btn-danger-ghost btn-sm', 'aria-label': `立即永久删除：${it.title || it.path}` }, '立即删除')
+    b.addEventListener('click', guard(b, async () => {
+      try { if ((await purge({ paths: [it.path], label: it.title || it.path })) !== false) ctx.reload() } catch (e) { toast('bad', errText(e)) }
+    }))
+    return b
+  }
   const rowRestore = (it) => {
     const b = h('button', { type: 'button', class: 'btn btn-ghost btn-sm' }, '恢复')
     b.addEventListener('click', guard(b, async () => {
@@ -32,14 +58,14 @@ export default async function render(ctx) {
   return h('div', { class: 'page' }, [
     pageHead('04', 'Recycle', '回收站', `共 ${d.total} 张 · 保留 ${d.retentionDays} 天后自动永久清除`),
     h('div', { class: 'g12' }, [
-      h('section', { class: 'c12' }, [secHead('A1', '保留规则'), notice('info', '软删的卡可以恢复', '永久删除需要进入卡片详情页，输入卡片标题确认。')]),
+      h('section', { class: 'c12' }, [secHead('A1', '保留规则'), notice('info', '软删的卡可以恢复', '不想等保留期，可用「立即删除」永久删除（单张 / 所选 / 清空回收站），操作前会二次确认，且不可恢复。')]),
       h('section', { class: 'c12' }, [secHead('A2', '待恢复的卡片', `${d.total} 张`), d.items.length ? bar : null, d.items.length
       ? h('div', { class: 'card-list' }, d.items.map((it) => {
         const pct = Math.max(0, Math.min(100, Math.round((it.daysLeft / d.retentionDays) * 100)))
         const tone = it.daysLeft <= 3 ? 'bad' : it.daysLeft <= 10 ? 'warn' : 'ok'
         return cardRow(it, {
           select: sel.checkbox(it.path, it.title),
-          actions: rowRestore(it),
+          actions: [rowRestore(it), rowPurge(it)],
           extra: [
             h('span', { class: `retention retention-${tone}`, title: `到期 ${fmtDate(it.expiresAt)}` }, [
               h('span', { class: 'bar bar-' + tone }, h('i', { css: { '--w': pct + '%' } })),

@@ -11,6 +11,7 @@ const WRITES = (p) => [
   ['POST', '/admin/api/card/purge', { path: p, confirmTitle: 'x' }],
   ['POST', '/admin/api/card/rollback', { path: p, revisionId: 1, expectedUpdatedAt: '2026-01-01T00:00:00Z' }],
   ['POST', '/admin/api/cards/batch', { action: 'delete', paths: [p], confirm: true }],
+  ['POST', '/admin/api/cards/purge', { paths: [p], confirm: true }],
   ['POST', '/admin/api/queue/approve', { paths: [p] }],
   ['POST', '/admin/api/queue/reject', { paths: [p], reason: 'x' }],
   ['POST', '/admin/api/tags/rename', { from: 'alpha', to: 'alpha2', confirm: true }],

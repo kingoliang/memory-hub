@@ -222,6 +222,7 @@ export function createAdminHandler({ config, log }) {
     'POST /card/purge': async (ctx) => Ops.purge(root, Ops.actorOf(ctx.session, ctx.ip), await ctx.json(), deps),
     'POST /card/rollback': async (ctx) => Ops.rollbackCard(root, Ops.actorOf(ctx.session, ctx.ip), await ctx.json(), deps),
     'POST /cards/batch': async (ctx) => Ops.batchCards(root, Ops.actorOf(ctx.session, ctx.ip), await ctx.json(), deps),
+    'POST /cards/purge': async (ctx) => Ops.purgeCards(root, Ops.actorOf(ctx.session, ctx.ip), await ctx.json(), deps),
     'POST /queue/approve': async (ctx) => Ops.moderate(root, Ops.actorOf(ctx.session, ctx.ip), 'approve', await ctx.json(), deps),
     'POST /queue/reject': async (ctx) => Ops.moderate(root, Ops.actorOf(ctx.session, ctx.ip), 'reject', await ctx.json(), deps),
     'GET /tags/preview': (ctx) => Ops.previewTagOp(root, { op: strParam(ctx.url, 'op', 20), from: strParam(ctx.url, 'from', 2000), to: strParam(ctx.url, 'to', 200) }),

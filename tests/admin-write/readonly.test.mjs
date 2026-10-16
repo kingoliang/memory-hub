@@ -13,6 +13,7 @@ test('只读模式：写接口一律 403 read_only 且零写入；读接口与�
       ['PATCH', '/admin/api/card', { path: p, title: 'x', expectedUpdatedAt: '2026-01-01T00:00:00Z' }],
       ['DELETE', '/admin/api/card?path=' + encodeURIComponent(p), undefined],
       ['POST', '/admin/api/cards/batch', { action: 'delete', paths: [p], confirm: true }],
+      ['POST', '/admin/api/cards/purge', { paths: [p], confirm: true }],
       ['POST', '/admin/api/queue/approve', { paths: [p] }],
       ['POST', '/admin/api/tags/rename', { from: 'alpha', to: 'z', confirm: true }],
       ['POST', '/admin/api/tidy/apply', { planId: 'x', confirm: true }],
