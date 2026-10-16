@@ -97,7 +97,7 @@ export async function startServer(config, { logger = getLogger(), scheduler = tr
   const llm = llmFromConfig(config)
   const limiter = new FailureLimiter()
   const base = config.basePath
-  const admin = createAdminHandler({ config, log })
+  const admin = createAdminHandler({ config, log, llm })
 
   const factory = (ctx) => {
     const a = ctx.authInfo

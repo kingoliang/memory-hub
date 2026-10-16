@@ -20,6 +20,8 @@
 | `POST /card/restore` | `{path}`，仅回收站里的卡。 |
 | `POST /card/purge` | `{path, confirmTitle}`：永久删除，仅回收站里的卡，须原样输入标题；同时清理其修订。 |
 | `POST /cards/purge` | 回收站「立即删除」（跳过 30 天保留期）：`{paths[], confirm:true}` 或 `{all:true, confirm:true}`（清空回收站）；`dryRun?`。**只删回收站里的卡**，非回收站 / 不存在的逐条进 `skipped`（`reason`: `not_in_recycle` / `not_found`，不删）；`paths` 受 `MEMORY_HUB_ADMIN_MAX_BATCH` 限制，`all` 由服务端取回收站全部卡不受限；缺 `confirm` → 400 `confirm_required`，`paths` 与 `all` 互斥；单事务物理删除（复用 `purgeCardSync`：更新记录/反馈/修订一并清除），每张卡写一条 `write_log`（action=purge，不含正文）。返回 `{affected, skipped, paths}`。 |
+| `POST /graph/search` | 图谱蜘蛛搜索（**不改库**，只读模式下可用；仍需会话 + CSRF）：`{q, limit?}` → `{hits:[{path,title,kind,tags,snippet,score,rank}], limit, ms}`。详见 [m4-graph.md](m4-graph.md)。 |
+| `POST /graph/summarize` | 图谱 AI 汇总：`{q, paths[≤20]}`，服务端按 path 自读主库正文 → `{summary, points:[{text,refs[path]}], used, skipped, truncated, ms}`；LLM 未配置 503 / 超时 504 / 失败 502。详见 [m4-graph.md](m4-graph.md)。 |
 | `POST /cards/batch` | `{action:'delete'\|'restore', paths[], confirm, dryRun?}` |
 | `POST /queue/approve` / `POST /queue/reject` | `{paths[], reason?, confirm?, dryRun?}`；单条无需 confirm，多条需要。批准：进 `cards`、可被 recall；驳回：留隔离区并记 `reason`；已驳回的卡可再批准。 |
 | `GET /tags/preview?op=rename\|merge\|delete&from=&to=` | 影响卡数（含待审/回收站里的卡）+ 样例路径，不改数据。 |

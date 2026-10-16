@@ -17,8 +17,11 @@ import { writeLog } from '../core/writelog.js'
 import { HttpError } from './errors.js'
 import * as Ops from './ops.js'
 import * as Settings from './settings.js'
+import { createGraphSearch } from './graph-search.js'
 
 const WEB_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../web')
+/** 虽是 POST 但不修改库的接口：只读模式下放行。 */
+const READONLY_OK = new Set(['/graph/search', '/graph/summarize'])
 const MAX_LOGIN_BODY = 8 * 1024
 /** 写接口请求体上限（编辑正文最多 20 万字符，按 UTF-8 最坏 3 字节 + JSON 开销留余量）。 */
 export const MAX_WRITE_BODY = 2 * 1024 * 1024
@@ -33,7 +36,7 @@ const CSP = [
   "connect-src 'self'", "frame-ancestors 'none'", "base-uri 'none'", "form-action 'self'", "object-src 'none'",
 ].join('; ')
 
-export function createAdminHandler({ config, log }) {
+export function createAdminHandler({ config, log, llm = null }) {
   const base = config.basePath
   const root = config.dbRoot
   const adminBase = `${base}/admin`
@@ -133,6 +136,7 @@ export function createAdminHandler({ config, log }) {
 
   // ---- 路由表 ----
   const deps = { config, log }
+  const spider = createGraphSearch({ config, log, llm })
   const routes = {
     'GET /session': (ctx) => ({ authenticated: true, passwordSet: true, readOnly: !!config.adminReadOnly, csrfToken: ctx.session.csrfToken, expiresAt: ctx.session.expiresAt, idleTimeoutMs: SESSION_IDLE_MS }),
     'GET /overview': async () => {
@@ -189,6 +193,9 @@ export function createAdminHandler({ config, log }) {
         throw e
       }
     },
+    // 蜘蛛搜索（POST 但不改库）：会话 + Origin + CSRF 照常校验；只读模式下仍可用（见 READONLY_OK）
+    'POST /graph/search': async (ctx) => spider.search(root, await ctx.json(), Ops.actorOf(ctx.session, ctx.ip), ctx.session),
+    'POST /graph/summarize': async (ctx) => spider.summarize(root, await ctx.json(), Ops.actorOf(ctx.session, ctx.ip), ctx.session),
     'GET /queue': (ctx) => Q.queuePage(root, { ...paging(ctx.url, 50), status: enumParam(ctx.url, 'status', ['pending', 'rejected', 'all'], 'all') }),
     'GET /recycle': (ctx) => Q.recyclePage(root, paging(ctx.url, 50)),
     'GET /tags': (ctx) => Q.tagStats(root, { q: strParam(ctx.url, 'q', 100), limit: intParam(ctx.url, 'limit', { def: 500, min: 1, max: 5000, clamp: true }) }),
@@ -296,7 +303,7 @@ export function createAdminHandler({ config, log }) {
       if (!safeMethod) {
         if (!originOk(req)) throw new HttpError(403, 'forbidden_origin', '来源不被允许')
         if (!csrfValid(session, req.headers['x-csrf-token'])) throw new HttpError(403, 'csrf', 'CSRF token 缺失或无效')
-        if (config.adminReadOnly && rel !== '/logout') {
+        if (config.adminReadOnly && rel !== '/logout' && !READONLY_OK.has(rel)) {
           log.warn('只读模式：已拒绝写请求', { method, path: rel, ip })
           throw new HttpError(403, 'read_only', '管理界面处于只读模式（MEMORY_HUB_ADMIN_READONLY=1），写操作已被禁用')
         }

@@ -134,6 +134,13 @@ export function loadConfig(env = process.env, { warn = () => {} } = {}) {
     maxBodyBytes: intOpt('MEMORY_HUB_INGEST_MAX_BODY_BYTES', file.ingest?.maxBodyBytes, 256 * 1024, 1024, 1024 * 1024),
   }
 
+  // 图谱蜘蛛搜索（POST /admin/api/graph/search|summarize）：召回条数默认值与每会话最小调用间隔（毫秒，0=不限）。
+  const graphSearch = {
+    topN: intOpt('MEMORY_HUB_GRAPH_SEARCH_TOPN', file.graphSearch?.topN, 12, 1, 30),
+    searchMinIntervalMs: intOpt('MEMORY_HUB_GRAPH_SEARCH_MIN_INTERVAL_MS', file.graphSearch?.searchMinIntervalMs, 400, 0, 60000),
+    summarizeMinIntervalMs: intOpt('MEMORY_HUB_GRAPH_SUMMARIZE_MIN_INTERVAL_MS', file.graphSearch?.summarizeMinIntervalMs, 3000, 0, 600000),
+  }
+
   const instructions = typeof file.instructions === 'string' && file.instructions.trim() ? file.instructions : null
 
   return {
@@ -153,6 +160,7 @@ export function loadConfig(env = process.env, { warn = () => {} } = {}) {
     adminReadOnly,
     trustProxy,
     ingest,
+    graphSearch,
     llm,
     llmRequest: llmOpts, // { reasoningEffort, extraBody, timeoutMs }：蒸馏请求的可选参数
     instructions,

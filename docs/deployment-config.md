@@ -42,3 +42,13 @@
 蒸馏沿用上文 `MEMORY_LLM_*`；去重沿用 `MEMORY_DEDUP_*`（阈值默认 0.62）；待审与否由库内 `auditMode` 决定。
 
 状态存储：冷却 / 配额 / 幂等记录在表 `ingest_log`，首次摄入时 `CREATE TABLE IF NOT EXISTS` 惰性创建（**不改 `user_version`**，旧版本代码打开该库不受影响；记录保留 7 天）。
+
+## 图谱蜘蛛搜索（`POST /admin/api/graph/search|summarize`）
+
+接口见 [m4-graph.md](m4-graph.md)。非法值启动即报错；环境变量优先于配置文件（`memory-hub.json` 的 `graphSearch.*`）。AI 汇总复用上文 `MEMORY_LLM_*`（未配置则 summarize 返回 503，搜索照常）。
+
+| 环境变量 | 配置文件键 | 默认 | 范围 | 含义 |
+|---|---|---|---|---|
+| `MEMORY_HUB_GRAPH_SEARCH_TOPN` | `graphSearch.topN` | `12` | 1~30 | 搜索默认召回条数（请求可用 `limit` 覆盖，上限 30） |
+| `MEMORY_HUB_GRAPH_SEARCH_MIN_INTERVAL_MS` | `graphSearch.searchMinIntervalMs` | `400` | 0~60000 | 同一会话两次搜索的最小间隔（毫秒），0 = 不限 |
+| `MEMORY_HUB_GRAPH_SUMMARIZE_MIN_INTERVAL_MS` | `graphSearch.summarizeMinIntervalMs` | `3000` | 0~600000 | 同一会话两次 AI 汇总的最小间隔（毫秒），0 = 不限 |
