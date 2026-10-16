@@ -62,7 +62,7 @@ export function plainExcerpt(text) {
   t = t.replace(/(^|\s)>\s+/g, '$1')
   t = t.replace(/(^|\s)[-*+]\s+/g, '$1')
   t = t.replace(/(\*\*|__)(.+?)\1/g, '$2')
-  t = t.replace(/(^|[\s(（])[*_]([^*_\s][^*_]*?)[*_](?=$|[\s.,;:!?)）。，、；：！？])/g, '$1$2')
+  t = t.replace(/(^|[\s(（：，。；、！？「『【《“‘])[*_]([^*_\s][^*_]*?)[*_](?=$|[\s.,;:!?)）。，、；：！？」』】》”’])/g, '$1$2')
   t = t.replace(/`([^`]+)`/g, '$1')
   t = t.replace(/\s+/g, ' ').trim()
   return t
