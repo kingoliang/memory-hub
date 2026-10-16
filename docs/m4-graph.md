@@ -52,6 +52,26 @@ URL：`#/graph?focus=&tag=&kind=&limit=`。
 - 调试钩子 `canvas.__mhGraph`（绘制耗时统计、节点屏幕坐标，只读）供自动化测试使用。
 
 
+## 蜘蛛与蜘蛛搜索
+画布里常驻一只蜘蛛（青绿色带网格纹圆环 + 中心品红方块，18 条白色点状虚线触手，末端“踩”在最近的节点上并随移动换脚）。空闲时沿弧线在簇间慢速游走并留拖尾；画布右上缩放栏最后一个按钮可开关（默认开，偏好存浏览器 `localStorage` 的 `mh.graph.spider`）。绘制层只读节点位置、不拦截指针，选中 / 聚焦 / 拖拽时自动调淡；`prefers-reduced-motion` 下蜘蛛静止（不游走、不脉动），搜索结果直接显示不播动画。
+实现：`web/js/graph-spider.js`（引擎 + 纯函数 `buildTourPlan` / `nodeStateAt` / `skipState` / `orderPath` / `smoothControl`，有单测）、`web/js/graph-spider-ui.js`（结果面板、飞出卡片、接口调用）；身体为预渲染 sprite，所有触手合成一条 path 一次 stroke，落脚点最近邻按帧分摊。5000 节点（2000 真实 + 复制到 5000 的前端压测）实测单帧约 2ms，60fps。
+
+### 蜘蛛搜索（工具栏「蜘蛛搜索」按钮或在搜索框按回车；输入即过滤的标题搜索保持不变）
+1. `POST /admin/api/graph/search` 召回命中卡；同时并行发 `POST /admin/api/graph/summarize`。
+2. 巡游是“表演”：**蜘蛛脚踩到命中节点之前，该节点与普通节点外观完全一致**（无高亮 / 标签 / 相机暗示）；踩到的那一刻才高亮（霓虹描边 + 光晕 + 名次角标，其余节点变暗），弹出标题，并把“标题 + 摘要”小卡飞进右侧结果面板。卡片按被踩到的顺序出现，AI 汇总等蜘蛛走完全部命中点后才显示（早到则缓存）。汇总期间蜘蛛原地“思考”，之后平缓回到游走。面板「跳过动画」一次性全部显示。
+3. 路线（纯函数，确定性，无随机）：命中节点按簇分组，簇间最近邻 + 2-opt，簇内同样；开场原地“扫描”；干扰节点只取顺路的少量非命中节点（每段 ≤2、总数 ≤6、偏离直线有阈值，时间不够先砍它们）；簇间长跳、簇内短步，每站固定停顿，转向用起飞方向连续的二次贝塞尔并限制转角；总时长 ≤12s（超出则加快步速 / 缩短停顿 / 等比压缩，命中点永不丢）。
+4. 点面板卡片或汇总里的引用 `[n]` → 相机飞到该节点并打开侧栏详情（不在当前图中的卡则以它为中心展开）；`×` / Esc 清除搜索。AI 汇总失败只在面板里提示“AI 汇总不可用”，搜索与命中展示不受影响。a11y：搜索框有 label，面板 `role=region`、按钮可键盘操作，汇总完成经 `aria-live` 播报。
+
+### 接口（均需管理员会话 + CSRF + Origin；POST 但不改库，`MEMORY_HUB_ADMIN_READONLY=1` 下仍可用）
+| 接口 | 入参 | 出参 |
+|---|---|---|
+| `POST /admin/api/graph/search` | `{q: 1~200 字符无控制字符, limit?: 1~30（默认 `MEMORY_HUB_GRAPH_SEARCH_TOPN`=12）}` | `{hits:[{path,title,kind,tags,snippet,score,rank}], limit, ms}`；复用 `vault.search`（与 `memory_recall` 同一检索，minScore 2），只含主库 approved 且未删除的卡；标题 / 片段脱敏；不依赖 LLM |
+| `POST /admin/api/graph/summarize` | `{q, paths: 1~20 个路径}`（**只收 path**，正文由服务端读主库，忽略前端传的任何正文） | `{summary, points:[{text, refs:[path]}], used:[{path,title}], skipped, truncated, ms}` |
+错误：400 校验、401/403 鉴权 / CSRF、404 无可读卡、429 `too_many_requests`（带 `Retry-After`；每会话并发 =1 + 最小间隔，`MEMORY_HUB_GRAPH_SEARCH_MIN_INTERVAL_MS` 默认 400 / `MEMORY_HUB_GRAPH_SUMMARIZE_MIN_INTERVAL_MS` 默认 3000）、503 `llm_not_configured`、504 `llm_timeout`、502 `llm_failed`（响应不含密钥 / 端点 / 内部路径）。
+LLM：复用蒸馏的 OpenAI 兼容适配器（`MEMORY_LLM_*`，同一超时配置，上限 60s）；撞 `max_tokens` / 空输出按 2000→4000 重试一次（推理模型思考吃预算，见 commit 73cdaac）。不流式，整体返回（前端用“思考”动画占位）。
+安全：卡片正文先 `redactSecrets`，每卡 600~2500 字、总计 ≤12000 字按句界截断（`truncateAtBoundary`）；卡片 / 查询整体转义（`& < > "`）后放进 `<query>` / `<card>` 围栏，系统提示声明围栏内全是数据而非指令。INFO 日志只记操作者 / 数量 / 耗时（`q` 仅前 20 字 + 长度），不记 `q` 全文与卡内容。配置见 [deployment-config.md](deployment-config.md)。
+测试：`tests/admin/graph-spider.test.mjs`（后端 15 项）、`tests/admin/graph-spider-plan.test.mjs`（巡游计划纯函数 9 项）。
+
 ## 未实现（相对原版）
 框选/合并/删除（管理台图谱只读）、右键菜单、导出、全屏、"时间模式"、视口剔除 LOD（改为标签预算 + 隐藏孤立点/最小权重/limit 降噪）、多库聚合、磁盘缓存。
 
@@ -59,4 +79,4 @@ URL：`#/graph?focus=&tag=&kind=&limit=`。
 `tests/admin/graph.test.mjs`（API：鉴权/结构/不泄露/过滤/limit/focus/边类型/只读/规模）、`tests/admin/graph-core.test.mjs`（纯函数）。截图 `docs/screenshots/m4/`（合成数据 260 卡，非真实数据）。
 
 ## 部署
-改了 `src/admin/{graph,handler}.js` 与 `web/`：**需重启 hub**；**无 schema 变更**、无新依赖、无新配置。
+改了 `src/admin/{graph,graph-search,handler}.js`、`src/config.js`、`src/server.js` 与 `web/`：**需重启 hub**；**无 schema 变更**、无新依赖、无新配置。

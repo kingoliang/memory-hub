@@ -8,3 +8,56 @@
 /* 图例 / 侧栏里的簇色点：霓虹色在浅底上加一圈暗描边保证可见 */
 .graph-controls .gdot, .graph-side .gdot, .graph-nodelist .gdot { box-shadow: 0 0 0 1px rgba(5, 6, 10, .55); }
 @media (prefers-reduced-motion: reduce) { .graph-stage .graph-zbtn { transition: none; } }
+
+/* ---- 蜘蛛 / 蜘蛛搜索（画布内：开关、结果面板、飞出卡片）。画布恒深色，面板同为暗色霓虹，不随全站主题。 ---- */
+.sp-label { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+.graph-spider-btn { display: inline-flex; align-items: center; gap: 6px; min-height: 44px; padding: 0 14px; border: 1px solid var(--line-strong); background: transparent; color: var(--text); font: inherit; font-weight: 700; cursor: pointer; }
+.graph-spider-btn:hover { background: var(--surface-2); }
+.graph-spider-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.graph-stage .graph-zbtn[aria-pressed="false"] { color: #6c7488; }
+.graph-stage .graph-zbtn[aria-pressed="true"] { color: #2ee6c8; }
+.spider-panel { position: absolute; z-index: 3; top: 64px; right: 12px; bottom: 12px; width: min(330px, calc(100% - 24px)); max-height: calc(100% - 76px); display: flex; flex-direction: column; border: 1px solid rgba(46, 230, 200, .45); background: rgba(6, 9, 16, .92); color: #dde4f2; font-family: ui-monospace, "SF Mono", Menlo, Consolas, "Noto Sans Mono CJK SC", monospace; box-shadow: 0 0 22px rgba(46, 230, 200, .12); backdrop-filter: blur(5px); }
+.spider-panel[hidden] { display: none; }
+.spider-panel:focus-visible { outline: 2px solid #2ee6ff; outline-offset: 2px; }
+.spider-panel:has(.sp-body[hidden]) { bottom: auto; }
+.sp-head { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-bottom: 1px solid rgba(46, 230, 200, .25); }
+.sp-title { color: #2ee6c8; letter-spacing: .04em; font-size: 12px; }
+.sp-status { font-size: 11px; color: #8b93a7; }
+.sp-spacer { flex: 1; }
+.sp-btn { display: grid; place-items: center; width: 28px; height: 28px; border: 1px solid rgba(255, 255, 255, .16); background: transparent; color: #cfd6e6; font: inherit; font-size: 14px; line-height: 1; cursor: pointer; }
+.sp-btn:hover { background: rgba(255, 255, 255, .1); color: #fff; }
+.sp-btn:focus-visible, .sp-card:focus-visible, .sp-ref:focus-visible { outline: 2px solid #2ee6ff; outline-offset: -2px; }
+.sp-body { overflow-y: auto; min-height: 0; padding: 10px; display: flex; flex-direction: column; gap: 10px; }
+.sp-body[hidden] { display: none; }
+.sp-sum { font-size: 12px; line-height: 1.6; padding: 8px 10px; border: 1px dashed rgba(255, 255, 255, .22); background: rgba(255, 255, 255, .03); }
+.sp-sum:empty { display: none; }
+.sp-sum-title { margin: 0 0 4px; font-size: 11px; color: #ff4fd8; letter-spacing: .06em; }
+.sp-sum-text { margin: 0 0 6px; color: #f0f4fc; overflow-wrap: anywhere; }
+.sp-points { margin: 0; padding-left: 16px; display: flex; flex-direction: column; gap: 4px; overflow-wrap: anywhere; }
+.sp-ref { display: inline-block; min-width: 24px; padding: 0 4px; border: 1px solid rgba(46, 230, 200, .6); background: transparent; color: #2ee6c8; font: inherit; font-size: 11px; cursor: pointer; }
+.sp-ref:hover { background: rgba(46, 230, 200, .18); color: #fff; }
+.sp-sum-err strong { color: #ffb347; }
+.sp-sum-err p, .sp-wait, .sp-note { margin: 4px 0 0; color: #9aa3b8; }
+.sp-dots { display: inline-block; width: 8px; height: 8px; margin-right: 8px; border-radius: 50%; background: #ff4fd8; animation: sp-pulse 1s ease-in-out infinite; }
+@keyframes sp-pulse { 0%, 100% { opacity: .25; transform: scale(.7); } 50% { opacity: 1; transform: scale(1.15); } }
+.sp-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.sp-item { display: block; }
+.sp-item.sp-in { animation: sp-land .35s ease-out; }
+@keyframes sp-land { 0% { box-shadow: 0 0 0 0 rgba(46, 230, 200, .7); } 100% { box-shadow: 0 0 0 10px rgba(46, 230, 200, 0); } }
+.sp-card, .sp-fly { display: flex; gap: 8px; width: 100%; padding: 8px; border: 1px solid rgba(255, 255, 255, .2); background: rgba(10, 14, 24, .95); color: #dde4f2; font: inherit; text-align: left; }
+.sp-card { cursor: pointer; }
+.sp-card:hover { border-color: #2ee6c8; background: rgba(46, 230, 200, .1); }
+.sp-card.sp-off { opacity: .6; border-style: dashed; }
+.sp-fly { position: absolute; z-index: 4; width: 210px; pointer-events: none; box-shadow: 0 0 26px rgba(46, 230, 200, .35); }
+.sp-rank { flex: none; display: grid; place-items: center; min-width: 20px; height: 20px; padding: 0 4px; color: #05060a; font-size: 11px; font-weight: 700; }
+.sp-card-main { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.sp-card-title { font-size: 12px; font-weight: 700; color: #fff; overflow-wrap: anywhere; }
+.sp-card-snip { font-size: 11px; line-height: 1.5; color: #aab3c8; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere; }
+.sp-card-meta { font-size: 10px; color: #6f7890; }
+.sp-live { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+@media (max-width: 760px) { .spider-panel { top: auto; right: 8px; left: 8px; bottom: 8px; width: auto; max-height: 52%; } }
+@media (prefers-reduced-motion: reduce) { .sp-dots { animation: none; opacity: 1; } .sp-item.sp-in { animation: none; } }
+.sp-skip { height: 28px; padding: 0 8px; border: 1px solid rgba(255, 79, 216, .7); background: transparent; color: #ff8ae6; font: inherit; font-size: 11px; cursor: pointer; }
+.sp-skip:hover { background: rgba(255, 79, 216, .18); color: #fff; }
+.sp-skip:focus-visible { outline: 2px solid #2ee6ff; outline-offset: 1px; }
+.sp-skip[hidden] { display: none; }

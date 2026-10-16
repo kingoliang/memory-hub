@@ -6,8 +6,11 @@
 
 import { h } from '../dom.js'
 import { get } from '../api.js'
+import { createSpider } from '../graph-spider.js'
+import { createSpiderSearch } from '../graph-spider-ui.js'
 import { kindLabel, fmtNum, fmtDate } from '../format.js'
 import { panel, notice, empty, kindBadge, tagChip, icon, pageHead } from '../ui.js'
+import { s as svg } from '../dom.js'
 import {
   EDGE_LABEL, searchMatches, adjacency, tagCounts,
   createLayout, LAYOUT_DONE, fitView, screenToWorld, zoomAt, hitTest, topLabelIds, clampZoom, filterGraph,
@@ -208,6 +211,18 @@ export default async function render(ctx) {
   const reduced = typeof matchMedia === 'function' && matchMedia('(prefers-reduced-motion: reduce)').matches
   const perf = { frames: 0, last: 0, sum: 0, max: 0 }
   const clusterOf = (key) => L?.cl.find((c) => c.key === key)
+  // 蜘蛛：装饰游走 + 搜索巡游（引擎 graph-spider.js，面板 graph-spider-ui.js）
+  const SPIDER_KEY = 'mh.graph.spider'
+  let spiderOn = true
+  try { spiderOn = globalThis.localStorage?.getItem(SPIDER_KEY) !== '0' } catch { /* 隐私模式等 */ }
+  const spider = createSpider({
+    nodes: () => L?.nodes || [], clusters: () => L?.cl || [], indexOf: (id) => L?.idx.get(id), reduced, mono: MONO,
+    colorOf: (n) => n.c.color,
+  })
+  spider.setEnabled(spiderOn)
+  let spAlpha = 0.92
+  let lastT = 0
+  let lastDraw = 0
 
   // ---------- 过滤 / 重建布局 ----------
   function rebuild({ keepPositions = true, refit = false } = {}) {
@@ -238,6 +253,7 @@ export default async function render(ctx) {
     renderNodeList()
     countEl.textContent = `显示 ${fmtNum(shown.nodes.length)} 个节点 · ${fmtNum(shown.edges.length)} 条边 · ${L.cl.length} 个簇` + (shown.nodes.length !== data.stats.nodes ? `（已过滤，共 ${fmtNum(data.stats.nodes)}）` : '')
     if (refit || !fitted) { fitNow() }
+    spider.reset()
     dirty = true
     kick()
   }
@@ -279,6 +295,7 @@ export default async function render(ctx) {
 
   function draw() {
     const t0 = performance.now()
+    const mt = spider.hasResults() ? null : matches // 蜘蛛搜索结果显示时，临时屏蔽标题过滤高亮
     const g = canvas.getContext('2d')
     if (!g || !L) return
     const dpr = Math.max(1, globalThis.devicePixelRatio || 1)
@@ -346,14 +363,14 @@ export default async function render(ctx) {
         const n = nodes[i]
         if (n.x < x0 || n.x > x1 || n.y < y0 || n.y > y1) continue
         if (hubOf(i)) continue // 枢纽走发光精灵
-        const lit = !matches || matches.has(n.id)
+        const lit = !mt || mt.has(n.id)
         const r = rr(n)
         const path = lit ? litPath : dimPath
         path.moveTo(n.x + r, n.y); path.arc(n.x, n.y, r, 0, Math.PI * 2)
         if (lit) nl++; else nd++
       }
       g.fillStyle = c.tint
-      if (nl) { g.globalAlpha = (matches ? 0.95 : 0.8) * Math.max(c.dim, 0.14); g.fill(litPath) }
+      if (nl) { g.globalAlpha = (mt ? 0.95 : 0.8) * Math.max(c.dim, 0.14); g.fill(litPath) }
       if (nd) { g.globalAlpha = 0.12 * c.dim; g.fill(dimPath) }
     }
     g.restore()
@@ -371,7 +388,7 @@ export default async function render(ctx) {
       const n = nodes[i]
       const px = sx(n.x); const py = sy(n.y)
       if (!onScreen(px, py, 20)) continue
-      const lit = !matches || matches.has(n.id)
+      const lit = !mt || mt.has(n.id)
       const a = (lit ? 1 : 0.15) * Math.max(n.c.dim, 0.14)
       const rg = sr(n) * 4.2
       g.globalAlpha = 0.6 * a
@@ -379,11 +396,11 @@ export default async function render(ctx) {
       glows++
     }
     // 搜索命中（非枢纽）补一圈小光晕
-    if (matches) {
+    if (mt) {
       let k = 0
       for (let i = 0; i < nodes.length && k < 200; i++) {
         const n = nodes[i]
-        if (!matches.has(n.id) || hubOf(i)) continue
+        if (!mt.has(n.id) || hubOf(i)) continue
         const px = sx(n.x); const py = sy(n.y)
         if (!onScreen(px, py, 20)) continue
         const rg = sr(n) * 4.5
@@ -398,9 +415,14 @@ export default async function render(ctx) {
       const n = nodes[i]
       const px = sx(n.x); const py = sy(n.y)
       if (!onScreen(px, py)) continue
-      g.globalAlpha = 0.95 * Math.max(n.c.dim, 0.14) * (!matches || matches.has(n.id) ? 1 : 0.2)
+      g.globalAlpha = 0.95 * Math.max(n.c.dim, 0.14) * (!mt || mt.has(n.id) ? 1 : 0.2)
       g.beginPath(); g.arc(px, py, Math.max(0.9, sr(n) * 0.55), 0, Math.PI * 2); g.fill()
     }
+
+    // 蜘蛛：暗化其余节点 + 已被踩到的命中节点高亮 → 蜘蛛本体（聚焦 / 选中 / 拖拽时调淡，且不拦截任何指针事件）
+    spAlpha += ((selected || focusCluster || drag?.moved ? 0.4 : 0.92) - spAlpha) * 0.15
+    spider.drawBackdrop(g, view, w, hgt)
+    spider.drawBody(g, view, w, hgt, spAlpha)
 
     // 选中节点：向邻居辐射的点状虚线（带流动）+ 邻居提亮
     const tags = [] // 待放置的小矩形标签（按优先级）
@@ -458,9 +480,9 @@ export default async function render(ctx) {
       tags.push({ n: hoverN, i: hover, kind: 'hover' })
       if (hoverNb) for (const id of [...hoverNb].slice(0, 8)) { const i = L.idx.get(id); if (i !== undefined) tags.push({ n: nodes[i], i, kind: 'nbr' }) }
     }
-    if (matches) {
+    if (mt) {
       let k = 0
-      for (let i = 0; i < nodes.length && k < 40; i++) if (matches.has(nodes[i].id)) { tags.push({ n: nodes[i], i, kind: 'match' }); k++ }
+      for (let i = 0; i < nodes.length && k < 40; i++) if (mt.has(nodes[i].id)) { tags.push({ n: nodes[i], i, kind: 'match' }); k++ }
     }
     if (focusCluster && !selN) {
       const c = clusterOf(focusCluster)
@@ -527,6 +549,7 @@ export default async function render(ctx) {
       g.fillStyle = sel ? '#05060a' : '#dde4f2'
       g.fillText(txt, box.x + 5, box.y + box.h / 2 + 0.5)
     }
+    spider.drawInspect(g, view, w, hgt, (ins) => (ins.title.length > 28 ? ins.title.slice(0, 27) + '…' : ins.title))
     g.globalAlpha = 1
     g.globalCompositeOperation = 'source-over'
 
@@ -571,8 +594,18 @@ export default async function render(ctx) {
       }
     }
     if (selected && !reduced) { active = true; dirty = true } // 辐射虚线流动 / 脉动环
-    if (dirty) { draw(); dirty = false }
-    if (active) raf = requestAnimationFrame(frame)
+    // 蜘蛛：独立计时；只有蜘蛛在动时仅限制高刷屏的重绘频率（60Hz 下不限；5000 节点单帧约 2ms）
+    const nowT = performance.now()
+    const dtS = lastT ? (nowT - lastT) / 1000 : 0
+    lastT = nowT
+    let spiderAnim = false
+    if (L && w) spiderAnim = spider.update(dtS, view)
+    if (spiderAnim) {
+      if (!active && !dirty && nowT - lastDraw < 10) { raf = requestAnimationFrame(frame); return }
+      active = true; dirty = true
+    }
+    if (dirty) { draw(); dirty = false; lastDraw = nowT }
+    if (active) raf = requestAnimationFrame(frame); else lastT = 0
   }
   function kick() { if (!raf) raf = requestAnimationFrame(frame) }
   let ro = null
@@ -673,7 +706,7 @@ export default async function render(ctx) {
     if (e.key === '+' || e.key === '=') zoomBtn(1.25)
     else if (e.key === '-') zoomBtn(0.8)
     else if (e.key === '0') { userMoved = false; fitNow(); kick() }
-    else if (e.key === 'Escape') clearFocus()
+    else if (e.key === 'Escape') { if (selected || focusCluster || !spiderUi.active) clearFocus(); else spiderUi.clear() }
   })
   function zoomBtn(f) { tween = null; view = zoomAt(view, w / 2, hgt / 2, f); userMoved = true; dirty = true; kick() }
 
@@ -689,6 +722,7 @@ export default async function render(ctx) {
     if (!c) return
     selected = ''
     focusCluster = key
+    spider.setPreferCluster(key)
     flyToCluster(c)
     renderSide()
     dirty = true; kick()
@@ -696,6 +730,7 @@ export default async function render(ctx) {
   function clearFocus() {
     const had = selected || focusCluster
     selected = ''; focusCluster = ''
+    spider.setPreferCluster('')
     if (had) renderSide()
     dirty = true; kick()
   }
@@ -765,11 +800,32 @@ export default async function render(ctx) {
     }).catch((e) => { if (my === sideToken) excerpt.textContent = '摘要加载失败：' + (e.message || e) })
   }
 
+  // ---------- 蜘蛛搜索面板 ----------
+  const spiderUi = createSpiderSearch({
+    spider, host: stage,
+    nodeScreen: (id) => { const i = L?.idx.get(id); if (i === undefined) return null; const n = L.nodes[i]; return { x: n.x * view.zoom + view.panX, y: n.y * view.zoom + view.panY } },
+    hasNode: (id) => !!L?.idx.has(id),
+    colorOf: neon, kindLabel,
+    onFocus: (path, inGraph) => { if (inGraph) { select(path); centerOn(path) } else nav({ focus: path, tag: '', kind: '' }) },
+    onChange: () => { dirty = true; kick() },
+  })
+  stage.append(spiderUi.panel)
+
   // ---------- 工具栏 ----------
   // 主行：搜索 / 标签 / 节点上限 / 视图选项（折叠）。缩放等画布操作浮在画布右上角。
   const kindsPresent = KIND_ORDER.filter((k) => data.stats.byKind[k]).concat(Object.keys(data.stats.byKind).filter((k) => !KIND_ORDER.includes(k)))
-  const search = h('input', { type: 'search', placeholder: '搜索标题 / 标签 / 类型', 'aria-label': '搜索节点（命中的节点会高亮）', autocomplete: 'off',
-    on: { input: (e) => { st.search = e.target.value; updateMatches(); if (matches?.size === 1) { const id = [...matches][0]; centerOn(id) } kick() } } })
+  const search = h('input', { id: 'graph-search-input', type: 'search', placeholder: '搜索标题 / 标签 / 类型；回车 = 蜘蛛搜索', 'aria-label': '搜索节点（输入即过滤高亮；回车或点「蜘蛛搜索」让蜘蛛按内容检索并 AI 汇总）', autocomplete: 'off',
+    on: {
+      input: (e) => { st.search = e.target.value; updateMatches(); if (matches?.size === 1) { const id = [...matches][0]; centerOn(id) } kick() },
+      keydown: (e) => { if (e.key === 'Enter' && !e.isComposing) { e.preventDefault(); runSpider() } },
+    } })
+  function runSpider() {
+    const q = search.value.trim()
+    if (!q) { search.focus(); return }
+    spiderUi.run(q).then(() => { dirty = true; kick() })
+    dirty = true; kick()
+  }
+  const spiderBtn = h('button', { type: 'button', class: 'graph-spider-btn', title: '让蜘蛛去图谱里找相关卡片（回车），并由 AI 汇总', on: { click: () => runSpider() } }, '蜘蛛搜索')
   const tagOpts = tagCounts(data.nodes)
   const tagSel = h('select', { 'aria-label': '按标签过滤', on: { change: (e) => { st.tag = e.target.value; rebuild() } } }, [
     h('option', { value: '' }, '全部标签'),
@@ -808,7 +864,8 @@ export default async function render(ctx) {
   if (st.kind) st.kinds = new Set([st.kind])
 
   const toolbar = h('div', { class: 'graph-toolbar' }, [
-    h('div', { class: 'search-box graph-search' }, [icon('search'), search]),
+    h('div', { class: 'search-box graph-search' }, [h('label', { class: 'sp-label', for: 'graph-search-input' }, '搜索'), icon('search'), search]),
+    spiderBtn,
     h('label', { class: 'graph-ctl' }, [h('span', null, '标签'), tagSel]),
     limitSel,
     h('details', { class: 'graph-opts' }, [
@@ -820,10 +877,22 @@ export default async function render(ctx) {
       ]),
     ]),
   ])
+  const spiderToggle = h('button', { type: 'button', class: 'graph-zbtn', title: '蜘蛛：开 / 关', 'aria-label': '蜘蛛动画开关', 'aria-pressed': spiderOn ? 'true' : 'false',
+    on: { click: () => {
+      spiderOn = !spiderOn
+      spider.setEnabled(spiderOn)
+      if (!spiderOn) spiderUi.interrupt()
+      spiderToggle.setAttribute('aria-pressed', spiderOn ? 'true' : 'false')
+      try { globalThis.localStorage?.setItem(SPIDER_KEY, spiderOn ? '1' : '0') } catch { /* 忽略 */ }
+      dirty = true; kick()
+    } } },
+  svg('svg', { class: 'icon', viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', 'stroke-width': '1.5', 'stroke-linecap': 'round', 'aria-hidden': 'true', focusable: 'false' },
+    svg('circle', { cx: '12', cy: '12', r: '3.2' }), svg('path', { d: 'M12 8.8V3M12 15.2V21M8.8 12H3M15.2 12H21M9.7 9.7L5 5M14.3 14.3L19 19M14.3 9.7L19 5M9.7 14.3L5 19' })))
   const zoomBar = h('div', { class: 'graph-zoom', role: 'group', 'aria-label': '画布缩放' }, [
     zbtn('放大（+）', () => zoomBtn(1.25), 'plus'), zbtn('缩小（-）', () => zoomBtn(0.8), 'minus'),
     zbtn('适应窗口（0）', () => { userMoved = false; fitNow(); kick() }, 'fit'),
     zbtn('重新布局', () => { L.alpha = 1; userMoved = false; kick() }, 'refresh'),
+    spiderToggle,
   ])
   stage.append(zoomBar)
 
@@ -863,6 +932,9 @@ export default async function render(ctx) {
     nodeScreen: (id) => { const i = L?.idx.get(id); if (i === undefined) return null; const n = L.nodes[i]; return { x: n.x * view.zoom + view.panX, y: n.y * view.zoom + view.panY, r: radiusOf(n) * view.zoom } },
     drawNow: () => { draw() },
     state: () => ({ selected, focusCluster, hover, tweening: !!tween }),
+    spider: () => spider.snapshot(),
+    spiderUi: () => spiderUi.state(),
+    spiderObj: spider,
   }
   return root
 }
