@@ -927,6 +927,8 @@ a.bar-row, .bar-row:hover { background: transparent; }
 .desk-body { font-size: 18px; line-height: 1.75; max-width: 40em; }
 .desk-body.md { font-size: 18px; }
 .desk-meta { font-family: var(--mono); font-size: 13px; color: var(--muted); overflow-wrap: anywhere; }
+.desk-reason { display: flex; flex-direction: column; gap: 6px; max-width: 560px; }
+.desk-reason textarea { border: 1px solid var(--ink, var(--line-strong)); border-radius: 0; min-height: 64px; }
 .desk-actions { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; border-top: 1px solid var(--line-strong); padding-top: 20px; }
 .desk-actions .desk-more { margin-left: auto; min-height: 44px; display: inline-flex; align-items: center; color: var(--muted); }
 .queue-row .card-row-actions { display: none; }

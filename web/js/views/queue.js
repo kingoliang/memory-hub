@@ -62,14 +62,33 @@ export default async function render(ctx) {
   let cur = null
   let approveBtn = null
   let rejectBtn = null
+  let reasonInput = null
+  const drafts = new Map() // 审阅台重绘（正文加载完成）时保留已输入的驳回理由
+  const runRejectInline = async (it, reason) => {
+    const r = await post('queue/reject', { paths: [it.path], reason })
+    reportBatch(r, '已驳回')
+    rememberNext(it)
+    drafts.delete(it.path)
+    ctx.reload()
+  }
   const renderDesk = (it, card) => {
     const aBtn = h('button', { type: 'button', class: 'btn btn-primary', 'aria-keyshortcuts': 'a' }, ['批准 ', kbd('a')])
-    const rBtn = it.status === 'pending' ? h('button', { type: 'button', class: 'btn btn-danger-ghost', 'aria-keyshortcuts': 'r' }, ['驳回… ', kbd('r')]) : null
-    const both = [aBtn, rBtn].filter(Boolean)
+    const rBtn = it.status === 'pending' ? h('button', { type: 'button', class: 'btn btn-danger-ghost', 'aria-keyshortcuts': 'r' }, ['驳回 ', kbd('r')]) : null
+    const reasonBox = it.status === 'pending'
+      ? h('textarea', { class: 'desk-reason-input', id: 'desk-reason', rows: '2', maxlength: '500', placeholder: '按 r 键聚焦，Enter 提交驳回，Esc 取消' })
+      : null
+    if (reasonBox) { reasonBox.value = drafts.get(it.path) || ''; reasonBox.addEventListener('input', () => drafts.set(it.path, reasonBox.value)) }
+    const both = [aBtn, rBtn, reasonBox].filter(Boolean)
+    const doReject = guard(both, async () => { try { await runRejectInline(it, reasonBox.value) } catch (e) { toast('bad', errText(e)) } })
     aBtn.addEventListener('click', guard(both, () => runApprove(it)))
-    rBtn?.addEventListener('click', guard(both, () => runReject(it)))
+    rBtn?.addEventListener('click', doReject)
+    reasonBox?.addEventListener('keydown', (e) => {
+      if (e.isComposing) return // 输入法选词中的 Enter / Esc 不处理
+      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); doReject() } else if (e.key === 'Escape') { e.preventDefault(); reasonBox.value = ''; drafts.delete(it.path); reasonBox.blur() }
+    })
     approveBtn = aBtn
     rejectBtn = rBtn
+    reasonInput = reasonBox
     const body = card ? h('div', { class: 'desk-body md' }, renderMarkdown(card.body || '')) : h('p', { class: 'desk-body' }, it.excerpt ? plainExcerpt(it.excerpt) : '加载正文…')
     mount(desk, h('div', { class: 'desk' }, [
       h('div', { class: 'desk-top' }, [h('span', { class: 'lab pane-no' }, [kindBadge(it.kind), ` · ${String(items.indexOf(it) + 1 + offset).padStart(2, '0')}`]), h('span', { class: 'lab' }, it.status === 'pending' ? `已等待 ${it.ageDays} 天` : '已驳回')]),
@@ -78,6 +97,7 @@ export default async function render(ctx) {
       it.reason ? h('p', { class: 'meta-reason' }, `原因：${it.reason}`) : null,
       h('div', { class: 'desk-meta' }, `${it.agent}${it.tags.length ? ' · ' + it.tags.join(', ') : ''}`),
       it.tags.length ? h('div', { class: 'card-row-tags' }, it.tags.slice(0, 8).map((t) => tagChip(t, `#/cards?tag=${encodeURIComponent(t)}`))) : null,
+      reasonBox ? h('label', { class: 'desk-reason', for: 'desk-reason' }, [h('span', { class: 'lab' }, '驳回理由（可选，会记录在状态流转里；Shift+Enter 换行）'), reasonBox]) : null,
       h('div', { class: 'desk-actions' }, [...both, h('a', { class: 'desk-more', href: `#/card?path=${encodeURIComponent(it.path)}` }, '查看全文 →')]),
     ]))
   }
@@ -102,7 +122,7 @@ export default async function render(ctx) {
     rows.get(items[i].path)?.scrollIntoView({ block: 'nearest' })
   }
 
-  // 键盘：j / k 上下切换，a 批准，r 驳回。输入框 / 对话框打开 / 带修饰键时不触发；页面被换掉后自动卸载监听。
+  // 键盘：j / k 上下切换，a 批准，r 聚焦行内驳回理由框（Enter 提交 / Esc 取消）。输入框 / 对话框打开 / 带修饰键时不触发；页面被换掉后自动卸载监听。
   const root = h('div', { class: 'page' }, [])
   const onKey = (e) => {
     if (!root.isConnected) { document.removeEventListener('keydown', onKey); return }
@@ -110,7 +130,7 @@ export default async function render(ctx) {
     const t = e.target
     if (t && (/^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName) || t.isContentEditable)) return
     if (document.querySelector('.modal-layer .modal')) return
-    if (e.key === 'j') { e.preventDefault(); move(1) } else if (e.key === 'k') { e.preventDefault(); move(-1) } else if (e.key === 'a') { if (approveBtn) { e.preventDefault(); approveBtn.click() } } else if (e.key === 'r') { if (rejectBtn) { e.preventDefault(); rejectBtn.click() } }
+    if (e.key === 'j') { e.preventDefault(); move(1) } else if (e.key === 'k') { e.preventDefault(); move(-1) } else if (e.key === 'a') { if (approveBtn) { e.preventDefault(); approveBtn.click() } } else if (e.key === 'r') { if (reasonInput) { e.preventDefault(); reasonInput.focus() } }
   }
   document.addEventListener('keydown', onKey)
 
