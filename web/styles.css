@@ -906,12 +906,13 @@ a.bar-row, .bar-row:hover { background: transparent; }
 
 /* ---- 主从布局：左列表 + 右详情 / 审阅台（卡片、待审）---- */
 .split { display: flex; flex-wrap: wrap; align-items: flex-start; border-top: 3px solid var(--line-strong); border-bottom: 1px solid var(--line-strong); }
-.split-list { flex: 999 1 460px; min-width: 0; }
+.split-list { flex: 1.5 1 clamp(340px, 33vw, 560px); min-width: 0; }
 .split-list .card-list { border-top: 0; border-bottom: 0; }
 .split-list .bulk-bar { border-top: 0; }
-.split-pane { flex: 1 1 400px; max-width: 600px; min-width: 0; border-left: 1px solid var(--line-strong); padding: 24px clamp(20px, 3vw, 36px) 36px; position: sticky; top: var(--topbar-h); max-height: calc(100vh - var(--topbar-h)); max-height: calc(100dvh - var(--topbar-h)); overflow-y: auto; align-self: stretch; }
-.split-queue .split-list { flex: 1 1 380px; max-width: 520px; }
-.split-queue .split-pane { flex: 999 1 440px; max-width: none; }
+.split-pane { flex: 1 1 clamp(360px, 36vw, 640px); max-width: none; min-width: 0; border-left: 1px solid var(--line-strong); padding: 24px clamp(20px, 3vw, 36px) 36px; position: sticky; top: var(--topbar-h); max-height: calc(100vh - var(--topbar-h)); max-height: calc(100dvh - var(--topbar-h)); overflow-y: auto; align-self: stretch; }
+/* 卡片 / 待审的主从布局：放开 .view 的限宽，详情栏约占一半；正文行宽另行限制在可读范围 */
+.view[data-route="cards"], .view[data-route="queue"] { max-width: none; }
+.split-pane .md, .split-pane .desk-body { max-width: 72ch; }
 .split-pane .page { gap: 20px; }
 .split-pane .back, .split-pane .detail-head .path { display: none; }
 .split-pane .detail-grid { grid-template-columns: 1fr; gap: 24px; }
