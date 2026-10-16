@@ -62,7 +62,7 @@ export default async function render(ctx) {
   ])
   const more = (k, n) => (d.truncated[k] ? h('p', { class: 'sub' }, `仅显示前 ${n} 项，共 ${c[{ noise: 'noise', duplicates: 'duplicateGroups', tags: 'tagChanges', kindMisplaced: 'kindMisplaced', secrets: 'secrets', oversizeRaw: 'oversizeRaw' }[k]]} 项`) : null)
   return h('div', { class: 'page' }, [
-    pageHead('04', 'Tidy', '整理中心', '预览不会修改任何数据。要执行：先演练，再输入确认词，才会真正改库；执行前自动备份，批后自检，失败自动回滚。', h('span', { class: 'lab' }, ['planId ', h('code', null, d.planId), ` · ${fmtNum(d.totals.cards)} 张卡`])),
+    pageHead('07', 'Tidy', '整理中心', '预览不会修改任何数据。要执行：先演练，再输入确认词，才会真正改库；执行前自动备份，批后自检，失败自动回滚。', h('span', { class: 'lab' }, ['planId ', h('code', null, d.planId), ` · ${fmtNum(d.totals.cards)} 张卡`])),
     h('div', { class: 'stats' }, [
       stat('噪声卡', c.noise, { tone: c.noise ? 'tone-warn' : '' }),
       stat('近似重复组', c.duplicateGroups, { hint: `可吸收 ${c.duplicateAbsorbable} 张` }),
