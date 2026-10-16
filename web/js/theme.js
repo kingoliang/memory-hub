@@ -30,4 +30,32 @@ export function setTheme(mode) {
   applyTheme(mode)
 }
 
+// 强调色：红（默认）/ 蓝 / 绿。同样只存 localStorage；通过 html[data-accent] 覆盖 --accent 系令牌（见 styles.css 末尾）。
+const ACCENT_KEY = 'mh-accent'
+export const ACCENTS = ['red', 'blue', 'green']
+export const ACCENT_LABEL = { red: '朱红', blue: '钴蓝', green: '森绿' }
+
+export function getAccent() {
+  try {
+    const v = globalThis.localStorage?.getItem(ACCENT_KEY)
+    return ACCENTS.includes(v) ? v : 'red'
+  } catch { return 'red' }
+}
+
+export function applyAccent(name) {
+  const el = globalThis.document?.documentElement
+  if (!el) return
+  if (name === 'blue' || name === 'green') el.setAttribute('data-accent', name)
+  else el.removeAttribute('data-accent')
+  globalThis.dispatchEvent?.(new Event('mh-theme')) // 图谱画布需要重读 CSS 变量
+}
+
+export function setAccent(name) {
+  try {
+    if (name === 'blue' || name === 'green') globalThis.localStorage?.setItem(ACCENT_KEY, name)
+    else globalThis.localStorage?.removeItem(ACCENT_KEY)
+  } catch { /* 存储不可用：本次会话仍生效 */ }
+  applyAccent(name)
+}
+
 export const nextTheme = (mode) => THEMES[(THEMES.indexOf(mode) + 1) % THEMES.length]

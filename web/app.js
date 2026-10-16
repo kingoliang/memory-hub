@@ -11,7 +11,7 @@ import { getTheme, setTheme, nextTheme, THEME_LABEL, THEME_ICON } from './js/the
 const NAV = [
   { group: '概览', items: [['overview', '总览', 'overview']] },
   { group: '记忆', items: [['cards', '卡片', 'cards'], ['queue', '待审队列', 'queue'], ['recycle', '回收站', 'trash'], ['tags', '标签', 'tag'], ['graph', '图谱', 'graph']] },
-  { group: '维护', items: [['tidy', '整理中心', 'broom'], ['lint', '健康报告', 'heart'], ['account', '账户', 'lock']] },
+  { group: '维护', items: [['tidy', '整理中心', 'broom'], ['lint', '健康报告', 'heart'], ['account', '账户', 'lock'], ['settings', '设置', 'sliders']] },
   { group: '观测', items: [['activity', '沉淀活跃度', 'pulse'], ['tokens', '令牌', 'key'], ['audit', '审计日志', 'log']] },
 ]
 const GROUP_OF = Object.fromEntries(NAV.flatMap((g) => g.items.map(([k]) => [k, g.group])))
@@ -22,7 +22,7 @@ const VIEWS = {
   overview: () => import('./js/views/overview.js'), cards: () => import('./js/views/cards.js'), card: () => import('./js/views/card.js'),
   queue: () => import('./js/views/queue.js'), recycle: () => import('./js/views/recycle.js'), tags: () => import('./js/views/tags.js'), graph: () => import('./js/views/graph.js'),
   tidy: () => import('./js/views/tidy.js'), lint: () => import('./js/views/lint.js'), activity: () => import('./js/views/activity.js'),
-  tokens: () => import('./js/views/tokens.js'), audit: () => import('./js/views/audit.js'), account: () => import('./js/views/account.js'),
+  tokens: () => import('./js/views/tokens.js'), audit: () => import('./js/views/audit.js'), account: () => import('./js/views/account.js'), settings: () => import('./js/views/settings.js'),
 }
 
 const root = document.getElementById('app')

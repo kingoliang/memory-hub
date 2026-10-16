@@ -2,4 +2,6 @@
 try {
   var t = localStorage.getItem('mh-theme')
   if (t === 'light' || t === 'dark') document.documentElement.setAttribute('data-theme', t)
+  var a = localStorage.getItem('mh-accent')
+  if (a === 'blue' || a === 'green') document.documentElement.setAttribute('data-accent', a)
 } catch (e) { /* 存储不可用：跟随系统 */ }

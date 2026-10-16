@@ -16,6 +16,7 @@ import * as G from './graph.js'
 import { writeLog } from '../core/writelog.js'
 import { HttpError } from './errors.js'
 import * as Ops from './ops.js'
+import * as Settings from './settings.js'
 
 const WEB_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../web')
 const MAX_LOGIN_BODY = 8 * 1024
@@ -203,6 +204,7 @@ export function createAdminHandler({ config, log }) {
     'GET /lint': () => Q.lintReport(root),
     'GET /activity': (ctx) => Q.activity(root, { days: intParam(ctx.url, 'days', { def: 30, min: 1, max: 365 }), silentDays: intParam(ctx.url, 'silentDays', { def: 7, min: 1, max: 365 }) }),
     'GET /tokens': () => Q.tokenList(root),
+    'GET /settings': () => Settings.getSettings(root, { config }),
     'GET /write-log': (ctx) => {
       const u = ctx.url
       return Q.writeLogPage(root, {
@@ -232,6 +234,7 @@ export function createAdminHandler({ config, log }) {
     'POST /tokens': async (ctx) => Ops.createTokenAdmin(root, Ops.actorOf(ctx.session, ctx.ip), await ctx.json(), deps),
     'PATCH /tokens': async (ctx) => Ops.updateTokenAdmin(root, Ops.actorOf(ctx.session, ctx.ip), await ctx.json(), deps),
     'DELETE /tokens': (ctx) => Ops.revokeTokenAdmin(root, Ops.actorOf(ctx.session, ctx.ip), strParam(ctx.url, 'tokenId', 100), deps),
+    'PATCH /settings': async (ctx) => Settings.updateSettings(root, Ops.actorOf(ctx.session, ctx.ip), await ctx.json(), deps),
     'POST /password': async (ctx) => {
       const out = await Ops.changePassword(root, Ops.actorOf(ctx.session, ctx.ip), await ctx.json(), { ...deps, limiter })
       return { ...out, __headers: { 'set-cookie': `${SESSION_COOKIE}=; ${cookieAttrs(ctx.req, 0)}` } }

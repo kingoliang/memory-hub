@@ -1062,3 +1062,47 @@ td .card-link, .plain-list .card-link { font-size: var(--fs-md); font-weight: 60
   .g12 { grid-template-columns: minmax(0, 1fr); gap: 32px; }
   .g12 > .c12, .g12 > .c7, .g12 > .c6, .g12 > .c5 { grid-column: auto; }
 }
+
+/* 强调色（外观设置，纯前端）：覆盖 --accent 系令牌；深色用提亮变体 */
+:root[data-accent="blue"] { --accent: #0a3dd6; --accent-ink: #ffffff; --accent-soft: #e3eaff; }
+:root[data-accent="green"] { --accent: #0a7a3d; --accent-ink: #ffffff; --accent-soft: #e0f1e7; }
+@media (prefers-color-scheme: dark) {
+  :root[data-accent="blue"]:not([data-theme="light"]) { --accent: #7a9bff; --accent-ink: #0b0b0b; --accent-soft: #16213f; }
+  :root[data-accent="green"]:not([data-theme="light"]) { --accent: #5fd18f; --accent-ink: #0b0b0b; --accent-soft: #12301f; }
+}
+:root[data-accent="blue"][data-theme="dark"] { --accent: #7a9bff; --accent-ink: #0b0b0b; --accent-soft: #16213f; }
+:root[data-accent="green"][data-theme="dark"] { --accent: #5fd18f; --accent-ink: #0b0b0b; --accent-soft: #12301f; }
+
+/* 设置页：左侧编号 + 说明，右侧字段（12 列：4 + 8） */
+.set-sec { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 16px 32px; align-items: start; }
+.set-sec > .set-intro { grid-column: span 4; min-width: 0; }
+.set-sec > .set-body { grid-column: span 8; min-width: 0; border-top: 1px solid var(--line-strong); padding-top: 16px; display: grid; gap: 20px; }
+.set-letter { font-family: var(--mono); font-size: 44px; line-height: 1; font-weight: 500; color: var(--accent); }
+.set-intro h2 { margin: 10px 0 6px; font-size: 24px; font-weight: 800; letter-spacing: -.01em; }
+.set-opt { display: flex; align-items: flex-start; gap: 12px; min-height: 44px; padding: 8px 0; cursor: pointer; }
+.set-opt input { margin-top: 4px; }
+.set-opt small { display: block; color: var(--muted); font-size: 14px; }
+.set-chips { display: flex; flex-wrap: wrap; gap: 8px; }
+.set-chip { min-height: 44px; display: inline-flex; align-items: center; gap: 8px; border: 1px solid var(--line-strong); padding: 0 12px; font-family: var(--mono); font-size: 13px; cursor: pointer; }
+.set-group { display: grid; gap: 8px; border: 0; padding: 0; margin: 0; min-width: 0; }
+.set-group > legend { padding: 0; margin-bottom: 4px; font-family: var(--mono); font-size: 11.5px; letter-spacing: .06em; text-transform: uppercase; color: var(--faint); }
+.set-kv { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 0; margin: 0; }
+.set-kv > div { display: contents; }
+.set-kv dt, .set-kv dd { margin: 0; padding: 10px 0; border-bottom: 1px solid var(--line); min-width: 0; overflow-wrap: anywhere; }
+.set-kv dt small { display: block; font-family: var(--mono); font-size: 12px; color: var(--faint); }
+.set-kv dd { text-align: right; font-weight: 700; padding-left: 16px; }
+.set-seg { display: flex; flex-wrap: wrap; }
+.set-seg label { border: 1px solid var(--line-strong); margin-right: -1px; padding: 0 18px; display: inline-flex; align-items: center; gap: 8px; min-height: 44px; cursor: pointer; font-family: inherit; }
+.set-seg label:has(input:checked) { background: var(--text); color: var(--bg); }
+.set-save { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; border-top: 3px solid var(--line-strong); padding-top: 20px; }
+@media (max-width: 860px) {
+  .set-sec { grid-template-columns: minmax(0, 1fr); }
+  .set-sec > .set-intro, .set-sec > .set-body { grid-column: auto; }
+  .set-seg label { flex: 1 1 auto; justify-content: center; }
+}
+/* 设置页：覆盖全局 label（小号大写等宽、纵向）——选项行是横向的正文字体 */
+label.set-opt, .set-seg label { flex-direction: row; font-family: var(--font); font-size: var(--fs-base); letter-spacing: 0; text-transform: none; font-weight: 500; color: var(--text); }
+label.set-chip { flex-direction: row; font-size: 13px; letter-spacing: 0; text-transform: none; font-weight: 400; color: var(--text); }
+.set-seg label:has(input:checked) { color: var(--bg); }
+label.set-opt strong { font-size: var(--fs-base); }
+.set-form { display: grid; gap: 20px; }
