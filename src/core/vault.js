@@ -5,6 +5,7 @@
 
 import { getDb, enforceAudit, nextCardId, MAIN_STATUS, QUARANTINE_STATUSES, tableForStatus } from './db.js'
 import { minhashSignature, lshCandidates } from './minhash.js'
+import { rankHits } from './scope.js'
 
 /** 主题目录根。 */
 export const KIND_ROOTS = {
@@ -21,7 +22,7 @@ export const CAPTURE_KINDS = ['project', 'knowledge', 'content', 'prompt', 'busi
 
 /** 从 Markdown 文本提取 frontmatter 与正文。 */
 export function parseCard(text) {
-  const meta = { title: '', kind: 'knowledge', tags: [], created: '', updated: '', source: '', formatVersion: 0, status: 'pending', submittedBy: '', severity: 'info', reason: '', deletedAt: '' }
+  const meta = { title: '', kind: 'knowledge', tags: [], created: '', updated: '', source: '', formatVersion: 0, status: 'pending', submittedBy: '', severity: 'info', reason: '', deletedAt: '', owner: '', team: '', visibility: '' }
   let body = text
   const m = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?/.exec(text)
   if (m) {
@@ -38,7 +39,7 @@ export function parseCard(text) {
       }
       if (key === 'formatVersion') {
         meta.formatVersion = Number(value) || 0
-      } else if (key === 'kind' || key === 'title' || key === 'created' || key === 'updated' || key === 'source' || key === 'status' || key === 'submittedBy' || key === 'severity' || key === 'reason' || key === 'deletedAt') {
+      } else if (key === 'kind' || key === 'title' || key === 'created' || key === 'updated' || key === 'source' || key === 'status' || key === 'submittedBy' || key === 'severity' || key === 'reason' || key === 'deletedAt' || key === 'owner' || key === 'team' || key === 'visibility') {
         meta[key] = value.replace(/^['"]|['"]$/g, '')
       }
     }
@@ -189,6 +190,9 @@ function rowToCard(row) {
     mtime: new Date(row.updated_at).getTime(),
     status: row.status,
     submittedBy: row.submitted_by || '',
+    owner: row.owner || '',
+    team: row.team || '',
+    visibility: row.visibility || '',
     severity: row.severity || 'info',
     reason: row.reason || '',
     deletedAt: row.deleted_at || '',
@@ -209,6 +213,9 @@ function rowToMarkdown(row) {
     `status: ${row.status}`,
     ...(row.deleted_at ? [`deletedAt: ${row.deleted_at}`] : []),
     ...(row.submitted_by ? [`submittedBy: ${yamlString(row.submitted_by)}`] : []),
+    ...(row.owner ? [`owner: ${yamlString(row.owner)}`] : []),
+    ...(row.team ? [`team: ${yamlString(row.team)}`] : []),
+    ...(row.visibility ? [`visibility: ${row.visibility}`] : []),
     ...(row.severity && row.severity !== 'info' ? [`severity: ${row.severity}`] : []),
     ...(row.reason ? [`reason: ${yamlString(row.reason)}`] : []),
     ...(row.source ? [`source: ${row.source}`] : []),
@@ -261,7 +268,7 @@ function storesFor(want) {
  * @param stores storesFor() 的结果
  * @param extra  { kind, agent, tail } —— tail 是 ORDER BY / LIMIT 片段（默认按 updated_at 倒序）
  */
-function multiStoreQuery(sel, stores, { kind = '', agent = '', tail = 'ORDER BY updated_at DESC' } = {}) {
+function multiStoreQuery(sel, stores, { kind = '', agent = '', owner = '', team = '', visibility = '', tail = 'ORDER BY updated_at DESC' } = {}) {
   const parts = []
   const args = []
   for (const store of stores) {
@@ -272,6 +279,9 @@ function multiStoreQuery(sel, stores, { kind = '', agent = '', tail = 'ORDER BY 
       wargs.push(...store.statuses)
     }
     if (kind) { where.push('kind = ?'); wargs.push(kind) }
+    if (owner) { where.push('owner = ?'); wargs.push(owner) }
+    if (team) { where.push('team = ?'); wargs.push(team) }
+    if (visibility) { where.push('visibility = ?'); wargs.push(visibility) }
     if (agent) where.push(agentWhere(agent, wargs))
     parts.push(`SELECT ${sel} FROM ${store.table}${where.length ? ' WHERE ' + where.join(' AND ') : ''}`)
     args.push(...wargs)
@@ -310,15 +320,16 @@ export const TITLE_COLLATOR = new Intl.Collator('zh-Hans-CN', { numeric: true, s
  * @param opts.offset  偏移（配合 limit 做真分页）
  * @param opts.sort    'recent'（updated_at DESC，默认）| 'title'（拼音升序，跨页全局有序）
  */
-export async function listCards(root, { status, kind, agent, limit, offset = 0, sort = 'recent' } = {}) {
+export async function listCards(root, { status, kind, agent, owner, team, visibility, limit, offset = 0, sort = 'recent' } = {}) {
   const want = status ?? [MAIN_STATUS]
   const db = getDb(root)
   const stores = storesFor(want)
+  const scope = { kind, agent, owner, team, visibility }
 
   if (sort === 'title') {
     // SQLite 的 ORDER BY 是 UTF-8 字节序，中文标题看着就是乱的 → 只取 path/title 用拼音排好，
     // 再回表取这一页的正文（避免为了排序把所有正文读进内存）。
-    const { sql, args } = multiStoreQuery('path, title', stores, { kind, agent, tail: '' })
+    const { sql, args } = multiStoreQuery('path, title', stores, { ...scope, tail: '' })
     const light = db.prepare(sql).all(...args)
     light.sort((a, b) => TITLE_COLLATOR.compare(a.title || '', b.title || ''))
     const start = Math.max(0, offset | 0)
@@ -340,19 +351,19 @@ export async function listCards(root, { status, kind, agent, limit, offset = 0, 
   // 注意：两张表的列数不同（quarantine 多 quarantined_at / quarantine_reason），
   // UNION ALL 必须显式列出公共列，不能用 `*`（否则列会错位）。
   const { sql, args } = multiStoreQuery(
-    'id, path, kind, title, tags, body, summary, status, source, submitted_by, severity, reason, created_at, updated_at, deleted_at',
+    'id, path, kind, title, tags, body, summary, status, source, submitted_by, severity, reason, owner, team, visibility, created_at, updated_at, deleted_at',
     stores,
-    { kind, agent, tail },
+    { ...scope, tail },
   )
   const finalArgs = Number.isInteger(limit) && limit > 0 ? [...args, limit, Math.max(0, offset | 0)] : args
   return db.prepare(sql).all(...finalArgs).map(rowToCard)
 }
 
 /** 计数（分页接口要用 total 判断还有没有下一页）。 */
-export async function countCards(root, { status, kind, agent } = {}) {
+export async function countCards(root, { status, kind, agent, owner, team, visibility } = {}) {
   const db = getDb(root)
   const stores = storesFor(status ?? [MAIN_STATUS])
-  const { sql, args } = multiStoreQuery('COUNT(*) n', stores, { kind, agent, tail: '' })
+  const { sql, args } = multiStoreQuery('COUNT(*) n', stores, { kind, agent, owner, team, visibility, tail: '' })
   return db.prepare(`SELECT SUM(n) n FROM (${sql})`).get(...args).n || 0
 }
 
@@ -409,15 +420,15 @@ function moveCardBetweenStores(db, from, to, rel, { status, deletedAt = null, qu
     if (to === 'quarantine') {
       db.prepare(`
         INSERT INTO quarantine
-          (id, path, kind, title, tags, body, summary, status, source, submitted_by, severity, reason, created_at, updated_at, deleted_at, quarantined_at, quarantine_reason)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?)
-      `).run(newId, src.path, src.kind, src.title, src.tags, src.body, src.summary, status, src.source, src.submitted_by, src.severity, src.reason, src.created_at, now, deletedAt, quarantineReason)
+          (id, path, kind, title, tags, body, summary, status, source, submitted_by, severity, reason, owner, team, visibility, created_at, updated_at, deleted_at, quarantined_at, quarantine_reason)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?)
+      `).run(newId, src.path, src.kind, src.title, src.tags, src.body, src.summary, status, src.source, src.submitted_by, src.severity, src.reason, src.owner || '', src.team || '', src.visibility || '', src.created_at, now, deletedAt, quarantineReason)
     } else {
       db.prepare(`
         INSERT INTO cards
-          (id, path, kind, title, tags, body, summary, status, source, submitted_by, severity, reason, created_at, updated_at, deleted_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(newId, src.path, src.kind, src.title, src.tags, src.body, src.summary, status, src.source, src.submitted_by, src.severity, src.reason, src.created_at, now, deletedAt)
+          (id, path, kind, title, tags, body, summary, status, source, submitted_by, severity, reason, owner, team, visibility, created_at, updated_at, deleted_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(newId, src.path, src.kind, src.title, src.tags, src.body, src.summary, status, src.source, src.submitted_by, src.severity, src.reason, src.owner || '', src.team || '', src.visibility || '', src.created_at, now, deletedAt)
     }
     // 更新记录跟着卡走（id 变了，按新 id 改绑）
     db.prepare('UPDATE card_updates SET card_id = ? WHERE card_id = ?').run(newId, src.id)
@@ -598,7 +609,7 @@ export function setCardStatusSync(db, rel, status, { changedBy = 'system', reaso
  * `dedupAgainst` 传入候选集合时，去重只跟**这些**卡比（导入备份用：基线取导入前的快照，
  * 让同一批里互相近似的卡不会互吞）。
  */
-export async function writeCard(root, { kind, title, tags = [], body, source = '', status = 'pending', submittedBy = '', severity = 'info', reason = '', deletedAt = '' }, { threshold = 0.62, dedup = true, dedupAgainst = null } = {}) {
+export async function writeCard(root, { kind, title, tags = [], body, source = '', status = 'pending', submittedBy = '', severity = 'info', reason = '', deletedAt = '', owner = '', team = '', visibility = '' }, { threshold = 0.62, dedup = true, dedupAgainst = null } = {}) {
   const db = getDb(root)
   const kindRoot = KIND_ROOTS[kind] || KIND_ROOTS.knowledge
 
@@ -627,19 +638,23 @@ export async function writeCard(root, { kind, title, tags = [], body, source = '
     const id = nextCardId(db) // 跨两张表唯一的 id，由 card_sequence 单一发号器分配
     if (targetTable === 'cards') {
       db.prepare(`
-        INSERT INTO cards (id, path, kind, title, tags, body, summary, status, source, submitted_by, severity, reason, created_at, updated_at, deleted_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO cards (id, path, kind, title, tags, body, summary, status, source, submitted_by, severity, reason, owner, team, visibility, created_at, updated_at, deleted_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         id, rel, kind, title, JSON.stringify(tags), body.trim(), summary,
-        enforcedStatus, source, submittedBy, severity, reason, now, now, deletedAt || null,
+        enforcedStatus, source, submittedBy, severity, reason,
+        String(owner || ''), String(team || ''), String(visibility || ''),
+        now, now, deletedAt || null,
       )
     } else {
       db.prepare(`
-        INSERT INTO quarantine (id, path, kind, title, tags, body, summary, status, source, submitted_by, severity, reason, created_at, updated_at, deleted_at, quarantined_at, quarantine_reason)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?)
+        INSERT INTO quarantine (id, path, kind, title, tags, body, summary, status, source, submitted_by, severity, reason, owner, team, visibility, created_at, updated_at, deleted_at, quarantined_at, quarantine_reason)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?)
       `).run(
         id, rel, kind, title, JSON.stringify(tags), body.trim(), summary,
-        enforcedStatus, source, submittedBy, severity, reason, now, now, deletedAt || null,
+        enforcedStatus, source, submittedBy, severity, reason,
+        String(owner || ''), String(team || ''), String(visibility || ''),
+        now, now, deletedAt || null,
         '新卡待审核',
       )
     }
@@ -822,8 +837,8 @@ export async function mergeCards(root, paths) {
   return { ok: true, path: r.path, merged: rows.length }
 }
 
-/** 检索：整词/中文 bigram 命中。 */
-export async function search(root, query, { limit = 30, minScore = 0, semantic = false } = {}) {
+/** 检索：整词/中文 bigram 命中。tier 优先（先自己的、再团队、再公开），同 tier 才比相关度。 */
+export async function search(root, query, { limit = 30, minScore = 0, semantic = false, viewer = null, scope = 'auto' } = {}) {
   const q = String(query || '').trim()
   if (!q) return []
   const db = getDb(root)
@@ -861,8 +876,8 @@ export async function search(root, query, { limit = 30, minScore = 0, semantic =
     const rec = fbByPath[hit.path]
     if (rec) hit.score += rec.useful * 2 - rec.irr * 2
   }
-  out.sort((a, b) => b.score - a.score || b.mtime - a.mtime)
-  return out.slice(0, limit)
+  // tier 过滤 + 分层排序在 scope.js（纯函数，变异测试重点靶区）。
+  return rankHits(out, viewer, scope).slice(0, limit)
 }
 
 /** 用量趋势：最近 N 天每天新增卡片数。 */

@@ -12,7 +12,9 @@ const { DatabaseSync } = sqlite
 const DB_FILE = 'memory-eternal.db'
 export const DB_FILENAME = DB_FILE
 /** 当前 schema 版本（PRAGMA user_version）。0 = 旧版 memory-eternal 库。 */
-export const SCHEMA_VERSION = 2
+export const SCHEMA_VERSION = 3
+/** 归属列：新增列名+建表默认值，迁移与建表共用一份，避免两边漂移。 */
+export const SCOPE_COLUMNS = { owner: "TEXT NOT NULL DEFAULT ''", team: "TEXT NOT NULL DEFAULT 'default'", visibility: "TEXT NOT NULL DEFAULT 'team'" }
 export const BUSY_TIMEOUT_MS = 5000
 
 /** 获取或创建 SQLite 数据库连接（单例 per root）。 */
@@ -26,14 +28,43 @@ export function getDb(root) {
   const db = new DatabaseSync(dbPath)
   // 必须最先设置：后面的 journal_mode / 建表在多进程并发启动时都可能遇到写锁
   db.exec(`PRAGMA busy_timeout=${BUSY_TIMEOUT_MS}`)
-  db.exec('PRAGMA journal_mode=WAL')
-  db.exec('PRAGMA synchronous=NORMAL')
-  db.exec('PRAGMA foreign_keys=ON')
-  initTables(db)
-  migrateSchema(db)
+  // 为什么还要重试：`PRAGMA journal_mode=WAL`（以及并发 DDL）抢不到写锁时**不会**被
+  // busy_timeout 兜住 —— 实测 8 进程同时首次打开同一个新库，6 轮里 5 轮有进程直接抛
+  // "database is locked"。表现为 tests/concurrency.test.mjs 间歇失败，很容易被误读成"机器慢"。
+  // 每一步都幂等，所以整段重试是安全的。回归见 tests/core/db-concurrent-open.test.mjs。
+  try {
+    withBusyRetry(() => {
+      db.exec('PRAGMA journal_mode=WAL')
+      db.exec('PRAGMA synchronous=NORMAL')
+      db.exec('PRAGMA foreign_keys=ON')
+      initTables(db)
+      migrateSchema(db)
+      migrateToQuarantine(db)
+    })
+  } catch (e) {
+    try { db.close() } catch { /* 关不掉也无所谓，下面重新抛 */ }
+    throw e
+  }
   try { chmodSync(dbPath, 0o600) } catch { /* 非 POSIX 文件系统 */ }
   instances.set(resolved, db)
   return db
+}
+
+/** 同步睡眠（getDb 不能 await，所以只能阻塞式等待）。 */
+const sleepSync = (ms) => { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms) }
+const isBusyError = (e) => /busy|locked/i.test(String(e?.message ?? e))
+
+/** 对锁冲突做有界重试：延迟线性递增（20ms 起），总预算约 2.4s，超过就把原错误抛回去。 */
+function withBusyRetry(fn, { attempts = 15, delayMs = 20 } = {}) {
+  let last
+  for (let i = 0; i < attempts; i++) {
+    try { return fn() } catch (e) {
+      if (!isBusyError(e)) throw e
+      last = e
+      sleepSync(delayMs * (i + 1))
+    }
+  }
+  throw last
 }
 
 /**
@@ -158,6 +189,15 @@ function initTables(db) {
   migrateToQuarantine(db)
 }
 
+const hasColumn = (db, table, col) => db.prepare(`PRAGMA table_info(${table})`).all().some((c) => c.name === col)
+
+/** 幂等加列（老库升级用）。新鲜库也走同一路径（见 migrateSchema 2 → 3），所以列定义只维护一份。 */
+function addColumnIfMissing(db, table, name, ddl) {
+  if (hasColumn(db, table, name)) return false
+  db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${ddl}`)
+  return true
+}
+
 /**
  * schema 迁移（PRAGMA user_version）。幂等、只增不删。
  *   0 → 1：追加 agent_tokens / write_log / card_revisions / admin_sessions（旧 7 张表一列不改）。
@@ -165,6 +205,11 @@ function initTables(db) {
  *          重建表（SQLite 无法直接删列约束）：同一事务内建新表 → 拷贝全部行 → 删旧表 → 改名 → 建索引；数据与哈希原样保留。
  *          旧代码（SCHEMA_VERSION=1）打开 v2 库时 user_version 已 ≥1 不再迁移，照常读写（它的"令牌名已存在"检查只是少了一道约束，不会坏）。
  *          回滚代码版本无需回滚库；真要还原库用升级前的备份。
+ *   2 → 3：团队归属 + 可见性（docs/decisions/2026-10-18-team-scope-own-first-recall.md）。
+ *          cards / quarantine 增 owner / team / visibility；agent_tokens 增 owner / team / default_visibility。
+ *          老行 owner 回填为 submitted_by（之后所有行都有归属），team 默认 'default'（全员同一团队 = 升级前语义），
+ *          visibility 默认 'team'（人人可见 = 升级前语义）。**只加列，不重写行**。
+ *          新增列不进 migrate 指纹（指纹用显式列 path|kind|title|tags|body|status），对账不受影响。
  * 多进程同时启动时：BEGIN IMMEDIATE 串行化，拿到锁后重新读一次 user_version，已迁移则直接返回。
  */
 export function migrateSchema(db) {
@@ -240,6 +285,20 @@ export function migrateSchema(db) {
         CREATE UNIQUE INDEX idx_agent_tokens_active_name ON agent_tokens(name) WHERE revoked_at IS NULL;
       `)
     }
+    if (current() < 3) {
+      // 单一定义源：SCOPE_COLUMNS。新鲜库与老库走同一条路（新鲜库 user_version=0，必经这里）。
+      for (const [col, ddl] of Object.entries(SCOPE_COLUMNS)) {
+        for (const table of ['cards', 'quarantine', 'agent_tokens']) addColumnIfMissing(db, table, col, ddl)
+      }
+      addColumnIfMissing(db, 'agent_tokens', 'default_visibility', "TEXT NOT NULL DEFAULT 'team'")
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_cards_scope ON cards(team, owner, visibility);
+        CREATE INDEX IF NOT EXISTS idx_quarantine_scope ON quarantine(team, owner, visibility);
+      `)
+      // 老行归属回填：owner 从署名推断（空署名 = 本机单机，保留空串，走 tierOf 的"本地人"通配）。
+      db.exec("UPDATE cards SET owner = submitted_by WHERE owner = '' AND COALESCE(submitted_by,'') <> ''")
+      db.exec("UPDATE quarantine SET owner = submitted_by WHERE owner = '' AND COALESCE(submitted_by,'') <> ''")
+    }
     db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`)
     db.exec('COMMIT')
   } catch (e) {
@@ -290,8 +349,8 @@ export function migrateToQuarantine(db) {
 
   const insertQuarantine = db.prepare(`
     INSERT OR IGNORE INTO quarantine
-      (id, path, kind, title, tags, body, summary, status, source, submitted_by, severity, reason, created_at, updated_at, deleted_at, quarantined_at, quarantine_reason)
-    SELECT id, path, kind, title, tags, body, summary, status, source, submitted_by, severity, reason, created_at, updated_at, deleted_at, datetime('now'), '迁移：主库只保留 approved'
+      (id, path, kind, title, tags, body, summary, status, source, submitted_by, severity, reason, owner, team, visibility, created_at, updated_at, deleted_at, quarantined_at, quarantine_reason)
+    SELECT id, path, kind, title, tags, body, summary, status, source, submitted_by, severity, reason, owner, team, visibility, created_at, updated_at, deleted_at, datetime('now'), '迁移：主库只保留 approved'
     FROM cards WHERE id = ?
   `)
   const dropFromMain = db.prepare('DELETE FROM cards WHERE id = ?')

@@ -4,6 +4,7 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { GATE_MODES } from './core/gate.js'
 
 export class ConfigError extends Error {
   constructor(message) { super(message); this.name = 'ConfigError' }
@@ -141,6 +142,17 @@ export function loadConfig(env = process.env, { warn = () => {} } = {}) {
     summarizeMinIntervalMs: intOpt('MEMORY_HUB_GRAPH_SUMMARIZE_MIN_INTERVAL_MS', file.graphSearch?.summarizeMinIntervalMs, 3000, 0, 600000),
   }
 
+  const gatePick = (envName, fileVal, def) => {
+    const raw = String(env[envName] ?? fileVal ?? def).trim().toLowerCase()
+    if (!GATE_MODES.includes(raw)) throw new ConfigError(`${envName} 必须是 ${GATE_MODES.join(' / ')} 之一：${raw}`)
+    return raw
+  }
+  // 经验闸门默认值：自动推送（ingest）最松不得 → strict；MCP 显式 capture 尊重意图 → heuristic。
+  const gate = {
+    ingest: gatePick('MEMORY_HUB_GATE_INGEST', file.gate?.ingest, 'strict'),
+    capture: gatePick('MEMORY_HUB_GATE_CAPTURE', file.gate?.capture, 'heuristic'),
+  }
+
   const instructions = typeof file.instructions === 'string' && file.instructions.trim() ? file.instructions : null
 
   return {
@@ -161,6 +173,7 @@ export function loadConfig(env = process.env, { warn = () => {} } = {}) {
     trustProxy,
     ingest,
     graphSearch,
+    gate,
     llm,
     llmRequest: llmOpts, // { reasoningEffort, extraBody, timeoutMs }：蒸馏请求的可选参数
     instructions,

@@ -36,7 +36,7 @@ test('列表不含任何密钥材料', () => {
     createToken(home, { name: 'a', scopes: ['read'] })
     const list = listTokens(home)
     assert.equal(list.length, 1)
-    assert.deepEqual(Object.keys(list[0]).sort(), ['createdAt', 'expiresAt', 'lastUsedAt', 'name', 'revokedAt', 'scopes', 'tokenId'])
+    assert.deepEqual(Object.keys(list[0]).sort(), ['createdAt', 'defaultVisibility', 'expiresAt', 'lastUsedAt', 'name', 'owner', 'revokedAt', 'scopes', 'team', 'tokenId'])
   } finally { closeAllDb(); rmrf(home) }
 })
 

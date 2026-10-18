@@ -103,7 +103,10 @@ export async function startServer(config, { logger = getLogger(), scheduler = tr
     const a = ctx.authInfo
     if (!a) throw new Error('missing authInfo') // 不可能：鉴权在 handler 之前
     return buildMcpServer({
-      identity: { type: 'agent', id: String(a.extra?.tokenId || ''), name: a.clientId, ip: String(a.extra?.ip || '') },
+      identity: {
+        type: 'agent', id: String(a.extra?.tokenId || ''), name: a.clientId, ip: String(a.extra?.ip || ''),
+        owner: String(a.extra?.owner || ''), team: String(a.extra?.team || ''), visibility: String(a.extra?.visibility || ''),
+      },
       scopes: a.scopes, config, log, llm, transport: 'http',
     })
   }
@@ -176,7 +179,7 @@ export async function startServer(config, { logger = getLogger(), scheduler = tr
       log.warn('ingest 请求校验失败', { actor: tok.name, reason: v.reason })
       return sendJson(res, 400, { status: 'invalid', reason: v.reason })
     }
-    const out = await runIngest({ config, identity: { tokenId: tok.tokenId, name: tok.name, ip }, llm, log, input: v.value })
+    const out = await runIngest({ config, identity: { tokenId: tok.tokenId, name: tok.name, ip, owner: tok.owner, team: tok.team, visibility: tok.visibility }, llm, log, input: v.value })
     return sendJson(res, out.http, out.body)
   }
 
@@ -227,7 +230,10 @@ export async function startServer(config, { logger = getLogger(), scheduler = tr
       }
     }
 
-    req.auth = { token: '', clientId: tok.name, scopes: tok.scopes, extra: { tokenId: tok.tokenId, ip } }
+    req.auth = {
+      token: '', clientId: tok.name, scopes: tok.scopes,
+      extra: { tokenId: tok.tokenId, ip, owner: tok.owner, team: tok.team, visibility: tok.visibility },
+    }
     res.setHeader('x-accel-buffering', 'no') // 反代（nginx）不要缓冲流式响应
     await nodeHandler(req, res, parsed)
   }

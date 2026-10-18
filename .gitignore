@@ -3,3 +3,7 @@ node_modules/
 .env
 *.env
 .tmp/
+
+# pi-goal-x 运行态（账本/锁/活跃目标；由插件维护，不进代码历史）
+.pi/goals/
+.pi/.goals-pool-snapshot.json

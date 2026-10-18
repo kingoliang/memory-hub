@@ -2,7 +2,7 @@
 // memory-hub CLI
 //   memory-hub serve                         起 HTTP 服务（默认 127.0.0.1:7990）
 //   memory-hub mcp                           stdio MCP（本地单 Agent，身份取 MEMORY_HUB_AGENT）
-//   memory-hub token create --name N --scope read,write [--expires 14d|ISO时间]   明文只显示这一次（stdout）
+//   memory-hub token create --name N --scope read,write [--owner 人] [--team 团队] [--visibility private|team|public] [--expires 14d|ISO时间]   明文只显示这一次（stdout）
 //   memory-hub token list [--json]
 //   memory-hub token revoke <name|tokenId>
 //   memory-hub token import-hash --name N --scope read,write [--expires 14d] (--from-file <旧令牌文件> | --hash <sha256>)   导入旧共享令牌（只存哈希，不打印）
@@ -67,8 +67,8 @@ function usage() {
   process.stderr.write(`用法：
   memory-hub serve
   memory-hub mcp
-  memory-hub token create --name <名字> --scope read,write[,tidy:apply] [--expires 14d]
-  memory-hub token list [--json]
+  memory-hub token create --name <名字> --scope read,write[,tidy:apply] [--owner <人>] [--team <团队>] [--visibility private|team|public] [--expires 14d]
+  memory-hub token list [--json]        # 文本输出列为：名字 owner team 可见性 tokenId scopes 状态 …
   memory-hub token revoke <名字|tokenId>
   memory-hub token import-hash --name <名字> --scope read,write [--expires 14d] (--from-file <旧令牌文件> | --hash <sha256十六进制>)
   memory-hub migrate verify --source <旧库或快照(目录或.db)> --target <新库> [--allow-target-extra] [--json]
@@ -115,9 +115,12 @@ async function main() {
 
   if (cmd === 'token') {
     if (sub === 'create') {
-      const t = createToken(config.dbRoot, { name: opt('name'), scopes: opt('scope'), expiresAt: parseExpires(opt('expires')) })
-      log.info('令牌已创建', { name: t.name, id: t.tokenId, scopes: t.scopes, expiresAt: t.expiresAt })
-      process.stderr.write(`令牌名：${t.name}\nscope：${t.scopes.join(',')}\n过期：${t.expiresAt || '不过期'}\n以下为令牌明文，只显示这一次，请立即保存（库里只存哈希）：\n`)
+      const t = createToken(config.dbRoot, {
+        name: opt('name'), scopes: opt('scope'), expiresAt: parseExpires(opt('expires')),
+        owner: opt('owner'), team: opt('team'), defaultVisibility: opt('visibility'),
+      })
+      log.info('令牌已创建', { name: t.name, id: t.tokenId, scopes: t.scopes, owner: t.owner, team: t.team, visibility: t.defaultVisibility, expiresAt: t.expiresAt })
+      process.stderr.write(`令牌名：${t.name}\nowner：${t.owner || '(空)'}\nteam：${t.team || '(空)'}\n默认可见性：${t.defaultVisibility}\nscope：${t.scopes.join(',')}\n过期：${t.expiresAt || '不过期'}\n以下为令牌明文，只显示这一次，请立即保存（库里只存哈希）：\n`)
       process.stdout.write(t.token + '\n')
       return 0
     }
@@ -127,7 +130,7 @@ async function main() {
       if (!rows.length) { process.stdout.write('（没有令牌）\n'); return 0 }
       for (const r of rows) {
         const state = r.revokedAt ? '已撤销' : r.expiresAt && Date.parse(r.expiresAt) <= Date.now() ? '已过期' : '有效'
-        process.stdout.write(`${r.name}\t${r.tokenId}\t${r.scopes.join(',')}\t${state}\t创建 ${r.createdAt}\t最近使用 ${r.lastUsedAt || '-'}\t过期 ${r.expiresAt || '-'}\n`)
+        process.stdout.write(`${r.name}\t${r.owner || '-'}\t${r.team || '-'}\t${r.defaultVisibility}\t${r.tokenId}\t${r.scopes.join(',')}\t${state}\t创建 ${r.createdAt}\t最近使用 ${r.lastUsedAt || '-'}\t过期 ${r.expiresAt || '-'}\n`)
       }
       return 0
     }
@@ -146,9 +149,12 @@ async function main() {
       if (file !== undefined) {
         try { token = fs.readFileSync(file, 'utf8').trim() } catch (e) { throw new TokenError(`读不到令牌文件：${file}（${e.code || 'error'}）`) }
       }
-      const t = importLegacyToken(config.dbRoot, { name: opt('name'), token, hash, scopes: opt('scope'), expiresAt: parseExpires(opt('expires')) })
-      log.info('旧令牌已导入（仅哈希）', { name: t.name, id: t.tokenId, scopes: t.scopes, expiresAt: t.expiresAt })
-      process.stdout.write(`已导入：${t.name}（${t.tokenId}） scope=${t.scopes.join(',')} 过期=${t.expiresAt || '不过期'}\n只保存了 sha256；旧令牌明文未被打印或存储。\n`)
+      const t = importLegacyToken(config.dbRoot, {
+        name: opt('name'), token, hash, scopes: opt('scope'), expiresAt: parseExpires(opt('expires')),
+        owner: opt('owner'), team: opt('team'), defaultVisibility: opt('visibility'),
+      })
+      log.info('旧令牌已导入（仅哈希）', { name: t.name, id: t.tokenId, scopes: t.scopes, owner: t.owner, team: t.team, visibility: t.defaultVisibility, expiresAt: t.expiresAt })
+      process.stdout.write(`已导入：${t.name}（${t.tokenId}） owner=${t.owner || '-'} team=${t.team || '-'} scope=${t.scopes.join(',')} 过期=${t.expiresAt || '不过期'}\n只保存了 sha256；旧令牌明文未被打印或存储。\n`)
       return 0
     }
     usage(); return 1

@@ -12,24 +12,36 @@ const legacyDb = await import(pathToFileURL(path.join(here, 'fixtures/legacy/db.
 
 const OLD_TABLES = ['config', 'cards', 'quarantine', 'card_updates', 'feedback', 'audit_log', 'card_sequence']
 const NEW_TABLES = ['agent_tokens', 'write_log', 'card_revisions', 'admin_sessions']
+/** schema v3 在旧表尾部追加的归属列（字面量，防止「新列被改动」被漏掉）。 */
+const ADDED_COLUMNS = {
+  cards: ["owner:TEXT:1:'':0", "team:TEXT:1:'default':0", "visibility:TEXT:1:'team':0"],
+  quarantine: ["owner:TEXT:1:'':0", "team:TEXT:1:'default':0", "visibility:TEXT:1:'team':0"],
+}
 const cols = (db, t) => db.prepare(`PRAGMA table_info(${t})`).all().map((c) => `${c.name}:${c.type}:${c.notnull}:${c.dflt_value}:${c.pk}`)
 
-test('新库：WAL + busy_timeout=5000 + foreign_keys + user_version=2', () => {
+test('新库：WAL + busy_timeout=5000 + foreign_keys + user_version=3', () => {
   const home = tmpHome()
   try {
     const db = newDb.getDb(home)
     assert.equal(db.prepare('PRAGMA journal_mode').get().journal_mode, 'wal')
     assert.equal(db.prepare('PRAGMA busy_timeout').get().timeout, 5000)
     assert.equal(db.prepare('PRAGMA foreign_keys').get().foreign_keys, 1)
-    assert.equal(db.prepare('PRAGMA user_version').get().user_version, 2)
+    assert.equal(db.prepare('PRAGMA user_version').get().user_version, 3)
   } finally { newDb.closeAllDb(); rmrf(home) }
 })
 
-test('旧 7 张表的列定义与旧实现逐列一致，新增 4 张表存在', () => {
+test('旧 7 张表的旧列定义逐列未被改动（v3 只在尾部追加归属列），新增 4 张表存在', () => {
   const a = tmpHome(), b = tmpHome()
   try {
     const dn = newDb.getDb(a), dl = legacyDb.getDb(b)
-    for (const t of OLD_TABLES) assert.deepEqual(cols(dn, t), cols(dl, t), `表 ${t} 列定义被改动`)
+    for (const t of OLD_TABLES) {
+      const legacy = cols(dl, t)
+      const now = cols(dn, t)
+      // 前缀必须是旧列原样：旧代码/旧实现回退打开新库时不会错位
+      assert.deepEqual(now.slice(0, legacy.length), legacy, `表 ${t} 的旧列被改动`)
+      // 尾部只能是已知追加列，且顺序与默认值固定
+      assert.deepEqual(now.slice(legacy.length), ADDED_COLUMNS[t] ?? [], `表 ${t} 追加了非预期列`)
+    }
     const names = new Set(dn.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map((r) => r.name))
     for (const t of [...OLD_TABLES, ...NEW_TABLES]) assert.ok(names.has(t), `缺表 ${t}`)
     for (const t of NEW_TABLES) assert.ok(!dl.prepare("SELECT 1 FROM sqlite_master WHERE name=?").get(t), '旧实现不应有新表（测试前提）')
@@ -48,13 +60,16 @@ test('旧版库（user_version=0）升级：数据与发号器原样保留，且
     legacyDb.closeAllDb()
 
     const db = newDb.getDb(home)
-    assert.equal(db.prepare('PRAGMA user_version').get().user_version, 2)
+    assert.equal(db.prepare('PRAGMA user_version').get().user_version, 3)
     assert.equal(db.prepare('SELECT COUNT(*) n FROM cards').get().n, 1)
     assert.equal(db.prepare('SELECT COUNT(*) n FROM quarantine').get().n, 1)
     assert.equal(db.prepare("SELECT seq FROM card_sequence WHERE name='card'").get().seq, seqBefore)
+    // v3 回填：老行 owner 从署名推断，team/visibility 取默认（升级前后可见性语义不变）
+    assert.deepEqual(db.prepare('SELECT owner, team, visibility FROM cards').all().map((r) => [r.owner, r.team, r.visibility]), [['x', 'default', 'team']])
+    assert.deepEqual(db.prepare('SELECT owner, team, visibility FROM quarantine').all().map((r) => [r.owner, r.team, r.visibility]), [['y', 'default', 'team']])
     newDb.closeAllDb()
     const db2 = newDb.getDb(home) // 再开一次：幂等
-    assert.equal(db2.prepare('PRAGMA user_version').get().user_version, 2)
+    assert.equal(db2.prepare('PRAGMA user_version').get().user_version, 3)
     assert.equal(db2.prepare('SELECT COUNT(*) n FROM cards').get().n, 1)
   } finally { newDb.closeAllDb(); legacyDb.closeAllDb(); rmrf(home) }
 })
@@ -81,7 +96,7 @@ test('nextCardId 单语句原子发号：连续发号严格递增且唯一', () 
   } finally { newDb.closeAllDb(); rmrf(home) }
 })
 
-test('v1 → v2 迁移（agent_tokens 去掉整列 UNIQUE，改为"仅未撤销令牌名唯一"的部分唯一索引）：数据与哈希原样保留、幂等、旧代码仍可打开', async () => {
+test('v1 → v3 迁移（v2 令牌名部分唯一 + v3 归属列）：数据与哈希原样保留、幂等、旧代码仍可打开', async () => {
   const home = tmpHome()
   try {
     // 构造一个 v1 库：用 v1 形态建表并写入令牌行
@@ -94,7 +109,7 @@ test('v1 → v2 迁移（agent_tokens 去掉整列 UNIQUE，改为"仅未撤销�
       PRAGMA user_version = 1;`)
     raw.close()
     const db = newDb.getDb(home)
-    assert.equal(db.prepare('PRAGMA user_version').get().user_version, 2)
+    assert.equal(db.prepare('PRAGMA user_version').get().user_version, 3)
     const rows = db.prepare('SELECT * FROM agent_tokens ORDER BY token_id').all()
     assert.deepEqual(rows.map((r) => [r.token_id, r.name, r.secret_hash, r.scopes, r.last_used_at, r.expires_at, r.revoked_at]), [
       ['t1', 'alpha', 'h1', '["read"]', null, null, null],
@@ -105,7 +120,7 @@ test('v1 → v2 迁移（agent_tokens 去掉整列 UNIQUE，改为"仅未撤销�
     assert.throws(() => db.prepare("INSERT INTO agent_tokens (token_id, name, secret_hash, scopes, created_at) VALUES ('t4','alpha','h4','[\"read\"]','2026-04-01T00:00:00.000Z')").run(), /UNIQUE/)
     newDb.closeAllDb()
     const again = newDb.getDb(home) // 幂等
-    assert.equal(again.prepare('PRAGMA user_version').get().user_version, 2)
+    assert.equal(again.prepare('PRAGMA user_version').get().user_version, 3)
     assert.equal(again.prepare('SELECT COUNT(*) n FROM agent_tokens').get().n, 3)
     newDb.closeAllDb()
     // 旧代码（fixtures/legacy，v1 形态）能打开 v2 库并读写令牌表之外的数据

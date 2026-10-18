@@ -61,9 +61,9 @@ test('stdio 与 HTTP 下 recall / stats / audit_list 输出逐字一致，且格
         // M3 修复 c：HTTP 对远程 Agent 隐藏服务器绝对路径（stdio 保持原样），其余逐字一致
         assert.equal(a, b.split(h.home).join('<data-dir>'), `${name} ${JSON.stringify(args)}`)
       }
-      // 与原版 mcp.js 的输出格式一致（见 memory-eternal-fork/lib/mcp.js callTool）
+      // 与原版 mcp.js 的输出格式一致（v3 起多了 tier 分组头，见 docs/decisions/2026-10-18-team-scope-own-first-recall.md）
       const recall = text(await stdio.callTool({ name: 'memory_recall', arguments: { query: '数据库选型' } }))
-      assert.match(recall, /^从记忆核心检索到 1 条相关卡片：\n\n### 1\. 数据库选型决策\n路径：03-Knowledge\/数据库选型决策\.md\n/)
+      assert.match(recall, /^从记忆核心检索到 1 条相关卡片（先自己的、再团队）：\n\n\[自己的记忆\] 1 条\n\n### 1\. 数据库选型决策\n路径：03-Knowledge\/数据库选型决策\.md\n/)
       assert.equal(text(await stdio.callTool({ name: 'memory_recall', arguments: { query: '完全不存在的词xyz' } })), '记忆库中没有与「完全不存在的词xyz」相关的内容。')
       assert.equal(text(await stdio.callTool({ name: 'memory_recall', arguments: { query: '  ' } })), '（未提供检索词）')
       const stats = JSON.parse(text(await stdio.callTool({ name: 'memory_stats', arguments: {} })))

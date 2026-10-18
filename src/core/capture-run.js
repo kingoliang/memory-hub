@@ -10,6 +10,7 @@
 //   - 蒸馏 LLM 由调用方注入（通用 OpenAI 兼容端点），未配置则降级。
 
 import { captureCard, captureUpdate, pickNeighbors, summarizeTurnDetailed, routeCandidates, maxTokenLadder, DEFAULT_CAPTURE_MAX_TOKENS, DISTILL_RETRY_CEILING, stripRuntimeNoise, hasUsableContent, deriveTitle, isUsableTitle } from './capture.js'
+import { gateText, ROUTINE_REASON } from './gate.js'
 import { createLlmFromEnv } from './llm-openai.js'
 import { DEFAULT_LLM_TIMEOUT_MS } from '../config.js'
 import { resolveDedupConfig } from './dedup-config.js'
@@ -26,12 +27,25 @@ import { getLogger } from '../logger.js'
  *   submittedBy 缺省时回落为 source || 'agent'（兼容旧调用方；hub 的 MCP 路径总是显式传令牌名）
  * @returns {Promise<{ok:boolean, action:'created'|'appended'|'skipped'|'failed', path?:string, reason?:string, degraded?:boolean, secretTypes?:string[]}>}
  */
-export async function runStandaloneCapture(vaultRoot, text, { source = '', submittedBy, llm, env = process.env, minChars = 120, log = getLogger() } = {}) {
+export async function runStandaloneCapture(vaultRoot, text, { source = '', submittedBy, llm, env = process.env, minChars = 120, log = getLogger(), gateMode = 'heuristic', owner = '', team = '', visibility = '' } = {}) {
   const author = String(submittedBy || source || 'agent')
+  const llmClient = llm === undefined ? createLlmFromEnv(env) : llm
+  // 归属三元组随卡落库（团队可见性语义，见 docs/decisions/2026-10-18-team-scope-own-first-recall.md）
+  const scope = { owner: String(owner || ''), team: String(team || ''), visibility: String(visibility || '') }
   // 入料噪声闸门（P0）：先剥运行时注入，再判断是否还有真实内容。
   const clean = stripRuntimeNoise(text)
   if (clean.length < minChars) return { ok: false, action: 'skipped', reason: 'text too short' }
   if (!hasUsableContent(clean)) return { ok: false, action: 'skipped', reason: 'text is runtime noise' }
+
+  // 经验闸门：只让「提炼过的、经验性质」的内容进蒸馏。明确是日常操作 → 直接丢，连模型都不调。
+  if (gateMode !== 'off') {
+    const gate = await gateText(clean, { mode: gateMode, llm: llmClient })
+    if (gate.verdict === 'routine') {
+      log.info('capture 跳过：闸门判定为日常操作', { actor: author, via: gate.via, score: gate.score, signals: gate.signals, inputChars: clean.length })
+      return { ok: true, action: 'skipped', reason: ROUTINE_REASON, gate: { verdict: gate.verdict, via: gate.via, score: gate.score, signals: gate.signals } }
+    }
+  }
+
   const title = deriveTitle(clean)
   if (!isUsableTitle(title)) return { ok: false, action: 'skipped', reason: 'cannot derive a usable title' }
 
@@ -49,7 +63,6 @@ export async function runStandaloneCapture(vaultRoot, text, { source = '', submi
 
   const dd = resolveDedupConfig(env)
   const dupOpts = { threshold: dd.threshold, env }
-  const llmClient = llm === undefined ? createLlmFromEnv(env) : llm
   const routes = llmClient ? await routeCandidates(llmClient, {}) : []
   const route = routes[0] ?? null
 
@@ -78,7 +91,7 @@ export async function runStandaloneCapture(vaultRoot, text, { source = '', submi
         result = applied.result // 新建卡 {save:true,…}，或 null（密钥 → 落原文卡）
       }
       if (result && result.save === true) {
-        const card = { kind: result.kind, title: result.title, tags: result.tags, body: result.body, source, status: 'pending', submittedBy: author, severity: 'info', reason: 'AI 自动沉淀（蒸馏卡）' }
+        const card = { kind: result.kind, title: result.title, tags: result.tags, body: result.body, source, status: 'pending', submittedBy: author, severity: 'info', reason: 'AI 自动沉淀（蒸馏卡）', ...scope }
         const out = await captureCard(vaultRoot, card, dupOpts)
         if (out.ok) return { ok: true, action: 'created', path: out.path ?? out.rel }
         if (out.duplicate) return handleDuplicate(vaultRoot, out.duplicate, `${result.title}\n${result.body}`, dd, undefined, card, log)
@@ -106,6 +119,7 @@ export async function runStandaloneCapture(vaultRoot, text, { source = '', submi
     submittedBy: author,
     severity: 'info',
     reason: 'AI 自动沉淀（原文卡）',
+    ...scope,
   }
   const out = await captureCard(vaultRoot, rawCard, dupOpts)
   if (out.ok) return { ok: true, action: 'created', path: out.path ?? out.rel, degraded: true }

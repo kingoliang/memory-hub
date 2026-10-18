@@ -13,6 +13,7 @@ import { writeLog } from './writelog.js'
 import { stripRuntimeNoise } from './capture.js'
 import { detectSecrets } from './tidy.js'
 import { runStandaloneCapture } from './capture-run.js'
+import { ROUTINE_REASON } from './gate.js'
 
 export const MAX_TEXT_CHARS = 64 * 1024
 /** 剥噪声后不足这个字数视为无内容（与 capture.hasUsableContent 的 60 字一致）。 */
@@ -167,7 +168,11 @@ export async function runIngest({ config, identity, llm, log, input }) {
   inFlight.add(lockKey)
   let out
   try {
-    out = await runStandaloneCapture(root, clean, { source: `ingest:${input.source}`, submittedBy: identity.name, llm, minChars: MIN_CLEAN_CHARS, log })
+    out = await runStandaloneCapture(root, clean, {
+      source: `ingest:${input.source}`, submittedBy: identity.name, llm, minChars: MIN_CLEAN_CHARS, log,
+      gateMode: cfg.gateMode ?? 'strict',
+      owner: identity.owner ?? '', team: identity.team ?? '', visibility: identity.visibility ?? '',
+    })
   } catch (e) {
     log.error('ingest 处理异常', { actor: identity.name, session: sessionId, error: String(e?.message || e).slice(0, 200) })
     return finish({ status: 'error', reason: 'internal_error' }, 502, 'ingest', 'error')
@@ -185,6 +190,14 @@ export async function runIngest({ config, identity, llm, log, input }) {
     return finish({ status: 'error', reason: 'write_failed' }, 502, 'ingest', 'error')
   }
   // skipped
+  // 经验闸门判定为日常操作：丢弃该 turn（客户端可推进水位），且**不消耗冷却/配额**
+  // —— 它根本没进蒸馏，算进冷却会让下一条经验文本被无谓挡住。
+  if (out.reason === ROUTINE_REASON) {
+    const body = { status: 'skipped', reason: 'routine', ...(out.gate ? { gate: out.gate } : {}) }
+    record(db, identity, sessionId, idemKey, 'skipped', body, now, false)
+    log.info('ingest 跳过：日常操作', { actor: identity.name, session: sessionId, via: out.gate?.via, signals: out.gate?.signals })
+    return finish(body, 200, 'skip', 'ok')
+  }
   let reason
   let counted = false
   if (out.reason === 'model judged not durable') { reason = 'not_durable'; counted = true }

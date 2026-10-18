@@ -7,6 +7,9 @@ import crypto from 'node:crypto'
 import { getDb } from '../core/db.js'
 
 export const SCOPES = ['read', 'write', 'tidy:apply']
+/** 卡片可见性白名单（与 core/scope.js 的 VISIBILITIES 同字面量；令牌的默认可见性用它）。 */
+export const VISIBILITY_VALUES = ['private', 'team', 'public']
+export const DEFAULT_VISIBILITY = 'team'
 const TOKEN_RE = /^mh_([A-Za-z0-9]{1,32})_([A-Za-z0-9_-]{20,128})$/
 const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._:@-]{0,63}$/
 /** last_used_at 节流：同一令牌两次落盘至少间隔这么久，避免每次读请求都变成一次写事务。 */
@@ -49,10 +52,34 @@ export function validateName(name) {
   return n
 }
 
-/** @returns {{tokenId:string, name:string, scopes:string[], expiresAt:string|null, token:string}} token 为明文，仅此一次 */
-export function createToken(root, { name, scopes, expiresAt = null }) {
+const PARTY_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/
+
+/**
+ * owner（人）/ team（团队命名空间）校验。**允许空串**：空 owner = 本机单机模式，
+ * 也兼容升级前没有归属的老令牌；空 team 在 tierOf 里按“与本团队相同”处理。
+ */
+export function validateParty(value, field) {
+  const v = String(value ?? '').trim()
+  if (v === '') return ''
+  if (!PARTY_RE.test(v)) throw new TokenError(`${field} 只能含字母数字与 . _ -，以字母或数字开头，最长 64 字符：${value}`)
+  return v
+}
+
+/** 默认可见性校验；缺省/空串 → team（与 DB 列默认值一致）。 */
+export function validateVisibility(value) {
+  const v = String(value ?? '').trim()
+  if (v === '') return DEFAULT_VISIBILITY
+  if (!VISIBILITY_VALUES.includes(v)) throw new TokenError(`visibility 只能是 ${VISIBILITY_VALUES.join(' / ')}：${value}`)
+  return v
+}
+
+/** @returns {{tokenId:string, name:string, scopes:string[], owner:string, team:string, defaultVisibility:string, expiresAt:string|null, token:string}} token 为明文，仅此一次 */
+export function createToken(root, { name, scopes, owner = '', team = '', defaultVisibility = '', expiresAt = null }) {
   const n = validateName(name)
   const sc = parseScopes(scopes)
+  const own = validateParty(owner, 'owner')
+  const tm = validateParty(team, 'team')
+  const vis = validateVisibility(defaultVisibility)
   let exp = null
   if (expiresAt) {
     const t = Date.parse(expiresAt)
@@ -63,13 +90,13 @@ export function createToken(root, { name, scopes, expiresAt = null }) {
   const tokenId = crypto.randomBytes(8).toString('hex')
   const secret = crypto.randomBytes(32).toString('base64url')
   try {
-    db.prepare('INSERT INTO agent_tokens (token_id, name, secret_hash, scopes, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)')
-      .run(tokenId, n, sha256hex(secret), JSON.stringify(sc), new Date().toISOString(), exp)
+    db.prepare('INSERT INTO agent_tokens (token_id, name, secret_hash, scopes, owner, team, default_visibility, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(tokenId, n, sha256hex(secret), JSON.stringify(sc), own, tm, vis, new Date().toISOString(), exp)
   } catch (e) {
     if (/UNIQUE/i.test(String(e?.message))) throw new TokenError(`令牌名已存在：${n}（被一枚未撤销的令牌使用；已撤销令牌的名字可以复用）`, 'conflict')
     throw e
   }
-  return { tokenId, name: n, scopes: sc, expiresAt: exp, token: `mh_${tokenId}_${secret}` }
+  return { tokenId, name: n, scopes: sc, owner: own, team: tm, defaultVisibility: vis, expiresAt: exp, token: `mh_${tokenId}_${secret}` }
 }
 
 /** 旧共享令牌最短长度（旧服务 server.mjs 同款要求：<32 字符拒绝启动）。 */
@@ -83,9 +110,12 @@ const HEX64_RE = /^[0-9a-f]{64}$/
  * 明文（token）只在本函数内哈希，不落库、不返回、不写日志；也可直接给 hash（64 位十六进制）。
  * @returns {{tokenId:string, name:string, scopes:string[], expiresAt:string|null}}
  */
-export function importLegacyToken(root, { name, token, hash, scopes, expiresAt = null }) {
+export function importLegacyToken(root, { name, token, hash, scopes, owner = '', team = '', defaultVisibility = '', expiresAt = null }) {
   const n = validateName(name)
   const sc = parseScopes(scopes)
+  const own = validateParty(owner, 'owner')
+  const tm = validateParty(team, 'team')
+  const vis = validateVisibility(defaultVisibility)
   if ((token === undefined) === (hash === undefined)) throw new TokenError('需要 token（明文，立即哈希）或 hash（sha256 十六进制）二选一')
   let h
   if (hash !== undefined) {
@@ -105,19 +135,22 @@ export function importLegacyToken(root, { name, token, hash, scopes, expiresAt =
   const db = getDb(root)
   const tokenId = LEGACY_ID_PREFIX + h.slice(0, 10)
   try {
-    db.prepare('INSERT INTO agent_tokens (token_id, name, secret_hash, scopes, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)')
-      .run(tokenId, n, h, JSON.stringify(sc), new Date().toISOString(), exp)
+    db.prepare('INSERT INTO agent_tokens (token_id, name, secret_hash, scopes, owner, team, default_visibility, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(tokenId, n, h, JSON.stringify(sc), own, tm, vis, new Date().toISOString(), exp)
   } catch (e) {
     if (/UNIQUE/i.test(String(e?.message))) throw new TokenError(`令牌名或该旧令牌已存在：${n}（名字被一枚未撤销的令牌使用，或这枚旧令牌已导入过）`, 'conflict')
     throw e
   }
-  return { tokenId, name: n, scopes: sc, expiresAt: exp }
+  return { tokenId, name: n, scopes: sc, owner: own, team: tm, defaultVisibility: vis, expiresAt: exp }
 }
 
 const toPublic = (r) => ({
   tokenId: r.token_id,
   name: r.name,
   scopes: JSON.parse(r.scopes),
+  owner: r.owner || '',
+  team: r.team || '',
+  defaultVisibility: r.default_visibility || DEFAULT_VISIBILITY,
   createdAt: r.created_at,
   lastUsedAt: r.last_used_at,
   expiresAt: r.expires_at,
@@ -126,7 +159,7 @@ const toPublic = (r) => ({
 
 /** 列表：不含任何密钥材料。 */
 export function listTokens(root) {
-  return getDb(root).prepare('SELECT token_id, name, scopes, created_at, last_used_at, expires_at, revoked_at FROM agent_tokens ORDER BY created_at, token_id').all().map(toPublic)
+  return getDb(root).prepare('SELECT token_id, name, scopes, owner, team, default_visibility, created_at, last_used_at, expires_at, revoked_at FROM agent_tokens ORDER BY created_at, token_id').all().map(toPublic)
 }
 
 /** 按名字或 tokenId 撤销（立即生效：校验每次都查库）。 */
@@ -142,7 +175,7 @@ export function revokeToken(root, nameOrId) {
 }
 
 /** 修改令牌名 / 过期时间（明文与哈希不变）。expiresAt: undefined = 不改，null = 清除过期，字符串 = 设为该时间（须为将来）。已撤销的令牌不可改。 */
-export function updateToken(root, tokenId, { name, expiresAt } = {}) {
+export function updateToken(root, tokenId, { name, expiresAt, owner, team, defaultVisibility } = {}) {
   const db = getDb(root)
   const row = db.prepare('SELECT token_id, name, revoked_at, expires_at FROM agent_tokens WHERE token_id = ?').get(String(tokenId ?? ''))
   if (!row) throw new TokenError(`令牌不存在：${tokenId}`, 'not_found')
@@ -153,6 +186,13 @@ export function updateToken(root, tokenId, { name, expiresAt } = {}) {
   if (name !== undefined) {
     const n = validateName(name)
     if (n !== row.name) { sets.push('name = ?'); args.push(n); changed.push('name') }
+  }
+  // 归属三列：传了才改（undefined = 不动）
+  for (const [key, column] of [['owner', 'owner'], ['team', 'team'], ['defaultVisibility', 'default_visibility']]) {
+    const given = { owner, team, defaultVisibility }[key]
+    if (given === undefined) continue
+    const value = key === 'defaultVisibility' ? validateVisibility(given) : validateParty(given, key)
+    sets.push(`${column} = ?`); args.push(value); changed.push(key)
   }
   if (expiresAt !== undefined) {
     let exp = null
@@ -176,7 +216,7 @@ export function updateToken(root, tokenId, { name, expiresAt } = {}) {
 
 /**
  * 校验明文令牌（不含 "Bearer " 前缀）。
- * @returns {{ok:true, token:{tokenId:string,name:string,scopes:string[]}} | {ok:false, reason:'malformed'|'unknown'|'mismatch'|'revoked'|'expired'}}
+ * @returns {{ok:true, token:{tokenId:string,name:string,scopes:string[],owner:string,team:string,visibility:string}} | {ok:false, reason:'malformed'|'unknown'|'mismatch'|'revoked'|'expired'}}
  * reason 仅供内部日志，绝不原样返回给调用方（避免枚举）。
  */
 export function verifyToken(root, bearer) {
@@ -204,5 +244,5 @@ export function verifyToken(root, bearer) {
   if (!last || Date.now() - last >= LAST_USED_THROTTLE_MS) {
     try { getDb(root).prepare('UPDATE agent_tokens SET last_used_at = ? WHERE token_id = ?').run(new Date().toISOString(), tokenId) } catch { /* 统计字段，失败不影响鉴权 */ }
   }
-  return { ok: true, token: { tokenId, name: row.name, scopes: JSON.parse(row.scopes) } }
+  return { ok: true, token: { tokenId, name: row.name, scopes: JSON.parse(row.scopes), owner: row.owner || '', team: row.team || '', visibility: row.default_visibility || DEFAULT_VISIBILITY } }
 }

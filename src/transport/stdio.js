@@ -5,7 +5,7 @@
 import { serveStdio } from '@modelcontextprotocol/server/stdio'
 import { buildMcpServer, llmFromConfig } from './mcp-server.js'
 import { getDb } from '../core/db.js'
-import { validateName } from '../auth/tokens.js'
+import { validateName, validateParty, validateVisibility } from '../auth/tokens.js'
 
 /**
  * @param {object} config loadConfig 的结果
@@ -15,11 +15,15 @@ export function runStdio(config, { log, env = process.env }) {
   getDb(config.dbRoot) // 提前打开/迁移，失败就在启动时报
   const agent = String(env.MEMORY_HUB_AGENT || '').trim()
   if (agent) validateName(agent) // 非法名字直接抛，避免写进 submitted_by
+  // 本机单机模式也要有归属：否则 scope.js 会把所有卡都当"自己的"，与 HTTP 团队语义不一致。
+  const owner = validateParty(env.MEMORY_HUB_OWNER, 'MEMORY_HUB_OWNER')
+  const team = validateParty(env.MEMORY_HUB_TEAM, 'MEMORY_HUB_TEAM')
+  const visibility = validateVisibility(env.MEMORY_HUB_VISIBILITY)
   const scopes = ['read', 'write', ...(config.exposeTidyApply ? ['tidy:apply'] : [])]
   const llm = llmFromConfig(config)
   let currentServer = null
   const handle = serveStdio((_ctx) => {
-    const identity = { type: 'agent', id: 'stdio:self-asserted', name: agent || 'stdio', ip: '' }
+    const identity = { type: 'agent', id: 'stdio:self-asserted', name: agent || 'stdio', ip: '', owner, team, visibility }
     const resolveName = agent ? undefined : () => {
       const cv = currentServer?.server?.getClientVersion?.()
       const n = String(cv?.name || '').replace(/[^A-Za-z0-9._:@-]/g, '-').slice(0, 50)
@@ -28,6 +32,6 @@ export function runStdio(config, { log, env = process.env }) {
     currentServer = buildMcpServer({ identity, scopes, config, log, llm, resolveName, transport: 'stdio' })
     return currentServer
   }, { legacy: 'serve', onerror: (e) => log.error('stdio 传输错误', { error: String(e?.message || e) }) })
-  log.info('MCP stdio 已启动', { agent: agent || '(clientInfo)', identity: 'self-asserted', exposeTidyApply: config.exposeTidyApply, llmConfigured: !!llm })
+  log.info('MCP stdio 已启动', { agent: agent || '(clientInfo)', identity: 'self-asserted', owner, team, visibility, exposeTidyApply: config.exposeTidyApply, llmConfigured: !!llm })
   return handle
 }
