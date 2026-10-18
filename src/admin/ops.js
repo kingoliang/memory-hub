@@ -17,7 +17,7 @@ import {
   tidyApply, tidyRollback, backupBeforeTidy, selfCheck, snapshotCounts, detectSecrets, TIDY_BATCHES,
 } from '../core/tidy.js'
 import { writeLog } from '../core/writelog.js'
-import { createToken, revokeToken, updateToken, parseScopes, TokenError } from '../auth/tokens.js'
+import { createToken, revokeToken, updateToken, parseScopes, validateParty, validateVisibility, TokenError } from '../auth/tokens.js'
 import { verifyPasswordAsync, getAdminPasswordHash, setAdminPassword, validatePassword, AdminAuthError } from './auth.js'
 import { HttpError } from './errors.js'
 import { tsMs } from './queries.js'
@@ -103,12 +103,18 @@ function applyEdit(root, actor, log, p, expectedUpdatedAt, fields, action) {
       body: fields.body !== undefined ? fields.body : row.body,
       tags: fields.tags !== undefined ? fields.tags : parseTagArray(row.tags),
       kind: fields.kind !== undefined ? fields.kind : row.kind,
+      owner: fields.owner !== undefined ? fields.owner : (row.owner || ''),
+      team: fields.team !== undefined ? fields.team : (row.team || ''),
+      visibility: fields.visibility !== undefined ? fields.visibility : (row.visibility || 'team'),
     }
     const changed = []
     if (next.title !== row.title) changed.push('title')
     if (next.body !== row.body) changed.push('body')
     if (JSON.stringify(next.tags) !== JSON.stringify(parseTagArray(row.tags))) changed.push('tags')
     if (next.kind !== row.kind) changed.push('kind')
+    if (next.owner !== (row.owner || '')) changed.push('owner')
+    if (next.team !== (row.team || '')) changed.push('team')
+    if (next.visibility !== (row.visibility || 'team')) changed.push('visibility')
     if (!changed.length) return { path: p, changed, updatedAt: cur }
     if (changed.includes('body') && MARKER_RE.test(next.body) && !MARKER_RE.test(row.body)) {
       throw bad('正文里含有界面的"已遮蔽"标记：这张卡含疑似明文密钥，界面显示的是遮蔽后的文本，直接保存会把标记写进正文。请先删掉标记再保存（或用回滚/CLI 处理）。')
@@ -123,8 +129,8 @@ function applyEdit(root, actor, log, p, expectedUpdatedAt, fields, action) {
       newPath = `${KIND_ROOTS[next.kind]}/${base}.md`
       for (let i = 2; pathTaken(db, newPath); i++) newPath = `${KIND_ROOTS[next.kind]}/${base}-${i}.md`
     }
-    db.prepare(`UPDATE ${found.table} SET path = ?, title = ?, body = ?, summary = ?, tags = ?, kind = ?, updated_at = ? WHERE path = ?`)
-      .run(newPath, next.title, next.body, next.body.trim().slice(0, 200), JSON.stringify(next.tags), next.kind, now, p)
+    db.prepare(`UPDATE ${found.table} SET path = ?, title = ?, body = ?, summary = ?, tags = ?, kind = ?, owner = ?, team = ?, visibility = ?, updated_at = ? WHERE path = ?`)
+      .run(newPath, next.title, next.body, next.body.trim().slice(0, 200), JSON.stringify(next.tags), next.kind, next.owner, next.team, next.visibility, now, p)
     if (newPath !== p) {
       db.prepare('UPDATE card_revisions SET card_path = ? WHERE card_path = ?').run(newPath, p)
       db.prepare('UPDATE feedback SET card_path = ? WHERE card_path = ?').run(newPath, p)
@@ -164,7 +170,17 @@ export function editCard(root, actor, input, { log }) {
     if (!KINDS.includes(input.kind)) throw bad(`kind 只能是：${KINDS.join(' / ')}`)
     f.kind = input.kind
   }
-  if (!Object.keys(f).length) throw bad('没有要修改的字段（title / body / tags / kind）')
+  // 归属三列：允许改（导入旧库后 owner 会是 agent 名，人要能改回自己的名字；也允许清空）
+  for (const key of ['owner', 'team']) {
+    if (input[key] === undefined) continue
+    if (typeof input[key] !== 'string') throw bad(`${key} 必须是字符串`)
+    try { f[key] = validateParty(input[key], key) } catch (e) { throw tokenErr(e) }
+  }
+  if (input.visibility !== undefined) {
+    if (typeof input.visibility !== 'string') throw bad('visibility 必须是字符串')
+    try { f.visibility = validateVisibility(input.visibility) } catch (e) { throw tokenErr(e) }
+  }
+  if (!Object.keys(f).length) throw bad('没有要修改的字段（title / body / tags / kind / owner / team / visibility）')
   return applyEdit(root, actor, log, p, expected, f, 'edit')
 }
 
