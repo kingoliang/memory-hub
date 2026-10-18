@@ -2,14 +2,21 @@
   "name": "memory-hub",
   "version": "0.1.0",
   "private": true,
-  "description": "多 Agent 共用的记忆 MCP 服务（memory-eternal 衍生）",
+  "description": "团队记忆 MCP 服务（memory-eternal / memory-hub 衍生）：多团队多人的分层检索 + 经验闸门",
   "license": "MIT",
   "type": "module",
   "engines": {
     "node": ">=22.16"
   },
   "scripts": {
-    "test": "node --test --test-concurrency=1 \"tests/**/*.test.mjs\""
+    "test": "node --test --test-concurrency=1 \"tests/**/*.test.mjs\"",
+    "coverage": "node scripts/quality/coverage.mjs",
+    "complexity": "node scripts/quality/complexity.mjs",
+    "deadcode": "node scripts/quality/deadcode.mjs",
+    "cycles": "node scripts/quality/cycles.mjs",
+    "mutate": "node scripts/quality/mutate.mjs",
+    "gate": "npm run coverage && npm run deadcode && npm run cycles",
+    "verify": "npm run gate && npm test"
   },
   "dependencies": {
     "@modelcontextprotocol/node": "2.1.1",

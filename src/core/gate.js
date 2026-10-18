@@ -82,7 +82,7 @@ export function heuristicGate(text) {
   return { verdict, score, signals }
 }
 
-const GATE_SYSTEM = [
+export const GATE_SYSTEM = [
   '你在做「记忆入库闸门」判定：判断这段对话增量里有没有值得长期留存的**经验**。',
   '算经验：决策与理由、方案取舍、踩坑与根因、可复用的流程/命令/配置、用户偏好与项目约定、具体参数或版本。',
   '不算经验：跑命令、看文件、列清单、状态汇报（"跑了一遍，全绿"）、打招呼、只有工具输出。',
