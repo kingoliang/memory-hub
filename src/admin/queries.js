@@ -10,6 +10,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { getDb, checkMainStoreInvariant, DB_FILENAME } from '../core/db.js'
 import { queryTerms, TITLE_COLLATOR, RECYCLE_RETENTION_DAYS } from '../core/vault.js'
+import { VISIBILITIES as SCOPE_VISIBILITIES } from '../core/scope.js'
 import { tidyPlan, tidyLint, detectSecrets, redactSecrets, tagKey } from '../core/tidy.js'
 import { OUTCOMES, ACTOR_TYPES } from '../core/writelog.js'
 
@@ -17,6 +18,8 @@ export const UNSIGNED = '__none__'
 export const UNSIGNED_LABEL = '(未署名)'
 export const LIST_STATUSES = ['approved', 'pending', 'rejected', 'deleted']
 export const SORTS = ['updated', 'created', 'title', 'path', 'score']
+/** 可见性白名单（单一来源：core/scope.js，避免与管理界面漂移）。 */
+export const VISIBILITIES = SCOPE_VISIBILITIES
 const DAY = 86400e3
 const EXCERPT_CHARS = 200
 
@@ -33,8 +36,7 @@ export function tsMs(s) {
 }
 const isoOrNull = (s) => (s ? new Date(tsMs(s)).toISOString() : null)
 
-function parseTags(raw) {
-  try {
+function parseTags(raw) {  try {
     const v = JSON.parse(raw || '[]')
     if (Array.isArray(v)) return v.map((t) => String(t).trim()).filter(Boolean)
   } catch { /* 非法 JSON：当作无标签，lint 会单独报告 */ }
@@ -74,8 +76,11 @@ export function listCards(root, f) {
     if (f.kind) { where.push('kind = ?'); args.push(f.kind) }
     if (f.agent === UNSIGNED) where.push("COALESCE(submitted_by,'') = ''")
     else if (f.agent) { where.push('submitted_by = ?'); args.push(f.agent) }
+    if (f.owner) { where.push('owner = ?'); args.push(f.owner) }
+    if (f.team) { where.push('team = ?'); args.push(f.team) }
+    if (f.visibility) { where.push('visibility = ?'); args.push(f.visibility) }
     if (f.source) { where.push('source = ?'); args.push(f.source) }
-    const cols = `path, kind, title, tags, status, source, submitted_by, created_at, updated_at, deleted_at, LENGTH(body) AS body_chars${needBody ? ', body' : ''}`
+    const cols = `path, kind, title, tags, status, source, submitted_by, owner, team, visibility, created_at, updated_at, deleted_at, LENGTH(body) AS body_chars${needBody ? ', body' : ''}`
     rows.push(...db.prepare(`SELECT ${cols} FROM ${st.table}${where.length ? ' WHERE ' + where.join(' AND ') : ''}`).all(...args))
   }
 
@@ -135,6 +140,9 @@ function hydrate(db, page, extra = () => ({})) {
       status: x.r.status,
       agent, agentFromSource,
       submittedBy: x.r.submitted_by || '',
+      owner: x.r.owner || '',
+      team: x.r.team || '',
+      visibility: x.r.visibility || '',
       source: x.r.source || '',
       createdAt: isoOrNull(x.r.created_at),
       updatedAt: isoOrNull(x.r.updated_at),
@@ -157,12 +165,17 @@ export function cardsPage(root, f) {
 // 待审队列 / 回收站
 // ---------------------------------------------------------------------------
 
-export function queuePage(root, { status, limit, offset }) {
+export function queuePage(root, { status, owner, team, visibility, limit, offset }) {
   const db = getDb(root)
   const counts = { pending: 0, rejected: 0 }
   for (const r of db.prepare("SELECT status, COUNT(*) n FROM quarantine WHERE status IN ('pending','rejected') GROUP BY status").all()) counts[r.status] = r.n
   const statuses = status === 'all' ? ['pending', 'rejected'] : [status]
-  const rows = db.prepare(`SELECT path, kind, title, tags, status, source, submitted_by, created_at, updated_at, deleted_at, reason, quarantine_reason, quarantined_at, LENGTH(body) AS body_chars FROM quarantine WHERE status IN (${statuses.map(() => '?').join(',')})`).all(...statuses)
+  const where = [`status IN (${statuses.map(() => '?').join(',')})`]
+  const args = [...statuses]
+  if (owner) { where.push('owner = ?'); args.push(owner) }
+  if (team) { where.push('team = ?'); args.push(team) }
+  if (visibility) { where.push('visibility = ?'); args.push(visibility) }
+  const rows = db.prepare(`SELECT path, kind, title, tags, status, source, submitted_by, owner, team, visibility, created_at, updated_at, deleted_at, reason, quarantine_reason, quarantined_at, LENGTH(body) AS body_chars FROM quarantine WHERE ${where.join(' AND ')}`).all(...args)
     .map((r) => ({ r, tags: parseTags(r.tags), created: tsMs(r.created_at), updated: tsMs(r.updated_at) }))
   rows.sort((a, b) => a.created - b.created || (a.r.path < b.r.path ? -1 : 1))
   const now = Date.now()
@@ -175,7 +188,7 @@ export function queuePage(root, { status, limit, offset }) {
 
 export function recyclePage(root, { limit, offset }) {
   const db = getDb(root)
-  const rows = db.prepare("SELECT path, kind, title, tags, status, source, submitted_by, created_at, updated_at, deleted_at, LENGTH(body) AS body_chars FROM quarantine WHERE status = 'deleted'").all()
+  const rows = db.prepare("SELECT path, kind, title, tags, status, source, submitted_by, owner, team, visibility, created_at, updated_at, deleted_at, LENGTH(body) AS body_chars FROM quarantine WHERE status = 'deleted'").all()
     .map((r) => ({ r, tags: parseTags(r.tags), created: tsMs(r.created_at), updated: tsMs(r.updated_at), deleted: tsMs(r.deleted_at) }))
   const now = Date.now()
   const expiry = (x) => (x.deleted || x.updated) + RECYCLE_RETENTION_DAYS * DAY
@@ -332,14 +345,24 @@ export async function lintReport(root) {
 // 令牌 / 审计日志
 // ---------------------------------------------------------------------------
 
+/** 令牌 scope 列是我们自己写进去的 JSON，但仍按“可能坏”处理：一列坏值不该让整页 500。 */
+function parseScopeList(raw) {
+  try {
+    const v = JSON.parse(raw || '[]')
+    if (Array.isArray(v)) return v.map((s) => String(s)).filter(Boolean)
+  } catch { /* 坏值 → 空 scope，管理界面照常渲染 */ }
+  return []
+}
+
 export function tokenList(root) {
   const db = getDb(root)
   const since = new Date(Date.now() - 30 * DAY).toISOString()
   const calls = Object.fromEntries(db.prepare("SELECT actor_name, COUNT(*) n FROM write_log WHERE actor_type = 'agent' AND ts >= ? GROUP BY actor_name").all(since).map((r) => [r.actor_name, r.n]))
-  const items = db.prepare('SELECT token_id, name, scopes, created_at, last_used_at, expires_at, revoked_at FROM agent_tokens ORDER BY created_at, token_id').all().map((t) => {
+  const items = db.prepare('SELECT token_id, name, scopes, owner, team, default_visibility, created_at, last_used_at, expires_at, revoked_at FROM agent_tokens ORDER BY created_at, token_id').all().map((t) => {
     const expired = !!t.expires_at && tsMs(t.expires_at) <= Date.now()
     return {
-      tokenId: t.token_id, name: t.name, scopes: JSON.parse(t.scopes), createdAt: t.created_at, lastUsedAt: t.last_used_at, expiresAt: t.expires_at, revokedAt: t.revoked_at,
+      tokenId: t.token_id, name: t.name, scopes: parseScopeList(t.scopes), owner: t.owner || '', team: t.team || '', defaultVisibility: t.default_visibility || 'team',
+      createdAt: t.created_at, lastUsedAt: t.last_used_at, expiresAt: t.expires_at, revokedAt: t.revoked_at,
       status: t.revoked_at ? 'revoked' : expired ? 'expired' : 'active', calls30d: calls[t.name] || 0,
     }
   })

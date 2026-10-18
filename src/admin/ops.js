@@ -30,6 +30,14 @@ const bad = (msg, extra) => new HttpError(400, 'bad_request', msg, undefined, ex
 const notFound = (msg) => new HttpError(404, 'not_found', msg)
 const conflict = (msg, extra) => new HttpError(409, 'conflict', msg, undefined, extra)
 const iso = (s) => (s ? new Date(tsMs(s)).toISOString() : null)
+/** 标签列是 JSON 数组；单个坏值不该让整个预览 500（与 queries.parseTags 同策略）。 */
+function parseTagList(raw) {
+  try {
+    const v = JSON.parse(raw || '[]')
+    if (Array.isArray(v)) return v.map((t) => String(t).trim()).filter(Boolean)
+  } catch { /* 坏值 → 当作无标签 */ }
+  return []
+}
 
 /** actor: { sidHash, ip }。write_log 里只留会话哈希前 12 位，足以区分会话又无法用来冒用。 */
 export const actorOf = (session, ip) => ({ id: `session:${String(session?.sidHash || '').slice(0, 12)}`, ip: ip || '' })
@@ -379,7 +387,7 @@ export function previewTagOp(root, query) {
   const spec = tagOpSpec(query.op, { from: query.op === 'merge' ? String(query.from || '').split(',') : query.from, tag: query.from, to: query.to })
   const rows = tagImpact(getDb(root), spec)
   const present = new Set()
-  for (const r of rows) for (const t of JSON.parse(r.before)) if (spec.from.includes(t)) present.add(t)
+  for (const r of rows) for (const t of parseTagList(r.before)) if (spec.from.includes(t)) present.add(t)
   return {
     op: spec.op, from: spec.from, to: spec.to,
     affectedCards: rows.length, fromPresent: present.size, merging: present.size,
@@ -515,7 +523,8 @@ export function listRollbacks(root) {
       removed: meta.removed?.length || 0, merged: meta.merged?.length || 0, tagsChanged: meta.tags?.length || 0, ms: st.mtimeMs,
     }
   }).sort((a, b) => b.ms - a.ms).slice(0, 50)
-  return { items: items.map(({ ms, ...r }) => r) }
+  // ms 只用于排序，输出里不带走（重命名成 _ms 是因为它是“故意不用”的解构字段）
+  return { items: items.map(({ ms: _ms, ...r }) => r) }
 }
 
 export async function rollbackAdmin(root, actor, input, { log }) {
@@ -544,8 +553,7 @@ export async function rollbackAdmin(root, actor, input, { log }) {
 // 令牌
 // ===========================================================================
 
-const tokenErr = (e) => {
-  if (!(e instanceof TokenError)) return e
+const tokenErr = (e) => {  if (!(e instanceof TokenError)) return e
   const status = { conflict: 409, not_found: 404 }[e.kind] || 400
   return new HttpError(status, status === 409 ? 'conflict' : status === 404 ? 'not_found' : 'bad_request', e.message)
 }
@@ -563,11 +571,11 @@ export function createTokenAdmin(root, actor, input, { log }) {
   let made
   try {
     parseScopes(input.scopes)
-    made = createToken(root, { name: input.name, scopes: input.scopes, expiresAt })
+    made = createToken(root, { name: input.name, scopes: input.scopes, owner: input.owner, team: input.team, defaultVisibility: input.visibility, expiresAt })
   } catch (e) { throw tokenErr(e) }
-  audit(root, actor, log, { tool: 'POST /tokens', action: 'token_create', args: { name: made.name, scopes: made.scopes, expiresAt } })
-  log.info('管理员创建令牌', { name: made.name, scopes: made.scopes, expiresAt, actor: actor.id })
-  return { ok: true, tokenId: made.tokenId, name: made.name, scopes: made.scopes, expiresAt: made.expiresAt, token: made.token, notice: '明文令牌仅显示一次：关闭此窗口后无法再次查看。请立即复制并妥善保存。' }
+  audit(root, actor, log, { tool: 'POST /tokens', action: 'token_create', args: { name: made.name, scopes: made.scopes, owner: made.owner, team: made.team, visibility: made.defaultVisibility, expiresAt } })
+  log.info('管理员创建令牌', { name: made.name, scopes: made.scopes, owner: made.owner, team: made.team, visibility: made.defaultVisibility, expiresAt, actor: actor.id })
+  return { ok: true, tokenId: made.tokenId, name: made.name, scopes: made.scopes, owner: made.owner, team: made.team, defaultVisibility: made.defaultVisibility, expiresAt: made.expiresAt, token: made.token, notice: '明文令牌仅显示一次：关闭此窗口后无法再次查看。请立即复制并妥善保存。' }
 }
 
 export function revokeTokenAdmin(root, actor, tokenId, { log }) {
@@ -585,11 +593,16 @@ export function revokeTokenAdmin(root, actor, tokenId, { log }) {
 
 export function updateTokenAdmin(root, actor, input, { log }) {
   if (typeof input?.tokenId !== 'string' || !input.tokenId) throw bad('缺少 tokenId')
-  if (input.name === undefined && input.expiresAt === undefined) throw bad('没有要修改的字段（name / expiresAt）')
+  if (input.name === undefined && input.expiresAt === undefined && input.owner === undefined && input.team === undefined && input.visibility === undefined) throw bad('没有要修改的字段（name / expiresAt / owner / team / visibility）')
   if (input.name !== undefined && typeof input.name !== 'string') throw bad('name 必须是字符串')
   if (input.expiresAt !== undefined && input.expiresAt !== null && typeof input.expiresAt !== 'string') throw bad('expiresAt 必须是时间字符串或 null')
+  for (const f of ['owner', 'team', 'visibility']) {
+    if (input[f] !== undefined && typeof input[f] !== 'string') throw bad(`${f} 必须是字符串`)
+  }
   let r
-  try { r = updateToken(root, input.tokenId, { name: input.name, expiresAt: input.expiresAt }) } catch (e) { throw tokenErr(e) }
+  try {
+    r = updateToken(root, input.tokenId, { name: input.name, expiresAt: input.expiresAt, owner: input.owner, team: input.team, defaultVisibility: input.visibility })
+  } catch (e) { throw tokenErr(e) }
   if (r.changed.length) {
     audit(root, actor, log, { tool: 'PATCH /tokens', action: 'token_update', args: { changed: r.changed, name: r.name } })
     log.info('管理员修改令牌', { name: r.name, changed: r.changed, actor: actor.id })

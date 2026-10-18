@@ -150,7 +150,7 @@ test('端到端：A 看得到自己的与同团队的，看不到同团队他人
     try {
       const body = text(await c.callTool({ name: 'memory_recall', arguments: { query: '部署流程' } }))
       assert.deepEqual(body.split('\n').filter((l) => /^### /.test(l)).map((l) => l.replace(/^### \d+\. /, '')), ['部署流程自己的', '部署流程同团队', '部署流程跨团队公开'])
-      assert.deepEqual(body.split('\n').filter((l) => /^\[/.test(l)), ['[自己的记忆] 1 条', '[团队 · alice] 1 条', '[公开 · bob] 1 条'])
+      assert.deepEqual(body.split('\n').filter((l) => /^\[/.test(l)), ['[自己的记忆] 1 条', '[本团队 · alice] 1 条', '[其它团队 · bob] 1 条'])
     } finally { await c.close() }
   })
 })

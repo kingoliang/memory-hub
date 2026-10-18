@@ -58,13 +58,16 @@ export default async function render(ctx) {
     let made = null
     await formDialog({
       title: '创建 Agent 令牌', submitText: '创建',
-      intro: '每个 Agent 一枚；写入的卡会以令牌名署名。名字只能含字母数字与 . _ : @ -，且不能与未撤销的令牌重名（已撤销的名字可复用）。',
+      intro: '每个 Agent 一枚；写入的卡会以令牌名署名。归属（owner/team）决定检索分层：先搜自己、再搜本团队、最后其它团队的公开卡。名字只能含字母数字与 . _ : @ -，且不能与未撤销的令牌重名（已撤销的名字可复用）。',
       fields: [
         { name: 'name', label: '令牌名', type: 'text', required: true, maxlength: 64, placeholder: '如 claude-code-kingo' },
+        { name: 'owner', label: '归属（人）', type: 'text', maxlength: 64, placeholder: '如 kingo' },
+        { name: 'team', label: '团队', type: 'text', maxlength: 64, placeholder: '如 remittance' },
+        { name: 'visibility', label: '新卡默认可见性', type: 'select', value: 'team', options: [['team', 'team（本团队可见，默认）'], ['private', 'private（只给自己）'], ['public', 'public（其它团队也能看）']] },
         { name: 'scopes', label: '范围', type: 'checkboxes', options: SCOPE_OPTIONS, value: ['read', 'write'], required: true },
         { name: 'days', label: '有效期', type: 'select', options: EXPIRY_OPTIONS, value: '90' },
       ],
-      onSubmit: async (v) => { made = await post('tokens', { name: v.name.trim(), scopes: v.scopes, expiresAt: iso(v.days) }) },
+      onSubmit: async (v) => { made = await post('tokens', { name: v.name.trim(), scopes: v.scopes, expiresAt: iso(v.days), owner: v.owner.trim(), team: v.team.trim(), visibility: v.visibility }) },
     })
     if (made) { await showTokenOnce(made); ctx.reload() }
   }))
@@ -78,18 +81,24 @@ export default async function render(ctx) {
     return b
   }
   const edit = (t) => {
-    const b = h('button', { type: 'button', class: 'btn btn-ghost btn-sm' }, '改名 / 过期')
+    const b = h('button', { type: 'button', class: 'btn btn-ghost btn-sm' }, '改名 / 归属 / 过期')
     b.addEventListener('click', guard(b, async () => {
       await formDialog({
         title: `修改令牌「${t.name}」`, submitText: '保存',
-        intro: '改名只影响以后的署名（已写入的卡保留旧名字）；令牌明文不变。',
+        intro: '改名只影响以后的署名（已写入的卡保留旧名字）；归属与可见性改动立即生效（影响以后的检索分层与写入）。令牌明文不变。',
         fields: [
           { name: 'name', label: '令牌名', type: 'text', value: t.name, maxlength: 64, required: true },
+          { name: 'owner', label: '归属（人）', type: 'text', value: t.owner || '', maxlength: 64, placeholder: '留空 = 无主' },
+          { name: 'team', label: '团队', type: 'text', value: t.team || '', maxlength: 64, placeholder: '留空 = 无团队' },
+          { name: 'visibility', label: '新卡默认可见性', type: 'select', value: t.defaultVisibility || 'team', options: [['team', 'team（本团队可见）'], ['private', 'private（只给自己）'], ['public', 'public（其它团队也能看）']] },
           { name: 'days', label: '过期时间', type: 'select', value: 'keep', options: [['keep', t.expiresAt ? `保持不变（${fmtDate(t.expiresAt)}）` : '保持不变（不过期）'], ...EXPIRY_OPTIONS.map(([v, l]) => [v, v === '0' ? '改为不过期' : `改为从现在起 ${l}`])] },
         ],
         onSubmit: async (v) => {
           const body = { tokenId: t.tokenId }
           if (v.name.trim() !== t.name) body.name = v.name.trim()
+          if (v.owner.trim() !== (t.owner || '')) body.owner = v.owner.trim()
+          if (v.team.trim() !== (t.team || '')) body.team = v.team.trim()
+          if (v.visibility !== (t.defaultVisibility || 'team')) body.visibility = v.visibility
           if (v.days !== 'keep') body.expiresAt = iso(v.days)
           if (Object.keys(body).length === 1) return
           await patch('tokens', body)

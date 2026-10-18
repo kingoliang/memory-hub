@@ -21,6 +21,16 @@ export function rememberSel(path) {
 
 const SORT_LABEL = { updated: '最近更新', created: '创建时间', title: '标题（拼音）', path: '路径', score: '匹配度' }
 
+/** 归属徽标：owner@team + 非默认可见性。owner/team 都空的历史卡不显示，免得噪声。 */
+function scopeMeta(it) {
+  if (!it.owner && !it.team) return null
+  const vis = it.visibility || 'team'
+  return h('span', { class: 'meta-scope', title: `归属 ${it.owner || '无主'} / 团队 ${it.team || '无团队'} / 可见性 ${vis}` }, [
+    icon('user', 'icon-sm'), `${it.owner || '无主'}@${it.team || '-'}`,
+    vis !== 'team' ? badge(vis === 'private' ? '仅自己' : '跨团队', 'accent') : null,
+  ])
+}
+
 /** 一行卡片（列表/待审/回收站共用）。extra：额外的元信息节点数组；cls：附加类名；excerptLines：摘要显示行数（默认 2）。
  *  整行可点：.card-link 的 ::after 铺满整行（见 styles.css），勾选框 / 标签 / 按钮在其上方，互不抢点击。 */
 export function cardRow(it, { extra = [], showScore = false, select = null, actions = null, cls = '', excerptLines = 2, no = null, pick = null } = {}) {
@@ -37,6 +47,7 @@ export function cardRow(it, { extra = [], showScore = false, select = null, acti
         it.status !== 'approved' ? statusBadge(it.status) : null,
         secretBadge(it.secretTypes),
         h('span', { class: 'meta-agent', title: it.agentFromSource ? '无署名，显示来源 source' : '署名' }, [icon('key', 'icon-sm'), it.agent, it.agentFromSource ? h('em', null, '（来源）') : null]),
+        scopeMeta(it),
         h('span', { class: 'meta-time' }, ['更新 ', timeEl(it.updatedAt)]),
         ...extra,
       ]),
@@ -50,6 +61,7 @@ export default async function render(ctx) {
   const p = ctx.params
   const st = {
     q: p.get('q') || '', status: p.get('status') || 'approved', kind: p.get('kind') || '', tag: p.get('tag') || '', agent: p.get('agent') || '',
+    owner: p.get('owner') || '', team: p.get('team') || '', visibility: p.get('visibility') || '',
     createdFrom: p.get('createdFrom') || '', createdTo: p.get('createdTo') || '', sort: p.get('sort') || '', order: p.get('order') || 'desc',
     offset: Number(p.get('offset')) || 0,
   }
@@ -70,8 +82,8 @@ export default async function render(ctx) {
   const inp = (name, attrs = {}) => h('input', { name, value: st[name], autocomplete: 'off', ...attrs })
   const sel = (name, options, cur) => h('select', { name }, options.map(([v, l]) => h('option', { value: v, selected: v === cur }, l)))
   const statusCount = Object.fromEntries((facets.statuses || []).map((x) => [x.status, x.count]))
-  const hasMore = !!(st.agent || st.tag || st.createdFrom || st.createdTo)
-  const moreCount = [st.agent, st.tag, st.createdFrom, st.createdTo].filter(Boolean).length
+  const hasMore = !!(st.agent || st.tag || st.owner || st.team || st.visibility || st.createdFrom || st.createdTo)
+  const moreCount = [st.agent, st.tag, st.owner, st.team, st.visibility, st.createdFrom, st.createdTo].filter(Boolean).length
   const form = h('form', { class: 'filters', on: { submit: (e) => {
     e.preventDefault()
     const f = new FormData(e.target)
@@ -91,6 +103,9 @@ export default async function render(ctx) {
       h('summary', null, [icon('sliders', 'icon-sm'), '更多筛选', moreCount ? badge(String(moreCount), 'accent') : null]),
       h('div', { class: 'filter-grid' }, [
         h('label', null, ['署名', sel('agent', [['', '全部署名'], ...facets.agents.map((a) => [a.value, `${a.name}（${a.count}）`])], st.agent)]),
+        h('label', null, ['归属（人）', inp('owner', { placeholder: '如 kingo' })]),
+        h('label', null, ['团队', inp('team', { placeholder: '如 remittance' })]),
+        h('label', null, ['可见性', sel('visibility', [['', '全部可见性'], ['private', 'private（只给自己）'], ['team', 'team（本团队）'], ['public', 'public（跳团队）']], st.visibility)]),
         h('label', null, ['标签（逗号分隔，需同时包含）', inp('tag', { placeholder: '如 alpha, shared', list: 'tag-options' })]),
         h('label', null, ['创建自', inp('createdFrom', { type: 'date' })]),
         h('label', null, ['创建至', inp('createdTo', { type: 'date' })]),
@@ -116,6 +131,9 @@ export default async function render(ctx) {
   if (st.kind) active.push(filterChip(kindLabel(st.kind), hrefWith({ kind: '' })))
   if (st.tag) active.push(filterChip(`标签 ${st.tag}`, hrefWith({ tag: '' })))
   if (st.agent) active.push(filterChip(`署名 ${facets.agents.find((a) => a.value === st.agent)?.name || st.agent}`, hrefWith({ agent: '' })))
+  if (st.owner) active.push(filterChip(`归属 ${st.owner}`, hrefWith({ owner: '' })))
+  if (st.team) active.push(filterChip(`团队 ${st.team}`, hrefWith({ team: '' })))
+  if (st.visibility) active.push(filterChip(`可见性 ${st.visibility}`, hrefWith({ visibility: '' })))
   if (st.createdFrom) active.push(filterChip(`创建自 ${st.createdFrom}`, hrefWith({ createdFrom: '' })))
   if (st.createdTo) active.push(filterChip(`创建至 ${st.createdTo}`, hrefWith({ createdTo: '' })))
 

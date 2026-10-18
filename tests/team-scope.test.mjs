@@ -9,7 +9,7 @@ import assert from 'node:assert/strict'
 import { tmpHome, rmrf, durableText } from './helpers.mjs'
 import { closeAllDb, getDb } from '../src/core/db.js'
 import { ensureVault, writeCard, search, listCards, countCards } from '../src/core/vault.js'
-import { VISIBILITIES, SCOPE_MODES, TIERS, visibleTiers, isVisibility, normalizeViewer, tierOf, rankHits } from '../src/core/scope.js'
+import { VISIBILITIES, SCOPE_MODES, TIERS, tierLabel, visibleTiers, isVisibility, normalizeViewer, tierOf, rankHits } from '../src/core/scope.js'
 import { findTool, callTool } from '../src/tools/registry.js'
 
 const KINGO = { owner: 'kingo', team: 'remittance' }
@@ -146,6 +146,32 @@ test('rankHits：不改入参数组，也不给 hit 加 tier（返回新对象�
   assert.deepEqual(Object.keys(input[0]), ['path', 'score', 'mtime', 'owner', 'team', 'visibility'])
 })
 
+
+test('多团队多人：自己 → 本团队其他成员 → 其它团队的公开卡；人数与团队数都不影响分层', () => {
+  const hits = [
+    { path: 'k-self', score: 1, mtime: 1, owner: 'kingo', team: 'remittance', visibility: 'private' },
+    { path: 'r-alice', score: 9, mtime: 2, owner: 'alice', team: 'remittance', visibility: 'team' },
+    { path: 'r-bob', score: 5, mtime: 3, owner: 'bob', team: 'remittance', visibility: 'team' },
+    { path: 'p-carol', score: 40, mtime: 4, owner: 'carol', team: 'payments', visibility: 'public' },
+    { path: 'p-dave', score: 30, mtime: 5, owner: 'dave', team: 'payments', visibility: 'public' },
+    { path: 'p-erin-private', score: 99, mtime: 6, owner: 'erin', team: 'payments', visibility: 'private' },
+  ]
+  // 本团队命中再怎么弱也排在其它团队的强命中之前（弱命中的 r-bob 分数 5 < p-carol 的 40）
+  assert.deepEqual(
+    rankHits(hits, KINGO, 'auto').map((h) => `${h.tier}:${h.path}`),
+    ['self:k-self', 'team:r-alice', 'team:r-bob', 'public:p-carol', 'public:p-dave'],
+  )
+  assert.deepEqual(rankHits(hits, KINGO, 'mine').map((h) => h.path), ['k-self'])
+  assert.deepEqual(rankHits(hits, KINGO, 'team').map((h) => h.path), ['k-self', 'r-alice', 'r-bob'])
+  // 其它团队他人的 private 永不出现
+  assert.equal(rankHits(hits, KINGO, 'auto').some((h) => h.path === 'p-erin-private'), false)
+  // 标签读得出是谁：多团队语义要体现在人看得见的地方
+  assert.deepEqual(
+    rankHits(hits, KINGO, 'auto').map((h) => tierLabel(h.tier, h)),
+    ['自己的记忆', '本团队 · alice', '本团队 · bob', '其它团队 · carol', '其它团队 · dave'],
+  )
+})
+
 // ─────────────────────────────────────────────────────────── 落库 + 检索集成
 
 async function withVault(fn) {
@@ -240,7 +266,7 @@ test('memory_recall 按 tier 分组标注，自己在前；memory_whoami 暴露�
     assert.equal(out.isError, undefined)
     assert.deepEqual(
       text.split('\n').filter((l) => /^\[/.test(l)),
-      ['[自己的记忆] 1 条', '[团队 · alice] 1 条'],
+      ['[自己的记忆] 1 条', '[本团队 · alice] 1 条'],
     )
     assert.deepEqual(
       text.split('\n').filter((l) => /^### /.test(l)).map((l) => l.replace(/^### \d+\. /, '')),

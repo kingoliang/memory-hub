@@ -152,6 +152,9 @@ export function createAdminHandler({ config, log, llm = null }) {
         kind: strParam(u, 'kind', 50),
         tags: strParam(u, 'tag', 500).split(',').map((t) => t.trim()).filter(Boolean),
         agent: strParam(u, 'agent', 100),
+        owner: strParam(u, 'owner', 64),
+        team: strParam(u, 'team', 64),
+        visibility: enumParam(u, 'visibility', Q.VISIBILITIES, ''),
         source: strParam(u, 'source', 100),
         q: strParam(u, 'q', 500),
         createdFrom: dateParam(u, 'createdFrom', false), createdTo: dateParam(u, 'createdTo', true),
@@ -196,7 +199,7 @@ export function createAdminHandler({ config, log, llm = null }) {
     // 蜘蛛搜索（POST 但不改库）：会话 + Origin + CSRF 照常校验；只读模式下仍可用（见 READONLY_OK）
     'POST /graph/search': async (ctx) => spider.search(root, await ctx.json(), Ops.actorOf(ctx.session, ctx.ip), ctx.session),
     'POST /graph/summarize': async (ctx) => spider.summarize(root, await ctx.json(), Ops.actorOf(ctx.session, ctx.ip), ctx.session),
-    'GET /queue': (ctx) => Q.queuePage(root, { ...paging(ctx.url, 50), status: enumParam(ctx.url, 'status', ['pending', 'rejected', 'all'], 'all') }),
+    'GET /queue': (ctx) => Q.queuePage(root, { ...paging(ctx.url, 50), status: enumParam(ctx.url, 'status', ['pending', 'rejected', 'all'], 'all'), owner: strParam(ctx.url, 'owner', 64), team: strParam(ctx.url, 'team', 64), visibility: enumParam(ctx.url, 'visibility', Q.VISIBILITIES, '') }),
     'GET /recycle': (ctx) => Q.recyclePage(root, paging(ctx.url, 50)),
     'GET /tags': (ctx) => Q.tagStats(root, { q: strParam(ctx.url, 'q', 100), limit: intParam(ctx.url, 'limit', { def: 500, min: 1, max: 5000, clamp: true }) }),
     'GET /tidy/preview': async (ctx) => {

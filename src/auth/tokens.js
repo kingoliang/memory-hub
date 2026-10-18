@@ -21,6 +21,14 @@ export class TokenError extends Error {
 }
 
 const sha256hex = (s) => crypto.createHash('sha256').update(s).digest('hex')
+/** scope 列是我们自己写的 JSON；单个坏值不该让鉴权链或列表页崩掉（与 admin/queries.js 同策略）。 */
+const parseScopeList = (raw) => {
+  try {
+    const v = JSON.parse(raw || '[]')
+    if (Array.isArray(v)) return v.map((s) => String(s)).filter(Boolean)
+  } catch { /* 坏值 → 空 scope：表现为少权限，而不是 500 */ }
+  return []
+}
 const DUMMY_HASH = Buffer.from(sha256hex('memory-hub-dummy'), 'hex')
 
 /** 'read,write' / ['read','write'] → 去重排序后的合法 scope 数组；非法或为空抛 TokenError。 */
@@ -147,7 +155,7 @@ export function importLegacyToken(root, { name, token, hash, scopes, owner = '',
 const toPublic = (r) => ({
   tokenId: r.token_id,
   name: r.name,
-  scopes: JSON.parse(r.scopes),
+  scopes: parseScopeList(r.scopes),
   owner: r.owner || '',
   team: r.team || '',
   defaultVisibility: r.default_visibility || DEFAULT_VISIBILITY,
@@ -192,7 +200,8 @@ export function updateToken(root, tokenId, { name, expiresAt, owner, team, defau
     const given = { owner, team, defaultVisibility }[key]
     if (given === undefined) continue
     const value = key === 'defaultVisibility' ? validateVisibility(given) : validateParty(given, key)
-    sets.push(`${column} = ?`); args.push(value); changed.push(key)
+    // changed 用 API 侧的名字（visibility），与管理界面/CLI 入参一致，避免调用方多一次映射
+    sets.push(`${column} = ?`); args.push(value); changed.push(key === 'defaultVisibility' ? 'visibility' : key)
   }
   if (expiresAt !== undefined) {
     let exp = null
@@ -244,5 +253,5 @@ export function verifyToken(root, bearer) {
   if (!last || Date.now() - last >= LAST_USED_THROTTLE_MS) {
     try { getDb(root).prepare('UPDATE agent_tokens SET last_used_at = ? WHERE token_id = ?').run(new Date().toISOString(), tokenId) } catch { /* 统计字段，失败不影响鉴权 */ }
   }
-  return { ok: true, token: { tokenId, name: row.name, scopes: JSON.parse(row.scopes), owner: row.owner || '', team: row.team || '', visibility: row.default_visibility || DEFAULT_VISIBILITY } }
+  return { ok: true, token: { tokenId, name: row.name, scopes: parseScopeList(row.scopes), owner: row.owner || '', team: row.team || '', visibility: row.default_visibility || DEFAULT_VISIBILITY } }
 }

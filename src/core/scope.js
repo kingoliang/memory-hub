@@ -2,16 +2,22 @@
 //
 // 设计见 docs/decisions/2026-10-18-team-scope-own-first-recall.md。
 //
-// 三件必须记住的语义：
+// 四件必须记住的语义：
 //   1. tier 是**权限**概念，不是排序技巧 —— 决定一条卡对这个 viewer 是否可见、以及可见时属于哪一层。
 //   2. 排序键是 tier 优先，其次才是 score。所以一条弱命中的自己的卡会排在强命中的团队卡之前。
-//   3. viewer 为 null = 单机模式（无 owner/team 概念）：一切可见、全部同层，退化成旧行为。
+//   3. **团队可以有多个，每个团队可以有多人**：team 只是命名空间，owner 是里面的人。
+//      分层固定是「自己 → 本团队的其他成员 → 其它团队的公开卡」；本团队有 3 个人还是 30 个人，
+//      都只是 team 这一层里的条数，不会挤掉其它团队永远排在身后这件事。
+//   4. viewer 为 null = 单机模式（无 owner/team 概念）：一切可见、全部同层，退化成旧行为。
 
-/** 可见性白名单。private 只给 owner 本人（**同团队他人也看不到**）。 */
+/** 可见性白名单。private 只给 owner 本人（**同团队他人也看不到**）；team 只在同一 team 内可见；public 才跳团队。 */
 export const VISIBILITIES = ['private', 'team', 'public']
 /** 检索时的纳入范围。auto = 自己 → 同团队 → 跨团队公开。 */
 export const SCOPE_MODES = ['auto', 'mine', 'team']
-/** 层级，数组顺序即排序优先级（self 最先）。 */
+/** 层级，数组顺序即排序优先级（self 最先）。
+ *
+ * self = 本人（同一 owner 的所有 agent）；team = **本团队**的其他成员；public = 其它团队的公开卡。
+ */
 export const TIERS = ['self', 'team', 'public']
 /** 卡片没写 visibility 时的默认值（与 DB 列默认值一致）。 */
 export const DEFAULT_VISIBILITY = 'team'
@@ -75,10 +81,15 @@ export function rankHits(hits, viewer, scope = 'auto') {
   return out
 }
 
-/** tier → 渲染用中文标签（管理界面 / MCP 输出共用，保证两边说法一致）。 */
+/** tier → 渲染用中文标签（管理界面 / MCP 输出共用，保证两边说法一致）。
+ *
+ * 措辞刻意对齐“多团队、每团队多人”的模型：说的是「谁」，不是「公开/私有」这种数据属性 ——
+ * 读的人一眼能看出这条命中该不该信。
+ */
 export function tierLabel(tier, hit = {}) {
+  const who = str(hit.owner) || '未知'
   if (tier === 'self') return '自己的记忆'
-  if (tier === 'team') return `团队 · ${str(hit.owner) || '未知'}`
-  if (tier === 'public') return `公开 · ${str(hit.owner) || '未知'}`
+  if (tier === 'team') return `本团队 · ${who}`
+  if (tier === 'public') return `其它团队 · ${who}`
   return '其它'
 }
