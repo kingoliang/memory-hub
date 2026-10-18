@@ -2,14 +2,14 @@
   "$schema": "https://unpkg.com/knip@6/schema.json",
   "entry": [
     "bin/memory-hub.mjs",
-    "web/js/app.js",
+    "web/app.js",
     "tests/**/*.test.mjs",
     "tests/e2e/*.mjs",
     "tests/fixtures/legacy/*.js",
-    "scripts/quality/*.mjs",
-    "scripts/**/*.sh"
+    "scripts/quality/*.mjs"
   ],
   "project": ["src/**/*.js", "web/js/**/*.js", "bin/*.mjs"],
   "ignore": ["tests/fixtures/legacy/**"],
-  "ignoreExportsUsedInFile": true
+  "ignoreExportsUsedInFile": true,
+  "ignoreDependencies": ["@stryker-mutator/core", "@stryker-mutator/tap-runner", "madge", "knip"]
 }
