@@ -2,7 +2,7 @@
 // “到达前不高亮 / 到达后才高亮 / 跳过动画一次性全部显示”的状态函数、转向平滑。
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { createSpider, legCount, activeSlots, assignFeet, steerPath, buildTourPlan, nodeStateAt, skipState, routeLength, orderPath, smoothControl, bezier2, arcControl } from '../../web/js/graph-spider.js'
+import { createSpider, legCount, activeSlots, assignFeet, steerPath, buildTourPlan, nodeStateAt, skipState, routeLength, orderPath, smoothControl, bezier2, arcControl, LEG_RHO_PX } from '../../web/js/graph-spider.js'
 
 // 合成数据：3 个簇 × 40 个节点；命中 12 个，相关度在簇间交错（A,B,C,A,B,C…），“按相关度直连”要来回折返
 const CENTERS = { A: [0, 0], B: [700, 120], C: [320, 620] }
@@ -272,6 +272,51 @@ test('引擎：游走与巡游中，每帧每条落地腿的脚尖都在某个�
   assert.ok(airFrames > 10, '走动时应有抬脚换脚')
   const counts = frames.map((f) => f.snap.legs)
   assert.ok(Math.max(...counts) <= 18 && Math.max(...counts) > Math.min(...counts), '腿数应随位置变化')
+})
+
+test('引擎：每帧画出来的每条触手（含换脚 / 伸出 / 收起过渡中的）末端都精确在真实节点中心，从不悬空', () => {
+  // 游走 30 秒 + 一次完整巡游；缩放变化也覆盖（脚尖在世界坐标，应随缩放跟随）
+  const runs = [{ zoom: 0.788, mode: 'wander' }, { zoom: 1.6, mode: 'wander' }, { zoom: 0.788, mode: 'tour' }]
+  let tips = 0; let off = 0; let mid = 0
+  for (const run of runs) {
+    const m = makeSim({ zoom: run.zoom })
+    const step = () => {
+      m.sp.update(m.dt, m.view)
+      for (const t of m.sp.snapshot().tips) {
+        tips++
+        const n = m.ns[t.node]
+        if (!n || Math.hypot(t.x - n.x, t.y - n.y) > 1e-9) off++
+        if (t.alpha < 0.99) mid++
+      }
+    }
+    if (run.mode === 'tour') {
+      for (let i = 0; i < 5; i++) step()
+      m.sp.startTour(REAL_HITS.map((h) => ({ id: `hit/${h[0]}-${h[1]}`, rank: h[1], title: `t${h[1]}` })))
+      for (let i = 0; i < 60 * 20 && m.sp.snapshot().mode !== 'think'; i++) step()
+    } else for (let i = 0; i < 60 * 30; i++) step()
+  }
+  assert.ok(tips > 20000, `触手帧数 ${tips}`)
+  assert.equal(off, 0, `${off}/${tips} 个画出来的脚尖不在节点上`)
+  assert.ok(mid > 500, `应覆盖到过渡中的触手（实际 ${mid}）`)
+})
+
+test('引擎：簇间快速跳转时不拖出横跨屏幕的长触手——可见的普通触手屏幕长度 ≤ 1.5×伸展半径', () => {
+  const m = makeSim()
+  const limit = LEG_RHO_PX * 1.5
+  let worst = 0; let n = 0
+  const step = () => {
+    m.sp.update(m.dt, m.view)
+    const s = m.sp.snapshot()
+    for (const t of s.tips) {
+      if (t.hero || t.alpha <= 0.15) continue
+      n++; worst = Math.max(worst, Math.hypot(t.x - s.x, t.y - s.y) * m.zoom)
+    }
+  }
+  for (let i = 0; i < 600; i++) step()
+  m.sp.startTour(REAL_HITS.map((h) => ({ id: `hit/${h[0]}-${h[1]}`, rank: h[1], title: `t${h[1]}` })))
+  for (let i = 0; i < 60 * 20 && m.sp.snapshot().mode !== 'think'; i++) step()
+  assert.ok(n > 5000, `样本 ${n}`)
+  assert.ok(worst <= limit + 1e-6, `最长可见触手 ${worst.toFixed(0)}px > ${limit}px`)
 })
 
 function legsAt(nodeCount, spread, { zoom = 1, steps = 240 } = {}) {

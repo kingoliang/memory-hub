@@ -424,7 +424,7 @@ export function createSpider(env) {
     enabled: true, inited: false, x: 0, y: 0, rot: rand() * TAU, T: 0,
     mode: 'wander', seg: null, dwell: 1, lastCluster: '', preferCluster: '',
     trail: [], trailT: 0, trailColor: '#2ee6c8',
-    legs: Array.from({ length: LEG_SLOTS }, (_, i) => ({ fx: 0, fy: 0, node: -1, pin: -1, a: 0, air: false, fl: null, t: 0, life: 0.6 + rand() * 1.0, seed: rand() * TAU, starvedUntil: 0, i })),
+    legs: Array.from({ length: LEG_SLOTS }, (_, i) => ({ fx: 0, fy: 0, node: -1, last: -1, pin: -1, a: 0, air: false, fl: null, t: 0, life: 0.6 + rand() * 1.0, seed: rand() * TAU, starvedUntil: 0, i })),
     legInit: false, legWant: undefined, legCur: 0, legStepT: 0, slots: activeSlots(0),
     cursor: 0, ripples: [],
     collected: new Map(), // id → { rank, t0 }
@@ -548,7 +548,11 @@ export function createSpider(env) {
 
   const legAngle = (i) => (i / LEG_SLOTS) * TAU + S.rot * 0.35
   const legRho = () => LEG_RHO_PX / S.view.zoom
-  function releaseLeg(l) { l.node = -1; l.fl = null }
+  // 触手末端永远钉在真实节点上：换脚 = 旧节点上的触手淡出 + 新节点上的淡入；伸出 = 原地淡入；收起 = 锚在旧节点上淡出。
+  // 过渡只动透明度与触手中段弯曲，不让脚尖经过节点之间的空白处。l.last = 收起中的锚点节点。
+  function releaseLeg(l) { if (l.node >= 0) l.last = l.node; l.node = -1; l.fl = null }
+  /** 换脚过渡：from = 正在淡出的旧锚点节点（-1 表示从无到有）。 */
+  const stepFrom = (l) => (l.node >= 0 ? l.node : l.a > 0 ? l.last : -1)
   /** 首次 / 重建后：按节点密度一次性站好（每条腿一个互不相同的节点）。 */
   function initLegs() {
     const nn = nodes(); const rho = legRho()
@@ -558,7 +562,7 @@ export function createSpider(env) {
     S.slots = activeSlots(S.legCur)
     const idxs = S.legs.map((_, i) => i).filter((i) => S.slots[i])
     const feet = assignFeet({ x: S.x, y: S.y }, near.map((i) => nn[i]), idxs.map(legAngle), { reach: rho * 0.62, rho })
-    for (const l of S.legs) { l.node = -1; l.a = 0; l.fl = null; l.air = false; l.fx = S.x; l.fy = S.y }
+    for (const l of S.legs) { l.node = -1; l.last = -1; l.a = 0; l.fl = null; l.air = false; l.fx = S.x; l.fy = S.y }
     idxs.forEach((li, k) => { const ni = feet[k] >= 0 ? near[feet[k]] : -1; const l = S.legs[li]; if (ni >= 0) { l.node = ni; l.fx = nn[ni].x; l.fy = nn[ni].y; l.a = 1; l.t = S.T - rand() * 0.6 } })
     S.legInit = true
   }
@@ -582,8 +586,9 @@ export function createSpider(env) {
       if (l.node !== l.pin) {
         for (const o of S.legs) if (o !== l && o.node === l.pin) releaseLeg(o)
         if (l.node >= 0) taken.delete(l.node)
+        const from = stepFrom(l)
         l.node = l.pin; taken.add(l.pin); l.t = S.T
-        if (reduced) { l.fl = null } else l.fl = { t0: S.T, dur: 0.08, x0: l.a > 0 ? l.fx : S.x, y0: l.a > 0 ? l.fy : S.y }
+        l.fl = reduced ? null : { t0: S.T, dur: 0.08, from }
       }
       l.a = 1
     }
@@ -597,52 +602,79 @@ export function createSpider(env) {
       if (want) l.a = reduced ? 1 : Math.min(1, l.a + dt / 0.2)
       else {
         if (l.node >= 0) { taken.delete(l.node); releaseLeg(l) }
-        l.a = reduced ? 0 : Math.max(0, l.a - dt / 0.2)
-        if (l.a === 0) { l.fx = S.x; l.fy = S.y }
+        l.a = reduced ? 0 : Math.max(0, l.a - dt / 0.12)
+        if (l.a === 0) { l.last = -1; l.fx = S.x; l.fy = S.y }
       }
       if (want && l.node < 0 && l.pin < 0) {
         const ang = legAngle(i)
         const j = pickStep(nn, S.x + Math.cos(ang) * R0, S.y + Math.sin(ang) * R0, taken, body, rho)
-        if (j >= 0) { l.node = j; taken.add(j); l.t = S.T; l.fl = reduced ? null : { t0: S.T, dur: 0.18, x0: l.a > 0 ? l.fx : S.x, y0: l.a > 0 ? l.fy : S.y }; if (reduced) { l.fx = nn[j].x; l.fy = nn[j].y } } else l.starvedUntil = S.T + 0.3
+        if (j >= 0) { const from = stepFrom(l); l.node = j; taken.add(j); l.t = S.T; l.fl = reduced ? null : { t0: S.T, dur: 0.18, from } } else l.starvedUntil = S.T + 0.3
       }
     }
-    // 4. 步态：轮流检查几条落地腿，太远 / 太久就抬脚换到更合适的节点（同时在空中的腿不超过 cap）
+    // 4. 步态：拉太长的腿每帧都处理（簇间快速跳转时不能等轮到，否则会拖出横跨屏幕的长线）；
+    //    太久没动的腿轮流检查几条，抬脚换到更合适的节点（同时在空中的腿不超过 cap）
     let budget = reduced ? LEG_SLOTS : 3
     let nFly = flying()
-    for (let k = 0; k < LEG_SLOTS && budget > 0; k++) {
+    for (let k = 0; k < LEG_SLOTS; k++) {
       const l = S.legs[(S.cursor + k) % LEG_SLOTS]
-      if (l.fl || l.node < 0 || l.a < 1 || l.pin >= 0) continue
+      if (l.node < 0 || l.a < 1 || l.pin >= 0) continue
       const tn = nn[l.node]
       if (!tn) { releaseLeg(l); continue }
-      budget--
       const fd = Math.hypot(tn.x - S.x, tn.y - S.y)
       const stretch = fd > rho * 1.05
+      if (l.fl && !stretch) continue
+      if (!stretch && budget <= 0) continue
+      if (!stretch) budget--
       const aged = S.T - l.t > l.life
       if (!stretch && !aged) continue
       if (!reduced && nFly >= cap && !stretch) continue
       const ang = legAngle(l.i); const R = R0 * (0.85 + 0.15 * Math.sin(S.T * 1.4 + l.seed))
+      const old = l.node
       taken.delete(l.node)
       const j = pickStep(nn, S.x + Math.cos(ang) * R, S.y + Math.sin(ang) * R, taken, body, rho)
       if (j < 0 && stretch) { releaseLeg(l); l.starvedUntil = S.T + 0.3; continue }
       l.t = S.T; l.life = 0.6 + rand() * 1.0
       if (j < 0 || j === l.node) { taken.add(l.node); continue }
       l.node = j; taken.add(j)
-      if (!reduced) { l.fl = { t0: S.T, dur: 0.11, x0: l.fx, y0: l.fy }; nFly++ } else { l.fx = nn[j].x; l.fy = nn[j].y }
+      if (!reduced) { l.fl = { t0: S.T, dur: 0.11, from: old }; nFly++ }
     }
     S.cursor = (S.cursor + 3) % LEG_SLOTS
-    // 5. 脚的位置：落地腿 = 节点中心（世界坐标，随缩放 / 布局跟随）；空中腿 = 起点→节点的插值 + 抬脚弧
+    // 5. 脚的位置 = 锚点节点中心（世界坐标，随缩放 / 布局跟随）；换脚过渡结束即清除 fl。
     for (const l of S.legs) {
-      const tn = l.node >= 0 ? nn[l.node] : null
-      if (tn && l.fl) {
-        const p = clamp((S.T - l.fl.t0) / l.fl.dur, 0, 1)
-        const e = easeInOut(p)
-        const dx = tn.x - l.fl.x0; const dy = tn.y - l.fl.y0; const d = Math.hypot(dx, dy) || 1
-        const lift = Math.min(16 / z, d * 0.25) * Math.sin(p * Math.PI)
-        l.fx = l.fl.x0 + dx * e - (dy / d) * lift; l.fy = l.fl.y0 + dy * e + (dx / d) * lift
-        if (p >= 1) { l.fl = null; l.fx = tn.x; l.fy = tn.y }
-      } else if (tn) { l.fx = tn.x; l.fy = tn.y; if (l.fl) l.fl = null }
+      if (l.fl && S.T - l.fl.t0 >= l.fl.dur) l.fl = null
+      const tn = l.node >= 0 ? nn[l.node] : l.last >= 0 ? nn[l.last] : null
+      if (tn) { l.fx = tn.x; l.fy = tn.y } else if (l.node >= 0) releaseLeg(l)
+      if (l.node < 0 && l.last >= 0 && !nn[l.last]) l.last = -1
       l.air = !!l.fl || l.a < 1
     }
+  }
+  /**
+   * 当前要画的触手（渲染与 snapshot 共用，测试量的就是实际画出来的东西）。
+   * 每条：node = 末端所在节点下标（末端 = 该节点中心，从不悬空），alpha = 0..1，hero = 检查腿，lift = 0..1 抬脚弯曲强度。
+   */
+  function legStrokes() {
+    const nn = nodes(); const out = []
+    // 超出伸展范围的触手（身体刚跳走、旧脚还没来得及换）按长度淡出，绝不画成横跨屏幕的长线；脚尖仍在节点上
+    const rho = legRho()
+    const reachFade = (ni) => { const n = nn[ni]; const d = Math.hypot(n.x - S.x, n.y - S.y); return clamp((1.5 * rho - d) / (0.4 * rho), 0, 1) }
+    const push = (s) => { s.alpha *= reachFade(s.node); out.push(s) }
+    for (const l of S.legs) {
+      if (l.a < 0.01) continue
+      if (l.node >= 0 && nn[l.node]) {
+        let inA = l.a; let lift = 0
+        if (l.fl) {
+          const p = clamp((S.T - l.fl.t0) / l.fl.dur, 0, 1); const e = easeInOut(p)
+          lift = Math.sin(p * Math.PI)
+          if (l.fl.from >= 0 && l.fl.from !== l.node && nn[l.fl.from]) push({ leg: l, node: l.fl.from, alpha: l.a * (1 - e), hero: false, lift })
+          inA *= e
+        }
+        if (l.pin >= 0) out.push({ leg: l, node: l.node, alpha: inA, hero: true, lift }) // 检查腿：始终完整可见
+        else push({ leg: l, node: l.node, alpha: inA, hero: false, lift })
+      } else if (l.last >= 0 && nn[l.last]) {
+        push({ leg: l, node: l.last, alpha: l.a, hero: false, lift: 0 })
+      }
+    }
+    return out.filter((s) => s.alpha > 0.02)
   }
 
   // ---- 每帧更新 ----
@@ -759,32 +791,35 @@ export function createSpider(env) {
     g.globalAlpha = alpha * (think ? 0.65 : 0.4)
     g.drawImage(glow(think ? '#ff2fa0' : '#2ee6c8'), bx - hg, by - hg, hg * 2, hg * 2)
     // 触手：所有腿合并成一条 path，一次 stroke（点状虚线，沿腿向外流动）
-    const legPath = new Path2D(); const heroPath = new Path2D(); let hasHero = false
-    const footDots = new Path2D()
-    for (const l of S.legs) {
-      if (l.a < 0.01 || (l.node < 0 && !l.fl && l.a >= 1)) continue
-      // 脚尖 = 落点节点的屏幕位置（世界坐标 → 屏幕，随缩放跟随）；仅伸出 / 收起过渡中（a<1）按比例缩短
-      let ex = bx + (l.fx * z + view.panX - bx) * l.a; let ey = by + (l.fy * z + view.panY - by) * l.a
+    // 透明度分 4 档合批：每档一条 path、一次 stroke（过渡中的触手只是档位不同，不额外增加绘制次数）
+    const nn = nodes()
+    const tiers = [0.25, 0.5, 0.75, 1].map((a) => ({ a, legs: new Path2D(), dots: new Path2D(), used: false }))
+    const heroPath = new Path2D(); let hasHero = false
+    for (const s of legStrokes()) {
+      const n = nn[s.node]
+      // 脚尖 = 锚点节点的屏幕位置（世界坐标 → 屏幕，随缩放跟随），任何状态下都不缩短、不插值
+      const ex = n.x * z + view.panX; const ey = n.y * z + view.panY
       const dx0 = ex - bx; const dy0 = ey - by; const l0 = Math.hypot(dx0, dy0)
-      if (l0 < 3) continue
+      if (l0 < BODY_R) continue // 节点在身体下面：脚尖被身体盖住，不画触手
       const sx0 = bx + (dx0 / l0) * BODY_R * 0.92; const sy0 = by + (dy0 / l0) * BODY_R * 0.92
       const dx = ex - sx0; const dy = ey - sy0
-      // 触手弯曲：垂直方向的缓慢摆动（只摆中间，不动脚尖）；抬脚时弯得更明显
-      const bend = (reduced ? 0.1 : 0.16 * Math.sin(S.T * 2.6 + l.seed)) + 0.08 + (l.fl ? 0.18 : 0)
+      // 触手弯曲：垂直方向的缓慢摆动（只摆中间，不动脚尖）；换脚时中段甩一下
+      const bend = (reduced ? 0.1 : 0.16 * Math.sin(S.T * 2.6 + s.leg.seed)) + 0.08 + 0.22 * s.lift
       const cx = (sx0 + ex) / 2 - dy * bend; const cy = (sy0 + ey) / 2 + dx * bend
-      const target = l.pin >= 0 ? heroPath : legPath
-      if (l.pin >= 0) hasHero = true
-      target.moveTo(sx0, sy0); target.quadraticCurveTo(cx, cy, ex, ey)
-      if (!l.fl) { footDots.moveTo(ex + 1.9, ey); footDots.arc(ex, ey, 1.9, 0, TAU) }
+      if (s.hero) { hasHero = true; heroPath.moveTo(sx0, sy0); heroPath.quadraticCurveTo(cx, cy, ex, ey); continue }
+      const t = tiers[clamp(Math.ceil(s.alpha * 4) - 1, 0, 3)]
+      t.used = true
+      t.legs.moveTo(sx0, sy0); t.legs.quadraticCurveTo(cx, cy, ex, ey)
+      t.dots.moveTo(ex + 1.9, ey); t.dots.arc(ex, ey, 1.9, 0, TAU)
     }
-    g.globalAlpha = alpha * 0.9
     g.strokeStyle = '#ffffff'; g.lineWidth = 1.6
     g.setLineDash([0.1, 4.6]); g.lineDashOffset = reduced ? 0 : -(S.T * (think ? 76 : 28))
-    g.stroke(legPath)
+    for (const t of tiers) if (t.used) { g.globalAlpha = alpha * 0.9 * t.a; g.stroke(t.legs) }
     if (hasHero) { g.globalAlpha = alpha; g.lineWidth = 2.4; g.setLineDash([0.1, 3.6]); g.strokeStyle = '#ffe3f6'; g.stroke(heroPath) }
     g.setLineDash([]); g.lineDashOffset = 0
     g.globalCompositeOperation = 'source-over'
-    g.globalAlpha = alpha; g.fillStyle = '#ffffff'; g.fill(footDots)
+    g.fillStyle = '#ffffff'
+    for (const t of tiers) if (t.used) { g.globalAlpha = alpha * t.a; g.fill(t.dots) }
     // 身体：环缓慢旋转
     g.globalAlpha = alpha
     g.translate(bx, by); g.rotate(S.rot)
@@ -846,7 +881,7 @@ export function createSpider(env) {
   Object.defineProperty(api, 'reduced', { get: () => reduced })
   api.setPreferCluster = (key) => { S.preferCluster = key || '' }
   /** 清掉对旧布局的引用（图谱重建后调用）：落脚点重新选取。 */
-  api.reset = () => { for (const l of S.legs) { l.node = -1; l.pin = -1; l.a = 0; l.fl = null } S.legInit = false; S.seg = null; S.inited = false; S.trail = []; if (S.tour || S.inspect) { S.tour = null; S.inspect = null; S.mode = 'wander' } }
+  api.reset = () => { for (const l of S.legs) { l.node = -1; l.last = -1; l.pin = -1; l.a = 0; l.fl = null } S.legInit = false; S.seg = null; S.inited = false; S.trail = []; if (S.tour || S.inspect) { S.tour = null; S.inspect = null; S.mode = 'wander' } }
   /** 相机跟随用：蜘蛛身体、当前目标、接下来 2 个目标（世界坐标）。 */
   api.cameraFocus = () => ({ body: { x: S.x, y: S.y }, cur: S.tour?.cur ? { x: S.tour.cur.x, y: S.tour.cur.y } : null, ahead: (S.tour?.queue || []).slice(0, 2).map((q) => ({ x: q.x, y: q.y })), touring: !!S.tour })
   api.hasResults = () => S.collected.size > 0 || !!S.tour
@@ -872,6 +907,6 @@ export function createSpider(env) {
   api.think = (ms = 0) => { if (!S.enabled || reduced) return; S.tour = null; S.inspect = null; S.seg = null; S.mode = 'think'; S.thinking = true; S.thinkUntil = ms > 0 ? S.T + ms / 1000 : 0 }
   api.release = () => { if (S.mode === 'think') { S.thinking = false; S.thinkUntil = 0; beginWander(); S.dwell = 0.5 } }
   api.clearResults = () => { S.collected.clear(); S.tour = null; S.inspect = null; for (const l of S.legs) l.pin = -1; if (S.mode === 'tour' || S.mode === 'inspect' || S.mode === 'scan') { S.seg = null; beginWander() } }
-  api.snapshot = () => ({ x: S.x, y: S.y, mode: S.mode, T: S.T, planted: S.legs.filter((l) => l.node >= 0 && !l.air).length, legs: S.legs.filter((l) => l.a > 0.01).length, legWant: S.legWant, heading: S.heading ? { ...S.heading } : null, feet: S.legs.filter((l) => l.a > 0.01).map((l) => ({ x: l.fx, y: l.fy, air: l.air, node: l.node, pin: l.pin >= 0, a: l.a })), collected: [...S.collected.keys()], inspect: S.inspect?.id || null, plan: S.plan ? { total: S.plan.totalMs, stops: S.plan.stops.length, decoys: S.plan.decoyCount } : null, dim: S.dim, thinking: S.thinking, trail: S.trail.length, enabled: S.enabled })
+  api.snapshot = () => ({ x: S.x, y: S.y, mode: S.mode, T: S.T, planted: S.legs.filter((l) => l.node >= 0 && !l.air).length, legs: S.legs.filter((l) => l.a > 0.01).length, legWant: S.legWant, heading: S.heading ? { ...S.heading } : null, feet: S.legs.filter((l) => l.a > 0.01).map((l) => ({ x: l.fx, y: l.fy, air: l.air, node: l.node, pin: l.pin >= 0, a: l.a })), tips: legStrokes().map((s) => { const n = nodes()[s.node]; return { x: n.x, y: n.y, node: s.node, alpha: s.alpha, hero: s.hero } }), collected: [...S.collected.keys()], inspect: S.inspect?.id || null, plan: S.plan ? { total: S.plan.totalMs, stops: S.plan.stops.length, decoys: S.plan.decoyCount } : null, dim: S.dim, thinking: S.thinking, trail: S.trail.length, enabled: S.enabled })
   return api
 }

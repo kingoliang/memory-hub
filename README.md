@@ -6,6 +6,10 @@
 
 > 状态：M1（MCP）～M4（图谱 / 部署 / 切换）已落地并在自建服务器上完成真实切换，管理界面已过真实浏览器验收。仓库处于 0.1.0。
 
+![知识图谱里的蜘蛛：空闲时在簇间爬行，触手末端始终踩在真实节点上；输入「缓存」回车后逐个踩点收集命中卡片，最后给出 AI 汇总](docs/media/graph-spider.gif)
+
+<sub>管理界面「图谱」页：蜘蛛空闲时在簇间爬行，每条触手的末端都踩在真实节点上；回车发起蜘蛛搜索后，逐个踩点收集命中卡片并飞入结果面板，最后由 AI 汇总。录屏使用合成数据与本地 LLM 测试桩，可用 `node scripts/demo/record-spider-gif.mjs docs/media/graph-spider.gif` 复现。</sub>
+
 ## 与上游的关系
 
 memory-hub 是 [EternalNight996/memory-eternal](https://github.com/EternalNight996/memory-eternal)（MIT，基线 v0.10.8）的衍生作品。`src/core/` 下的存储、检索、去重、沉淀、整理（tidy）模块源自该项目及其本地 fork（上游基础之外增加了 tidy / lint / dedup-merge），在此之上删除了 DSH（DeepSeek Harness）宿主耦合，并重做了并发、鉴权与多 Agent 署名。版权声明见 [`LICENSE`](LICENSE) 与 [`NOTICE.md`](NOTICE.md)。
@@ -28,6 +32,7 @@ memory-hub 是 [EternalNight996/memory-eternal](https://github.com/EternalNight9
 - **审核闸门**：新卡默认进待审队列，批准前检索不到；支持按 Agent / kind 免审白名单，规则存在库内、改后立即生效、无需重启。
 - **检索**：中文整词 + 字符片段打分（不依赖 FTS 分词），标注摘要、路径与标签；沿用上游召回语义。
 - **管理界面**（`web/`，纯静态、零构建、零第三方依赖）：总览 / 卡片 / 待审 / 整理 / 图谱 / 回收站 / 标签 / 健康 / 活跃度 / 令牌 / 审计 / 设置，Swiss 风格，明暗双主题，自托管字体。
+- **知识图谱 + 蜘蛛搜索**：暗色簇云图谱（`[[链接]]` / 共享标签 / 正文相似三类边）；蜘蛛常驻画布在簇间爬行，回车后沿最短巡游路线踩点收集命中卡片，再由 AI 汇总要点并标注出处（蒸馏 LLM 未配置时只做召回，不汇总）。详见 [`docs/m4-graph.md`](docs/m4-graph.md)。
 - **写操作有护栏**：乐观锁防并发丢更新、修订历史与回滚、批量操作需确认、改前自动 `VACUUM INTO` 备份并自检、`MEMORY_HUB_ADMIN_READONLY` 只读模式。
 - **审计**：所有写入（Agent 与管理员）落 `write_log`，含署名、工具、来源 IP 与参数摘要；不含口令、令牌与正文。
 - **令牌即身份**：库里只存哈希，明文仅在创建时显示一次；可设过期、可吊销；旧共享令牌支持 `token import-hash` 零改动接管。
@@ -195,6 +200,8 @@ npm test        # node:test，tests/**/*.test.mjs（串行，含并发、鉴权�
 ```
 
 另有针对性验证脚本（不进 `npm test`）：`scripts/validate/`（MCP 客户端兼容、召回对账、负载、管理台截图）与 `tests/e2e/`。两个客户端适配器各自带独立测试，见其 README。
+
+演示素材：`scripts/demo/seed-demo.mjs <数据目录>` 生成一份确定性的合成知识库（10 个主题、约 360 张卡，不含任何真实数据）；`scripts/demo/record-spider-gif.mjs <输出.gif>` 在临时目录里用这份数据和本地 LLM 测试桩起服务，录制图谱蜘蛛动画，录制期间逐帧校验触手末端都在节点上，有一条不在就以非零码退出（需要本机 Chrome 与 ffmpeg）。
 
 ## 目录结构
 
