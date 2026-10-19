@@ -10,6 +10,7 @@
 //   - LLM 未配置 / 超时 / 失败 → 结构化错误（503/504/502），响应与日志里不含密钥 / 端点 URL。
 
 import { getDb } from '../core/db.js'
+import { canSeeCard, isAdmin } from './rbac.js'
 import { search, truncateAtBoundary } from '../core/vault.js'
 import { redactSecrets } from '../core/tidy.js'
 import { maxTokenLadder } from '../core/capture.js'
@@ -167,7 +168,10 @@ export function createGraphSearch({ config, log, llm }) {
     const g = gate(searchLimiter, session)
     const t0 = Date.now()
     try {
-      const raw = await search(root, q, { limit, minScore: 2 })
+      // 非管理员：与 MCP 召回同一套可见性（viewer = 本人 + 本团队，scope=auto）
+      const user = actor?.user
+      const restricted = user && !isAdmin(user)
+      const raw = await search(root, q, { limit, minScore: 2, ...(restricted ? { viewer: { owner: user.username, team: user.team }, scope: 'auto' } : {}) })
       // 只留主库里 approved 且未删除的卡（与图谱节点集一致）
       const db = getDb(root)
       const ok = new Set()
@@ -192,7 +196,10 @@ export function createGraphSearch({ config, log, llm }) {
     const t0 = Date.now()
     try {
       const db = getDb(root)
-      const rows = db.prepare(`SELECT path, title, kind, tags, body FROM cards WHERE status = 'approved' AND deleted_at IS NULL AND path IN (${paths.map(() => '?').join(',')})`).all(...paths)
+      // 汇总只喂查看者看得见的卡：路径是客户端传来的，不能信
+      const user = actor?.user
+      const rows = db.prepare(`SELECT path, title, kind, tags, body, owner, team, visibility, status FROM cards WHERE status = 'approved' AND deleted_at IS NULL AND path IN (${paths.map(() => '?').join(',')})`).all(...paths)
+        .filter((r) => !user || canSeeCard(user, r))
       const byPath = new Map(rows.map((r) => [r.path, r]))
       const cards = paths.filter((p) => byPath.has(p)).map((p) => byPath.get(p))
       if (cards.length === 0) throw new HttpError(404, 'not_found', '没有可汇总的卡片（可能已删除、未通过审核或不存在）')

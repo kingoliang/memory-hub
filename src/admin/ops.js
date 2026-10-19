@@ -22,6 +22,7 @@ import { verifyPasswordAsync, getAdminPasswordHash, setAdminPassword, validatePa
 import { HttpError } from './errors.js'
 import { tsMs } from './queries.js'
 import * as Users from './users.js'
+import { canSeeCard, canEditCard, canModerateCard, canManageToken, tokenScopeFor, isAdmin } from './rbac.js'
 
 const KINDS = Object.keys(KIND_ROOTS)
 export const LIMITS = Object.freeze({ title: 200, body: 200_000, tagLen: 50, tagCount: 30, reason: 500, path: 500 })
@@ -89,6 +90,24 @@ function uniquePaths(paths, max) {
 }
 
 // ===========================================================================
+// 数据级权限（docs/decisions/2026-10-19-admin-multi-user-rbac.md）
+// ===========================================================================
+
+/** actor.user 缺省（单测直调 / 内部调用）= 超级管理员，行为与多用户之前一致。 */
+const userOf = (actor) => actor?.user || null
+
+/**
+ * 写卡前的权限检查：看不见 → 404（不泄露存在性）；看得见但不能改 → 403。
+ * 在事务内、拿到行之后调用，避免检查与写入之间被改归属。
+ */
+function assertCanEdit(actor, row) {
+  const u = userOf(actor)
+  if (!u) return
+  if (!canSeeCard(u, row)) throw notFound('卡片不存在')
+  if (!canEditCard(u, row)) throw new HttpError(403, 'forbidden', '只能修改自己的卡片（团队管理员可修改本团队的卡片）')
+}
+
+// ===========================================================================
 // 卡片：编辑 / 回滚
 // ===========================================================================
 
@@ -103,6 +122,12 @@ function applyEdit(root, actor, log, p, expectedUpdatedAt, fields, action) {
     const found = findCardRow(db, p)
     if (!found) throw notFound('卡片不存在')
     const row = found.row
+    assertCanEdit(actor, row)
+    // 非管理员不能把卡改到别人名下 / 别的团队（否则可借此把自己的卡「送」进别的团队，或冒名）
+    const u = userOf(actor)
+    if (u && !isAdmin(u) && ((fields.owner !== undefined && fields.owner !== u.username) || (fields.team !== undefined && fields.team !== u.team))) {
+      throw new HttpError(403, 'forbidden', '只有超级管理员能修改卡片的归属人与团队')
+    }
     const cur = iso(row.updated_at)
     if (tsMs(row.updated_at) !== tsMs(expectedUpdatedAt)) {
       throw conflict('卡片在你打开之后被修改过（可能是 Agent 追加了内容或另一个管理会话保存了），请刷新后重新编辑', { currentUpdatedAt: cur })
@@ -198,6 +223,9 @@ export function rollbackCard(root, actor, input, { log }) {
   const expected = reqTimestamp(input?.expectedUpdatedAt, 'expectedUpdatedAt')
   const id = Number(input?.revisionId)
   if (!Number.isInteger(id) || id < 1) throw bad('revisionId 必须是正整数')
+  const target = findCardRow(getDb(root), p)
+  if (!target) throw notFound('卡片不存在')
+  assertCanEdit(actor, target.row)
   const rev = getDb(root).prepare('SELECT * FROM card_revisions WHERE id = ? AND card_path = ?').get(id, p)
   if (!rev) throw notFound('该卡片没有这个修订版本')
   return applyEdit(root, actor, log, p, expected, {
@@ -215,6 +243,7 @@ export function softDelete(root, actor, p, { log }) {
   inTransaction(db, () => {
     const found = findCardRow(db, p)
     if (!found) throw notFound('卡片不存在')
+    assertCanEdit(actor, found.row)
     if (found.row.status === 'deleted') throw conflict('这张卡已经在回收站里')
     softDeleteCardSync(db, p, { changedBy: 'admin', reason: '管理员软删进回收站' })
   })
@@ -288,8 +317,11 @@ function runBatch(root, actor, log, { tool, action, paths, confirm, dryRun, maxB
   const db = getDb(root)
   const todo = []
   const skipped = []
+  const u = userOf(actor)
   for (const p of list) {
-    const found = findCardRow(db, p)
+    let found = findCardRow(db, p)
+    // 数据级：查看者看不见的卡视为不存在；审批类操作还要求有审批权（团队管理员限本团队）
+    if (found && u && (!canSeeCard(u, found.row) || (action === 'approve' || action === 'reject' ? !canModerateCard(u, found.row) : !canEditCard(u, found.row)))) found = null
     const why = classify(found)
     if (why) skipped.push({ path: p, reason: why.code, message: why.message }); else todo.push({ path: p, title: found.row.title })
   }
@@ -593,22 +625,33 @@ export function createTokenAdmin(root, actor, input, { log }) {
     if (t <= Date.now()) throw bad('expiresAt 必须是将来的时间')
     expiresAt = new Date(t).toISOString()
   }
+  const u = userOf(actor)
+  // 非管理员：归属强制为本人与本团队（忽略请求里的 owner/team），且不能自封 tidy:apply
+  const scope = u ? tokenScopeFor(u, { owner: input.owner, team: input.team }) : { owner: input.owner, team: input.team }
+  if (u && !isAdmin(u) && input.scopes.includes('tidy:apply')) throw new HttpError(403, 'forbidden', '只有超级管理员能授予 tidy:apply')
   let made
   try {
     parseScopes(input.scopes)
-    made = createToken(root, { name: input.name, scopes: input.scopes, owner: input.owner, team: input.team, defaultVisibility: input.visibility, expiresAt })
+    made = createToken(root, { name: input.name, scopes: input.scopes, owner: scope.owner, team: scope.team, defaultVisibility: input.visibility, expiresAt })
   } catch (e) { throw tokenErr(e) }
   audit(root, actor, log, { tool: 'POST /tokens', action: 'token_create', args: { name: made.name, scopes: made.scopes, owner: made.owner, team: made.team, visibility: made.defaultVisibility, expiresAt } })
   log.info('管理员创建令牌', { name: made.name, scopes: made.scopes, owner: made.owner, team: made.team, visibility: made.defaultVisibility, expiresAt, actor: actor.id })
   return { ok: true, tokenId: made.tokenId, name: made.name, scopes: made.scopes, owner: made.owner, team: made.team, defaultVisibility: made.defaultVisibility, expiresAt: made.expiresAt, token: made.token, notice: '明文令牌仅显示一次：关闭此窗口后无法再次查看。请立即复制并妥善保存。' }
 }
 
+/** 取令牌行并做归属检查：不存在或不属于查看者 → 一律 404（不泄露别人的令牌是否存在）。 */
+function ownedTokenRow(root, actor, tokenId) {
+  const row = getDb(root).prepare('SELECT token_id, owner FROM agent_tokens WHERE token_id = ?').get(tokenId)
+  const u = userOf(actor)
+  if (!row || (u && !canManageToken(u, row))) throw new TokenError(`令牌不存在：${tokenId}`, 'not_found')
+  return row
+}
+
 export function revokeTokenAdmin(root, actor, tokenId, { log }) {
   if (typeof tokenId !== 'string' || !tokenId) throw bad('缺少 tokenId')
   let r
   try {
-    const row = getDb(root).prepare('SELECT token_id FROM agent_tokens WHERE token_id = ?').get(tokenId)
-    if (!row) throw new TokenError(`令牌不存在：${tokenId}`, 'not_found')
+    ownedTokenRow(root, actor, tokenId)
     r = revokeToken(root, tokenId)
   } catch (e) { throw tokenErr(e) }
   audit(root, actor, log, { tool: 'DELETE /tokens', action: 'token_revoke', args: { name: r.name } })
@@ -624,8 +667,11 @@ export function updateTokenAdmin(root, actor, input, { log }) {
   for (const f of ['owner', 'team', 'visibility']) {
     if (input[f] !== undefined && typeof input[f] !== 'string') throw bad(`${f} 必须是字符串`)
   }
+  const u = userOf(actor)
+  if (u && !isAdmin(u) && (input.owner !== undefined || input.team !== undefined)) throw new HttpError(403, 'forbidden', '只有超级管理员能修改令牌的归属人与团队')
   let r
   try {
+    ownedTokenRow(root, actor, input.tokenId)
     r = updateToken(root, input.tokenId, { name: input.name, expiresAt: input.expiresAt, owner: input.owner, team: input.team, defaultVisibility: input.visibility })
   } catch (e) { throw tokenErr(e) }
   if (r.changed.length) {

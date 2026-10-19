@@ -5,6 +5,7 @@
 //
 // 只取主库 cards 表（status='approved' 且未软删）：隔离区（待审/驳回/回收站）的卡不入图。
 
+import { canSeeCard, isAdmin } from './rbac.js'
 import { getDb } from '../core/db.js'
 import { KIND_ROOTS, bigramHashSet, jaccardSets } from '../core/vault.js'
 import { minhashSignature, lshCandidates } from '../core/minhash.js'
@@ -47,19 +48,21 @@ const isoOrNull = (s) => {
 
 /** 缓存指纹：任何写卡/改标签/改标题/改正文/审核/追加更新都会改变其中至少一项。 */
 function fingerprint(db) {
-  const c = db.prepare("SELECT COUNT(*) n, MAX(updated_at) m, SUM(id) s, SUM(LENGTH(tags)) t, SUM(LENGTH(title)) ti, SUM(LENGTH(body)) b FROM cards WHERE status = 'approved' AND deleted_at IS NULL").get()
+  // 归属三列也进指纹：改 owner / team / visibility 必须让缓存失效，否则按人过滤会用到旧归属
+  const c = db.prepare("SELECT COUNT(*) n, MAX(updated_at) m, SUM(id) s, SUM(LENGTH(tags)) t, SUM(LENGTH(title)) ti, SUM(LENGTH(body)) b, GROUP_CONCAT(owner || '/' || team || '/' || visibility, ',') o FROM cards WHERE status = 'approved' AND deleted_at IS NULL").get()
   const log = db.prepare('SELECT MAX(id) id FROM audit_log').get()
   let upd = 0
   try { upd = db.prepare('SELECT MAX(id) id FROM card_updates').get().id || 0 } catch { /* 老库无此表 */ }
-  return [c.n, c.m || '', c.s || 0, c.t || 0, c.ti || 0, c.b || 0, log.id || 0, upd].join('|')
+  return [c.n, c.m || '', c.s || 0, c.t || 0, c.ti || 0, c.b || 0, log.id || 0, upd, c.o || ''].join('|')
 }
 
 /** 全量建图（不含过滤）。返回 { cards, edges, buildMs }。 */
 function buildFull(db) {
   const t0 = Date.now()
-  const rows = db.prepare("SELECT path, kind, title, tags, status, created_at, updated_at, body FROM cards WHERE status = 'approved' AND deleted_at IS NULL ORDER BY updated_at DESC, path").all()
+  const rows = db.prepare("SELECT path, kind, title, tags, status, owner, team, visibility, created_at, updated_at, body FROM cards WHERE status = 'approved' AND deleted_at IS NULL ORDER BY updated_at DESC, path").all()
   const cards = rows.map((r) => ({
     id: r.path, kind: r.kind, title: redactSecrets(r.title).text, rawTitle: r.title || '', tags: parseTags(r.tags), status: r.status,
+    owner: r.owner || '', team: r.team || '', visibility: r.visibility || '',
     createdAt: isoOrNull(r.created_at), updatedAt: isoOrNull(r.updated_at),
   }))
   const byPath = new Map(cards.map((c) => [c.id, c]))
@@ -195,7 +198,12 @@ export class GraphNotFound extends Error {
  * 处理顺序：kind/tag 选点 → 按类型/权重选边 → focus 邻域 → 去孤立点 → 按加权度数截断到 limit。
  */
 export function graphQuery(root, o = {}) {
-  const { full, cached } = getFull(root)
+  const { full: whole, cached } = getFull(root)
+  // 数据级过滤先于一切：看不见的卡既不成为节点，也不参与连边，更不能当焦点（否则可借焦点探测它是否存在）
+  const visible = o.user && !isAdmin(o.user) ? new Set(whole.cards.filter((c) => canSeeCard(o.user, c)).map((c) => c.id)) : null
+  const full = visible
+    ? { ...whole, cards: whole.cards.filter((c) => visible.has(c.id)), edges: whole.edges.filter((e) => visible.has(e.source) && visible.has(e.target)) }
+    : whole
   const limit = o.limit ?? GRAPH_DEFAULT_LIMIT
   const minWeight = o.minWeight ?? 1
   const types = o.types?.length ? new Set(o.types) : null

@@ -170,11 +170,11 @@ export function createAdminHandler({ config, log, llm = null }) {
       authenticated: true, passwordSet: true, readOnly: !!config.adminReadOnly, csrfToken: ctx.session.csrfToken, expiresAt: ctx.session.expiresAt, idleTimeoutMs: SESSION_IDLE_MS,
       user: { username: ctx.user.username, team: ctx.user.team, role: ctx.user.role, breakGlass: ctx.user.breakGlass },
     }),
-    'GET /overview': async () => {
+    'GET /overview': async (ctx) => {
       const act = Q.activity(root, { days: 30, silentDays: 7 })
-      return Q.overview(root, { config, alerts: act.alerts.filter((a) => a.type === 'read-only' || (a.type === 'idle-token' && !a.neverUsed)) })
+      return Q.overview(root, { config, user: ctx.user, alerts: isAdmin(ctx.user) ? act.alerts.filter((a) => a.type === 'read-only' || (a.type === 'idle-token' && !a.neverUsed)) : [] })
     },
-    'GET /facets': () => Q.facets(root),
+    'GET /facets': (ctx) => Q.facets(root, { user: ctx.user }),
     'GET /cards': (ctx) => {
       const u = ctx.url
       const f = {
@@ -194,12 +194,12 @@ export function createAdminHandler({ config, log, llm = null }) {
         order: enumParam(u, 'order', ['asc', 'desc'], 'desc'),
       }
       if (f.q && !P(u).get('sort')) f.sort = 'score'
-      return Q.cardsPage(root, f)
+      return Q.cardsPage(root, { ...f, user: ctx.user })
     },
     'GET /card': (ctx) => {
       const p = strParam(ctx.url, 'path', 500)
       if (!p) throw new HttpError(400, 'bad_request', '缺少 path 参数')
-      const d = Q.cardDetail(root, p)
+      const d = Q.cardDetail(root, p, { user: ctx.user })
       if (!d) throw new HttpError(404, 'not_found', '卡片不存在')
       return d
     },
@@ -213,6 +213,7 @@ export function createAdminHandler({ config, log, llm = null }) {
       if (hi !== null && !['', '0', '1'].includes(hi)) throw new HttpError(400, 'bad_request', 'hide_isolated 只能是 0 或 1')
       try {
         return G.graphQuery(root, {
+          user: ctx.user,
           kind: strParam(u, 'kind', 50),
           tags: strParam(u, 'tag', 500).split(',').map((t) => t.trim()).filter(Boolean),
           types,
@@ -230,9 +231,9 @@ export function createAdminHandler({ config, log, llm = null }) {
     // 蜘蛛搜索（POST 但不改库）：会话 + Origin + CSRF 照常校验；只读模式下仍可用（见 READONLY_OK）
     'POST /graph/search': async (ctx) => spider.search(root, await ctx.json(), Ops.actorOf(ctx.session, ctx.ip), ctx.session),
     'POST /graph/summarize': async (ctx) => spider.summarize(root, await ctx.json(), Ops.actorOf(ctx.session, ctx.ip), ctx.session),
-    'GET /queue': (ctx) => Q.queuePage(root, { ...paging(ctx.url, 50), status: enumParam(ctx.url, 'status', ['pending', 'rejected', 'all'], 'all'), owner: strParam(ctx.url, 'owner', 64), team: strParam(ctx.url, 'team', 64), visibility: enumParam(ctx.url, 'visibility', Q.VISIBILITIES, '') }),
+    'GET /queue': (ctx) => Q.queuePage(root, { ...paging(ctx.url, 50), user: ctx.user, status: enumParam(ctx.url, 'status', ['pending', 'rejected', 'all'], 'all'), owner: strParam(ctx.url, 'owner', 64), team: strParam(ctx.url, 'team', 64), visibility: enumParam(ctx.url, 'visibility', Q.VISIBILITIES, '') }),
     'GET /recycle': (ctx) => Q.recyclePage(root, paging(ctx.url, 50)),
-    'GET /tags': (ctx) => Q.tagStats(root, { q: strParam(ctx.url, 'q', 100), limit: intParam(ctx.url, 'limit', { def: 500, min: 1, max: 5000, clamp: true }) }),
+    'GET /tags': (ctx) => Q.tagStats(root, { user: ctx.user, q: strParam(ctx.url, 'q', 100), limit: intParam(ctx.url, 'limit', { def: 500, min: 1, max: 5000, clamp: true }) }),
     'GET /tidy/preview': async (ctx) => {
       const raw = P(ctx.url).get('threshold')
       let threshold
@@ -244,7 +245,7 @@ export function createAdminHandler({ config, log, llm = null }) {
     },
     'GET /lint': () => Q.lintReport(root),
     'GET /activity': (ctx) => Q.activity(root, { days: intParam(ctx.url, 'days', { def: 30, min: 1, max: 365 }), silentDays: intParam(ctx.url, 'silentDays', { def: 7, min: 1, max: 365 }) }),
-    'GET /tokens': () => Q.tokenList(root),
+    'GET /tokens': (ctx) => Q.tokenList(root, { user: ctx.user }),
     'GET /settings': () => Settings.getSettings(root, { config }),
     'GET /write-log': (ctx) => {
       const u = ctx.url

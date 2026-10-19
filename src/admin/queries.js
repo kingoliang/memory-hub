@@ -11,6 +11,13 @@ import path from 'node:path'
 import { getDb, checkMainStoreInvariant, DB_FILENAME } from '../core/db.js'
 import { queryTerms, TITLE_COLLATOR, RECYCLE_RETENTION_DAYS } from '../core/vault.js'
 import { VISIBILITIES as SCOPE_VISIBILITIES } from '../core/scope.js'
+import { canSeeCard, isAdmin, canManageToken } from './rbac.js'
+
+/**
+ * 数据级过滤：查看者看不见的行一律剔除。user 缺省（老调用方 / 单测直调）按超级管理员处理，行为与多用户之前完全一致。
+ * 行上需有 owner / team / visibility / status 四列。
+ */
+const seeRow = (user) => (user && !isAdmin(user) ? (r) => canSeeCard(user, r) : null)
 import { tidyPlan, tidyLint, detectSecrets, redactSecrets, tagKey } from '../core/tidy.js'
 import { OUTCOMES, ACTOR_TYPES } from '../core/writelog.js'
 
@@ -83,8 +90,9 @@ export function listCards(root, f) {
     const cols = `path, kind, title, tags, status, source, submitted_by, owner, team, visibility, created_at, updated_at, deleted_at, LENGTH(body) AS body_chars${needBody ? ', body' : ''}`
     rows.push(...db.prepare(`SELECT ${cols} FROM ${st.table}${where.length ? ' WHERE ' + where.join(' AND ') : ''}`).all(...args))
   }
+  const see = seeRow(f.user)
 
-  let items = rows.map((r) => ({ r, tags: parseTags(r.tags), created: tsMs(r.created_at), updated: tsMs(r.updated_at) }))
+  let items = (see ? rows.filter(see) : rows).map((r) => ({ r, tags: parseTags(r.tags), created: tsMs(r.created_at), updated: tsMs(r.updated_at) }))
   if (f.tags?.length) items = items.filter((x) => f.tags.every((t) => x.tags.includes(t)))
   if (f.createdFrom != null) items = items.filter((x) => x.created >= f.createdFrom)
   if (f.createdTo != null) items = items.filter((x) => x.created <= f.createdTo)
@@ -165,10 +173,11 @@ export function cardsPage(root, f) {
 // 待审队列 / 回收站
 // ---------------------------------------------------------------------------
 
-export function queuePage(root, { status, owner, team, visibility, limit, offset }) {
+export function queuePage(root, { status, owner, team, visibility, limit, offset, user }) {
   const db = getDb(root)
+  const see = seeRow(user)
   const counts = { pending: 0, rejected: 0 }
-  for (const r of db.prepare("SELECT status, COUNT(*) n FROM quarantine WHERE status IN ('pending','rejected') GROUP BY status").all()) counts[r.status] = r.n
+  for (const r of db.prepare("SELECT status, owner, team, visibility FROM quarantine WHERE status IN ('pending','rejected')").all()) if (!see || see(r)) counts[r.status]++
   const statuses = status === 'all' ? ['pending', 'rejected'] : [status]
   const where = [`status IN (${statuses.map(() => '?').join(',')})`]
   const args = [...statuses]
@@ -176,6 +185,7 @@ export function queuePage(root, { status, owner, team, visibility, limit, offset
   if (team) { where.push('team = ?'); args.push(team) }
   if (visibility) { where.push('visibility = ?'); args.push(visibility) }
   const rows = db.prepare(`SELECT path, kind, title, tags, status, source, submitted_by, owner, team, visibility, created_at, updated_at, deleted_at, reason, quarantine_reason, quarantined_at, LENGTH(body) AS body_chars FROM quarantine WHERE ${where.join(' AND ')}`).all(...args)
+    .filter((r) => !see || see(r))
     .map((r) => ({ r, tags: parseTags(r.tags), created: tsMs(r.created_at), updated: tsMs(r.updated_at) }))
   rows.sort((a, b) => a.created - b.created || (a.r.path < b.r.path ? -1 : 1))
   const now = Date.now()
@@ -204,12 +214,15 @@ export function recyclePage(root, { limit, offset }) {
 // 卡片详情
 // ---------------------------------------------------------------------------
 
-export function cardDetail(root, cardPath) {
+export function cardDetail(root, cardPath, { user } = {}) {
   const db = getDb(root)
   let row = db.prepare('SELECT * FROM cards WHERE path = ?').get(cardPath)
   let inQuarantine = false
   if (!row) { row = db.prepare('SELECT * FROM quarantine WHERE path = ?').get(cardPath); inQuarantine = !!row }
   if (!row) return null
+  // 看不见 = 不存在（同样返回 null → 404），不泄露这张卡是否存在
+  const see = seeRow(user)
+  if (see && !see(row)) return null
   const red = (s) => redactSecrets(s)
   const body = red(row.body)
   const types = new Set(body.types)
@@ -260,9 +273,10 @@ export function cardDetail(root, cardPath) {
 // 标签
 // ---------------------------------------------------------------------------
 
-export function tagStats(root, { q, limit }) {
+export function tagStats(root, { q, limit, user }) {
   const counts = new Map()
-  for (const r of getDb(root).prepare('SELECT tags FROM cards').all()) for (const t of new Set(parseTags(r.tags))) counts.set(t, (counts.get(t) || 0) + 1)
+  const see = seeRow(user)
+  for (const r of getDb(root).prepare('SELECT tags, owner, team, visibility, status FROM cards').all().filter((x) => !see || see(x))) for (const t of new Set(parseTags(r.tags))) counts.set(t, (counts.get(t) || 0) + 1)
   const all = [...counts.entries()].map(([tag, count]) => ({ tag, count, singleton: count === 1 }))
   all.sort((a, b) => b.count - a.count || TITLE_COLLATOR.compare(a.tag, b.tag))
   const groups = new Map()
@@ -354,7 +368,7 @@ function parseScopeList(raw) {
   return []
 }
 
-export function tokenList(root) {
+export function tokenList(root, { user } = {}) {
   const db = getDb(root)
   const since = new Date(Date.now() - 30 * DAY).toISOString()
   const calls = Object.fromEntries(db.prepare("SELECT actor_name, COUNT(*) n FROM write_log WHERE actor_type = 'agent' AND ts >= ? GROUP BY actor_name").all(since).map((r) => [r.actor_name, r.n]))
@@ -365,7 +379,7 @@ export function tokenList(root) {
       createdAt: t.created_at, lastUsedAt: t.last_used_at, expiresAt: t.expires_at, revokedAt: t.revoked_at,
       status: t.revoked_at ? 'revoked' : expired ? 'expired' : 'active', calls30d: calls[t.name] || 0,
     }
-  })
+  }).filter((t) => !user || canManageToken(user, t))
   return { total: items.length, items }
 }
 
@@ -393,10 +407,13 @@ export const WRITE_LOG_ACTOR_TYPES = ACTOR_TYPES
 // facets / 总览
 // ---------------------------------------------------------------------------
 
-export function facets(root) {
+export function facets(root, { user } = {}) {
   const db = getDb(root)
-  const kinds = db.prepare('SELECT kind, COUNT(*) count FROM cards GROUP BY kind ORDER BY count DESC, kind').all()
-  const agentRows = db.prepare('SELECT submitted_by, source FROM cards').all()
+  const see = seeRow(user)
+  const agentRows = db.prepare('SELECT kind, submitted_by, source, owner, team, visibility, status FROM cards').all().filter((r) => !see || see(r))
+  const kindCount = new Map()
+  for (const r of agentRows) kindCount.set(r.kind, (kindCount.get(r.kind) || 0) + 1)
+  const kinds = [...kindCount.entries()].map(([kind, count]) => ({ kind, count })).sort((a, b) => b.count - a.count || (a.kind < b.kind ? -1 : a.kind > b.kind ? 1 : 0))
   const byAgent = new Map()
   const bySource = new Map()
   let unsigned = 0
@@ -406,12 +423,13 @@ export function facets(root) {
   }
   const agents = [...byAgent.entries()].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1)).map(([name, count]) => ({ name, value: name, count }))
   if (unsigned) agents.push({ name: UNSIGNED_LABEL, value: UNSIGNED, count: unsigned })
-  const q = Object.fromEntries(db.prepare('SELECT status, COUNT(*) n FROM quarantine GROUP BY status').all().map((r) => [r.status, r.n]))
+  const q = {}
+  for (const r of db.prepare('SELECT status, owner, team, visibility FROM quarantine').all()) if (!see || see(r)) q[r.status] = (q[r.status] || 0) + 1
   const statuses = [
     { status: 'approved', count: agentRows.length }, { status: 'pending', count: q.pending || 0 },
     { status: 'rejected', count: q.rejected || 0 }, { status: 'deleted', count: q.deleted || 0 },
   ]
-  const tags = tagStats(root, { q: '', limit: 100 }).items
+  const tags = tagStats(root, { q: '', limit: 100, user }).items
   return { kinds, agents, sources: [...bySource.entries()].sort((a, b) => b[1] - a[1]).map(([name, count]) => ({ name, count })), statuses, tags }
 }
 
@@ -428,9 +446,10 @@ export function dailySeries(days, stamps) {
 
 function fileBytes(p) { try { return fs.statSync(p).size } catch { return 0 } }
 
-export function overview(root, { config, alerts: extraAlerts = [] } = {}) {
+export function overview(root, { config, alerts: extraAlerts = [], user } = {}) {
   const db = getDb(root)
-  const cardsRows = db.prepare('SELECT kind, submitted_by, created_at FROM cards').all()
+  const see = seeRow(user)
+  const cardsRows = db.prepare('SELECT kind, submitted_by, created_at, tags, owner, team, visibility, status FROM cards').all().filter((r) => !see || see(r))
   const byKind = {}
   const agents = new Map()
   for (const r of cardsRows) {
@@ -439,14 +458,14 @@ export function overview(root, { config, alerts: extraAlerts = [] } = {}) {
     agents.set(n, (agents.get(n) || 0) + 1)
   }
   const tagSet = new Set()
-  for (const r of db.prepare('SELECT tags FROM cards').all()) for (const t of parseTags(r.tags)) tagSet.add(t)
+  for (const r of cardsRows) for (const t of parseTags(r.tags)) tagSet.add(t)
   const q = { pending: 0, rejected: 0, deleted: 0 }
-  for (const r of db.prepare('SELECT status, COUNT(*) n FROM quarantine GROUP BY status').all()) if (r.status in q) q[r.status] = r.n
+  for (const r of db.prepare('SELECT status, owner, team, visibility FROM quarantine').all()) if ((r.status in q) && (!see || see(r))) q[r.status]++
   const created = cardsRows.map((r) => tsMs(r.created_at))
   const week = Date.now() - 7 * DAY
   const dbFile = path.join(path.resolve(root), DB_FILENAME)
   const b = backupInfo(root)
-  const recentLog = db.prepare('SELECT ts, actor_type, actor_name, tool, action, card_path, outcome FROM write_log ORDER BY ts DESC, id DESC LIMIT 10').all()
+  const recentLog = (see ? [] : db.prepare('SELECT ts, actor_type, actor_name, tool, action, card_path, outcome FROM write_log ORDER BY ts DESC, id DESC LIMIT 10').all())
     .map((l) => ({ ts: l.ts, actorType: l.actor_type, actorName: l.actor_name, tool: l.tool, action: l.action, cardPath: l.card_path, outcome: l.outcome }))
 
   const alerts = [...extraAlerts]
@@ -459,7 +478,7 @@ export function overview(root, { config, alerts: extraAlerts = [] } = {}) {
     cards: { total: cardsRows.length, byKind, tags: tagSet.size, recent7d: created.filter((t) => t >= week).length },
     quarantine: q,
     daily: dailySeries(30, created),
-    vault: { dbBytes: fileBytes(dbFile), walBytes: fileBytes(dbFile + '-wal'), backupCount: b.count, lastBackup: b.last },
+    vault: see ? null : { dbBytes: fileBytes(dbFile), walBytes: fileBytes(dbFile + '-wal'), backupCount: b.count, lastBackup: b.last },
     agents: [...agents.entries()].map(([name, cards]) => ({ name, cards })).sort((a, c) => c.cards - a.cards || (a.name < c.name ? -1 : 1)),
     recentLog,
     llm: { configured: !!config?.llm, model: config?.llm?.model || null },
