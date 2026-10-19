@@ -9,7 +9,8 @@
     "node": ">=22.16"
   },
   "scripts": {
-    "test": "node --test --test-concurrency=1 \"tests/**/*.test.mjs\"",
+    "test": "node --test --test-concurrency=1 \"tests/**/*.test.mjs\" && npm run test:clients",
+    "test:clients": "node --test --test-concurrency=1 clients/*/tests/*.test.mjs",
     "coverage": "node scripts/quality/coverage.mjs",
     "complexity": "node scripts/quality/complexity.mjs",
     "deadcode": "node scripts/quality/deadcode.mjs",

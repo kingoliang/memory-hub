@@ -23,6 +23,8 @@ export const LIMITS = Object.freeze({
   retryCapS: 3600, // 遵守 retry_after_s 的上限
   timerRetries: 3, // 连续由定时器触发的"收尾重试"次数上限
   maxSessions: 200, // 同时跟踪的 session 状态上限
+  prefilterMinLines: 3, // 本地预筛：少于这么多行就不动手（单行命令看着也像工具输出）
+  prefilterToolRatio: 0.8, // 本地预筛：工具输出行占比到达这个比例才算"全是工具输出"
 })
 
 // ---------------------------------------------------------------- 文本处理
@@ -63,6 +65,30 @@ export function messageKey(m) {
 
 const ROLE_PREFIX = { user: '用户：', assistant: '助手：' }
 
+// ---------------------------------------------------------------- 本地预筛
+//
+// 目的：纯工具输出的那一轮（"$ npm test / PASS / ok 1 - …"）**根本不发请求**。
+// 判定权仍在服务端（服务端 gate.js 是唯一权威，此处只是省钱），所以两个原则：
+//   1. 只丢"非常确定"的：行数够多、几乎全是工具输出行、且看不到一丝经验信号；
+//   2. 宁可漏丢不可错丢 —— 拿不准就交给服务端判。
+// 口径与 src/core/gate.js 的 tool-log 同源，跨包无法 import，所以那边改了要同步（有对拍测试）。
+const TOOL_LINE = /^\s*(?:\$\s|>\s|→|\+{3}|-{3}|@@|(?:PASS|FAIL)\b|ok\s+\d+|not ok\b|\d+\s+(?:passing|failing)\b|(?:npm|pnpm|yarn|mvn|gradle|git|node|npx|ls|cd|cat|curl|docker|kubectl|brew|uv|pip)\b|(?:M|A|D|R|\?\?)\s+\S)/i
+const EXPERIENCE_HINT = /结论|决定|采用|方案|原因|根因|教训|踩坑|流程|步骤|配置|参数|注意|必须|不要|否则|经验|约定|偏好|推荐|规则|原则/
+
+/**
+ * 本地预筛：`{ push, reason }`。push=false 时调用方应把这段文本当作"服务端会 skipped"直接推进水位。
+ * @param {string} text 已去噪、已拼好的待发文本
+ */
+export function shouldPushLocally(text, limits = LIMITS) {
+  const t = String(text ?? '')
+  if (EXPERIENCE_HINT.test(t)) return { push: true, reason: 'has-signal' }
+  const lines = t.split('\n').map((l) => l.trim()).filter(Boolean)
+  if (lines.length < limits.prefilterMinLines) return { push: true, reason: 'too-few-lines' }
+  const tool = lines.filter((l) => TOOL_LINE.test(l)).length
+  if (tool / lines.length < limits.prefilterToolRatio) return { push: true, reason: 'not-all-tool-lines' }
+  return { push: false, reason: 'tool-log' }
+}
+
 /** 返回一条消息的带角色前缀文本（已去噪）；非 user/assistant、出错/中止的 assistant、无文本 → ''。 */
 export function messageLine(m) {
   const prefix = ROLE_PREFIX[m?.role]
@@ -100,6 +126,8 @@ export function resolveConfig(env = process.env, io = {}) {
   return {
     url: (env.MEMORY_HUB_INGEST_URL || DEFAULT_URL).trim(),
     source: 'pi-web',
+    // 本地预筛：默认开；MEMORY_HUB_PI_PREFILTER=off 关掉（想让服务端判每一轮时用）
+    prefilter: String(env.MEMORY_HUB_PI_PREFILTER ?? '').toLowerCase() !== 'off',
     token,
     tokenSource,
     enabled: !!token,
@@ -327,6 +355,17 @@ export function createMemoryHubIngest(opts = {}) {
         if (wait > 0) { log.debug(`${TAG} 遵守 retry_after，暂不发送`, { session: sid, wait_ms: wait }); break }
         const batch = buildBatch(s.pending)
         if (batch.text.length < L.minChars) { log.debug(`${TAG} 去噪后不足 ${L.minChars} 字，继续累积`, { session: sid, chars: batch.text.length }); break }
+        // 本地预筛：纯工具输出直接丢（水位推进，与服务端 skipped 等价），不白跑一次网络
+        if (cfg.prefilter) {
+          const pre = shouldPushLocally(batch.text, L)
+          if (!pre.push) {
+            s.pending.splice(0, s.pending.length)
+            s.nextAllowedAt = 0
+            s.timerRetries = 0
+            log.info(`${TAG} 本地预筛：${pre.reason}，未发请求`, { session: sid, chars: batch.text.length })
+            continue
+          }
+        }
         const sent = s.pending.length
         let r
         try {
