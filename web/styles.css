@@ -1121,3 +1121,12 @@ label.set-opt strong { font-size: var(--fs-base); }
 .sidebar-foot { display: flex; flex-direction: column; gap: 6px; align-items: flex-start; }
 .whoami { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; color: var(--text, inherit); max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .whoami em { font-style: normal; color: var(--muted, #888); }
+
+/* 令牌接入说明（创建令牌后的弹窗里） */
+.howto-title { margin: 18px 0 6px; font-size: 15px; }
+.howto { display: grid; gap: 10px; }
+.howto-item { border: 1px solid var(--line, #ddd); border-radius: 6px; padding: 8px 10px; }
+.howto-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 6px; }
+.howto-code { margin: 0; white-space: pre-wrap; word-break: break-all; font-size: 12.5px; line-height: 1.5; user-select: all; }
+/* 字段说明（如「团队：PayTool」）不跟随 label 大写：团队名大小写有意义 */
+.modal-field > .sub { text-transform: none; letter-spacing: normal; }

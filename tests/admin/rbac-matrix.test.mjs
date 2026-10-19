@@ -57,6 +57,7 @@ const EXPECTED = {
   'GET /settings': A,
   'PATCH /settings': A,
   'GET /users': A,
+  'GET /users/options': A,
   'POST /users': A,
   'PATCH /users': A,
   'POST /users/password': A,

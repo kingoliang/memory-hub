@@ -44,7 +44,7 @@ export const ADMIN_ROUTE_ROLES = Object.freeze({
   'GET /tags/preview': ADMINS, 'POST /tags/rename': ADMINS, 'POST /tags/merge': ADMINS, 'POST /tags/delete': ADMINS,
   'GET /lint': ADMINS, 'GET /activity': ADMINS, 'GET /write-log': ADMINS,
   'GET /settings': ADMINS, 'PATCH /settings': ADMINS,
-  'GET /users': ADMINS, 'POST /users': ADMINS, 'PATCH /users': ADMINS, 'POST /users/password': ADMINS,
+  'GET /users': ADMINS, 'GET /users/options': ADMINS, 'POST /users': ADMINS, 'PATCH /users': ADMINS, 'POST /users/password': ADMINS,
 })
 
 const WEB_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../web')
@@ -289,6 +289,8 @@ export function createAdminHandler({ config, log, llm = null }) {
     },
     // ---- 用户管理（仅超级管理员）----
     'GET /users': () => ({ items: Users.listUsers(root) }),
+    // 令牌表单的「归属人」下拉：只给未停用账号的 username/team/role
+    'GET /users/options': () => ({ items: Users.listUsers(root).filter((u) => !u.disabled).map((u) => ({ username: u.username, team: u.team, role: u.role })) }),
     'POST /users': async (ctx) => userOp(ctx, 'user_create', async () => {
       const b = await ctx.json()
       const u = Users.createUser(root, { username: b?.username, team: b?.team, role: b?.role, password: b?.password })

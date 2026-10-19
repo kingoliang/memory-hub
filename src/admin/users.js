@@ -89,6 +89,8 @@ export function updateUser(root, username, { team, role } = {}) {
   if (team !== undefined) { const t = validateTeam(team); if (t !== row.team) { sets.push('team = ?'); args.push(t); changed.push('team') } }
   if (role !== undefined) { const r = validateRole(role); if (r !== row.role) { sets.push('role = ?'); args.push(r); changed.push('role') } }
   if (sets.length) db.prepare(`UPDATE admin_users SET ${sets.join(', ')}, updated_at = ? WHERE id = ?`).run(...args, nowIso(), row.id)
+  // 换团队：这个人名下未撤销令牌的团队同步跟着变，令牌团队永远与账号团队一致（已撤销的保留历史值）
+  if (changed.includes('team')) db.prepare('UPDATE agent_tokens SET team = ? WHERE owner = ? AND revoked_at IS NULL').run(validateTeam(team), row.username)
   return { username: row.username, changed }
 }
 

@@ -70,7 +70,9 @@ export function validateParty(value, field) {
   const v = String(value ?? '').trim()
   if (v === '') return ''
   if (!PARTY_RE.test(v)) throw new TokenError(`${field} 只能含字母数字与 . _ -，以字母或数字开头，最长 64 字符：${value}`)
-  return v
+  // owner 即用户名，账号侧统一小写；这里也小写，否则 GuoyouMa 与 guoyouma 会被当成两个人。
+  // 字段名带 OWNER 的都算 owner（stdio 的 MEMORY_HUB_OWNER）。team 保持原样：团队名大小写有意义（如 PayTool）。
+  return /owner/i.test(String(field)) ? v.toLowerCase() : v
 }
 
 /** 默认可见性校验；缺省/空串 → team（与 DB 列默认值一致）。 */

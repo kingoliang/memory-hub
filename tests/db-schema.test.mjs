@@ -19,14 +19,14 @@ const ADDED_COLUMNS = {
 }
 const cols = (db, t) => db.prepare(`PRAGMA table_info(${t})`).all().map((c) => `${c.name}:${c.type}:${c.notnull}:${c.dflt_value}:${c.pk}`)
 
-test('新库：WAL + busy_timeout=5000 + foreign_keys + user_version=4', () => {
+test('新库：WAL + busy_timeout=5000 + foreign_keys + user_version=5', () => {
   const home = tmpHome()
   try {
     const db = newDb.getDb(home)
     assert.equal(db.prepare('PRAGMA journal_mode').get().journal_mode, 'wal')
     assert.equal(db.prepare('PRAGMA busy_timeout').get().timeout, 5000)
     assert.equal(db.prepare('PRAGMA foreign_keys').get().foreign_keys, 1)
-    assert.equal(db.prepare('PRAGMA user_version').get().user_version, 4)
+    assert.equal(db.prepare('PRAGMA user_version').get().user_version, 5)
   } finally { newDb.closeAllDb(); rmrf(home) }
 })
 
@@ -60,7 +60,7 @@ test('旧版库（user_version=0）升级：数据与发号器原样保留，且
     legacyDb.closeAllDb()
 
     const db = newDb.getDb(home)
-    assert.equal(db.prepare('PRAGMA user_version').get().user_version, 4)
+    assert.equal(db.prepare('PRAGMA user_version').get().user_version, 5)
     assert.equal(db.prepare('SELECT COUNT(*) n FROM cards').get().n, 1)
     assert.equal(db.prepare('SELECT COUNT(*) n FROM quarantine').get().n, 1)
     assert.equal(db.prepare("SELECT seq FROM card_sequence WHERE name='card'").get().seq, seqBefore)
@@ -69,7 +69,7 @@ test('旧版库（user_version=0）升级：数据与发号器原样保留，且
     assert.deepEqual(db.prepare('SELECT owner, team, visibility FROM quarantine').all().map((r) => [r.owner, r.team, r.visibility]), [['y', 'default', 'team']])
     newDb.closeAllDb()
     const db2 = newDb.getDb(home) // 再开一次：幂等
-    assert.equal(db2.prepare('PRAGMA user_version').get().user_version, 4)
+    assert.equal(db2.prepare('PRAGMA user_version').get().user_version, 5)
     assert.equal(db2.prepare('SELECT COUNT(*) n FROM cards').get().n, 1)
   } finally { newDb.closeAllDb(); legacyDb.closeAllDb(); rmrf(home) }
 })
@@ -96,7 +96,7 @@ test('nextCardId 单语句原子发号：连续发号严格递增且唯一', () 
   } finally { newDb.closeAllDb(); rmrf(home) }
 })
 
-test('v1 → v4 迁移（v2 令牌名部分唯一 + v3 归属列 + v4 管理账号表）：数据与哈希原样保留、幂等、旧代码仍可打开', async () => {
+test('v1 → v5 迁移（v2 令牌名部分唯一 + v3 归属列 + v4 管理账号表 + v5 owner 小写）：数据与哈希原样保留、幂等、旧代码仍可打开', async () => {
   const home = tmpHome()
   try {
     // 构造一个 v1 库：用 v1 形态建表并写入令牌行
@@ -109,7 +109,7 @@ test('v1 → v4 迁移（v2 令牌名部分唯一 + v3 归属列 + v4 管理账�
       PRAGMA user_version = 1;`)
     raw.close()
     const db = newDb.getDb(home)
-    assert.equal(db.prepare('PRAGMA user_version').get().user_version, 4)
+    assert.equal(db.prepare('PRAGMA user_version').get().user_version, 5)
     const rows = db.prepare('SELECT * FROM agent_tokens ORDER BY token_id').all()
     assert.deepEqual(rows.map((r) => [r.token_id, r.name, r.secret_hash, r.scopes, r.last_used_at, r.expires_at, r.revoked_at]), [
       ['t1', 'alpha', 'h1', '["read"]', null, null, null],
@@ -120,7 +120,7 @@ test('v1 → v4 迁移（v2 令牌名部分唯一 + v3 归属列 + v4 管理账�
     assert.throws(() => db.prepare("INSERT INTO agent_tokens (token_id, name, secret_hash, scopes, created_at) VALUES ('t4','alpha','h4','[\"read\"]','2026-04-01T00:00:00.000Z')").run(), /UNIQUE/)
     newDb.closeAllDb()
     const again = newDb.getDb(home) // 幂等
-    assert.equal(again.prepare('PRAGMA user_version').get().user_version, 4)
+    assert.equal(again.prepare('PRAGMA user_version').get().user_version, 5)
     assert.equal(again.prepare('SELECT COUNT(*) n FROM agent_tokens').get().n, 3)
     newDb.closeAllDb()
     // 旧代码（fixtures/legacy，v1 形态）能打开 v2 库并读写令牌表之外的数据

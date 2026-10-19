@@ -14,10 +14,10 @@ async function withRoot(fn) {
   try { return await fn(home) } finally { closeAllDb(); rmrf(home) }
 }
 
-test('schema v4：admin_users 表与 admin_sessions.user_id 列', async () => {
+test('schema v4+：admin_users 表与 admin_sessions.user_id 列', async () => {
   await withRoot(async (home) => {
     const db = getDb(home)
-    assert.equal(db.prepare('PRAGMA user_version').get().user_version, 4)
+    assert.equal(db.prepare('PRAGMA user_version').get().user_version, 5)
     const cols = (t) => db.prepare(`PRAGMA table_info(${t})`).all().map((c) => c.name)
     assert.deepEqual(cols('admin_users'), ['id', 'username', 'team', 'role', 'password_hash', 'created_at', 'updated_at', 'disabled_at', 'last_login_at'])
     assert.equal(cols('admin_sessions').includes('user_id'), true)

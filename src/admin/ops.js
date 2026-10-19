@@ -627,7 +627,8 @@ export function createTokenAdmin(root, actor, input, { log }) {
   }
   const u = userOf(actor)
   // 非管理员：归属强制为本人与本团队（忽略请求里的 owner/team），且不能自封 tidy:apply
-  const scope = u ? tokenScopeFor(u, { owner: input.owner, team: input.team }) : { owner: input.owner, team: input.team }
+  // 成员：强制本人；超级管理员（经管理界面）：只能选已存在的账号，团队跟着账号走
+  const scope = u && !isAdmin(u) ? tokenScopeFor(u, {}) : u ? ownerFromAccount(root, input.owner) : { owner: input.owner, team: input.team }
   if (u && !isAdmin(u) && input.scopes.includes('tidy:apply')) throw new HttpError(403, 'forbidden', '只有超级管理员能授予 tidy:apply')
   let made
   try {
@@ -637,6 +638,18 @@ export function createTokenAdmin(root, actor, input, { log }) {
   audit(root, actor, log, { tool: 'POST /tokens', action: 'token_create', args: { name: made.name, scopes: made.scopes, owner: made.owner, team: made.team, visibility: made.defaultVisibility, expiresAt } })
   log.info('管理员创建令牌', { name: made.name, scopes: made.scopes, owner: made.owner, team: made.team, visibility: made.defaultVisibility, expiresAt, actor: actor.id })
   return { ok: true, tokenId: made.tokenId, name: made.name, scopes: made.scopes, owner: made.owner, team: made.team, defaultVisibility: made.defaultVisibility, expiresAt: made.expiresAt, token: made.token, notice: '明文令牌仅显示一次：关闭此窗口后无法再次查看。请立即复制并妥善保存。' }
+}
+
+/**
+ * 超级管理员给令牌指定归属人：必须是已存在且未停用的账号，团队取该账号的团队（请求里的 team 忽略）。
+ * owner 留空 = 无主令牌（给不属于任何人的自动化脚本）。见 docs/decisions/2026-10-19-token-owner-from-user-list.md。
+ */
+function ownerFromAccount(root, owner) {
+  const name = String(owner ?? '').trim()
+  if (!name) return { owner: '', team: '' }
+  const u = Users.getUser(root, name)
+  if (!u || u.disabled) throw new HttpError(400, 'unknown_owner', `归属人必须是已存在且未停用的账号：${name.toLowerCase()}`)
+  return { owner: u.username, team: u.team }
 }
 
 /** 取令牌行并做归属检查：不存在或不属于查看者 → 一律 404（不泄露别人的令牌是否存在）。 */
@@ -669,10 +682,14 @@ export function updateTokenAdmin(root, actor, input, { log }) {
   }
   const u = userOf(actor)
   if (u && !isAdmin(u) && (input.owner !== undefined || input.team !== undefined)) throw new HttpError(403, 'forbidden', '只有超级管理员能修改令牌的归属人与团队')
+  // 管理界面里团队跟着归属人走，不能单独改（否则令牌团队会和这个人的账号团队对不上）
+  if (u && input.team !== undefined && input.owner === undefined) throw new HttpError(400, 'team_follows_owner', '令牌的团队跟着归属人走，不能单独修改；要换团队请改归属人，或在「用户」页改这个人的团队')
+  // 改归属：只能改成已存在账号，团队取该账号的团队
+  const scope = input.owner !== undefined && u ? ownerFromAccount(root, input.owner) : { owner: input.owner, team: input.team }
   let r
   try {
     ownedTokenRow(root, actor, input.tokenId)
-    r = updateToken(root, input.tokenId, { name: input.name, expiresAt: input.expiresAt, owner: input.owner, team: input.team, defaultVisibility: input.visibility })
+    r = updateToken(root, input.tokenId, { name: input.name, expiresAt: input.expiresAt, owner: scope.owner, team: scope.team, defaultVisibility: input.visibility })
   } catch (e) { throw tokenErr(e) }
   if (r.changed.length) {
     audit(root, actor, log, { tool: 'PATCH /tokens', action: 'token_update', args: { changed: r.changed, name: r.name } })

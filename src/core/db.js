@@ -12,7 +12,7 @@ const { DatabaseSync } = sqlite
 const DB_FILE = 'memory-eternal.db'
 export const DB_FILENAME = DB_FILE
 /** 当前 schema 版本（PRAGMA user_version）。0 = 旧版 memory-eternal 库。 */
-export const SCHEMA_VERSION = 4
+export const SCHEMA_VERSION = 5
 /** 归属列：新增列名+建表默认值，迁移与建表共用一份，避免两边漂移。 */
 export const SCOPE_COLUMNS = { owner: "TEXT NOT NULL DEFAULT ''", team: "TEXT NOT NULL DEFAULT 'default'", visibility: "TEXT NOT NULL DEFAULT 'team'" }
 export const BUSY_TIMEOUT_MS = 5000
@@ -327,6 +327,12 @@ export function migrateSchema(db) {
       `)
       addColumnIfMissing(db, 'admin_sessions', 'user_id', 'INTEGER')
       db.exec('CREATE INDEX IF NOT EXISTS idx_admin_sessions_user ON admin_sessions(user_id)')
+    }
+    if (current() < 5) {
+      // 4 → 5：owner 一律小写（只改值不改结构）。账号用户名是小写，owner 比较区分大小写，
+      // 手填的 GuoyouMa 与账号 guoyouma 会被当成两个人（docs/decisions/2026-10-19-token-owner-from-user-list.md）。
+      // team 不动：团队名大小写有意义。
+      for (const t of ['cards', 'quarantine', 'agent_tokens']) db.exec(`UPDATE ${t} SET owner = lower(owner) WHERE owner <> lower(owner)`)
     }
     db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`)
     db.exec('COMMIT')

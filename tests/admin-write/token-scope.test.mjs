@@ -7,12 +7,21 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { withHubW, loggedIn } from './write-helpers.mjs'
 import { listTokens } from '../../src/auth/tokens.js'
+import { createUser, updateUser } from '../../src/admin/users.js'
+import { TEST_COST } from '../admin/admin-helpers.mjs'
+
+// 2026-10-19 起：管理界面里令牌归属人必须是已存在账号，团队跟着账号走（docs/decisions/2026-10-19-token-owner-from-user-list.md）
+const seedUsers = (home) => {
+  createUser(home, { username: 'alice', team: 'remittance', role: 'member', password: 'strong-user-pass-01' }, { cost: TEST_COST })
+  createUser(home, { username: 'bob', team: 'payments', role: 'member', password: 'strong-user-pass-01' }, { cost: TEST_COST })
+}
 
 const lastLog = (h, action) => h.db().prepare('SELECT * FROM write_log WHERE action = ? ORDER BY id DESC LIMIT 1').get(action)
 test('POST /tokens 接受 owner/team/visibility：落库、响应、列表三处一致', async () => {
   await withHubW(async (h) => {
+    seedUsers(h.home)
     const c = await loggedIn(h)
-    const r = await c.wpost('/admin/api/tokens', { name: 'alice-claude', scopes: ['read', 'write'], owner: 'alice', team: 'remittance', visibility: 'private' })
+    const r = await c.wpost('/admin/api/tokens', { name: 'alice-claude', scopes: ['read', 'write'], owner: 'alice', visibility: 'private' })
     assert.equal(r.status, 200, r.text)
     assert.deepEqual(
       { owner: r.json.owner, team: r.json.team, defaultVisibility: r.json.defaultVisibility },
@@ -49,20 +58,22 @@ test('POST /tokens 非法归属 → 400，且消息是字面量', async () => {
     assert.equal(bad.status, 400, bad.text)
     assert.match(bad.json.message, /visibility 只能是 private \/ team \/ public/)
     const badOwner = await c.wpost('/admin/api/tokens', { name: 'bad-owner', scopes: ['read'], owner: 'alice liang' })
-    assert.equal(badOwner.status, 400, badOwner.text)
-    assert.match(badOwner.json.message, /owner 只能含字母数字/)
+    assert.deepEqual({ status: badOwner.status, error: badOwner.json.error, message: badOwner.json.message }, { status: 400, error: 'unknown_owner', message: '归属人必须是已存在且未停用的账号：alice liang' })
   }, { seed: false })
 })
 
-test('PATCH /tokens 可改 owner/team/visibility，并写审计', async () => {
+test('PATCH /tokens 改归属人时团队跟着账号走；单独改团队被拒；写审计', async () => {
   await withHubW(async (h) => {
+    seedUsers(h.home)
     const c = await loggedIn(h)
-    await c.wpost('/admin/api/tokens', { name: 'movable', scopes: ['read'], owner: 'alice', team: 'remittance' })
+    await c.wpost('/admin/api/tokens', { name: 'movable', scopes: ['read'], owner: 'alice' })
     const tokenId = listTokens(h.home).find((t) => t.name === 'movable').tokenId
-    const r = await c.patch('/admin/api/tokens', { tokenId, team: 'payments', visibility: 'public' })
+    const teamOnly = await c.patch('/admin/api/tokens', { tokenId, team: 'payments' })
+    assert.deepEqual({ status: teamOnly.status, error: teamOnly.json.error, message: teamOnly.json.message }, { status: 400, error: 'team_follows_owner', message: '令牌的团队跟着归属人走，不能单独修改；要换团队请改归属人，或在「用户」页改这个人的团队' })
+    const r = await c.patch('/admin/api/tokens', { tokenId, owner: 'bob', visibility: 'public' })
     assert.equal(r.status, 200, r.text)
-    assert.deepEqual(r.json.changed.sort(), ['team', 'visibility'])
-    assert.deepEqual(listTokens(h.home).map((t) => [t.owner, t.team, t.defaultVisibility]), [['alice', 'payments', 'public']])
+    assert.deepEqual(r.json.changed.sort(), ['owner', 'team', 'visibility'])
+    assert.deepEqual(listTokens(h.home).map((t) => [t.owner, t.team, t.defaultVisibility]), [['bob', 'payments', 'public']])
     const log = h.db().prepare("SELECT * FROM write_log WHERE action = 'token_update' ORDER BY id DESC LIMIT 1").get()
     assert.equal(log.outcome, 'ok')
   }, { seed: false })
@@ -70,14 +81,35 @@ test('PATCH /tokens 可改 owner/team/visibility，并写审计', async () => {
 
 test('PATCH /tokens 只给归属字段也算"有要改的字段"', async () => {
   await withHubW(async (h) => {
+    seedUsers(h.home)
     const c = await loggedIn(h)
     await c.wpost('/admin/api/tokens', { name: 'only-scope', scopes: ['read'] })
     const tokenId = listTokens(h.home).find((t) => t.name === 'only-scope').tokenId
     const r = await c.patch('/admin/api/tokens', { tokenId, owner: 'bob' })
     assert.equal(r.status, 200, r.text)
-    assert.deepEqual(r.json.changed, ['owner'])
+    assert.deepEqual(r.json.changed.sort(), ['owner', 'team'])
     const empty = await c.patch('/admin/api/tokens', { tokenId })
     assert.equal(empty.status, 400)
     assert.match(empty.json.message, /没有要修改的字段/)
+  }, { seed: false })
+})
+
+test('给一个人换团队：他名下有效令牌的团队同步跟着变（已撤销的不动，别人的不动）', async () => {
+  await withHubW(async (h) => {
+    seedUsers(h.home)
+    const c = await loggedIn(h)
+    await c.wpost('/admin/api/tokens', { name: 'alice-a', scopes: ['read'], owner: 'alice' })
+    await c.wpost('/admin/api/tokens', { name: 'alice-old', scopes: ['read'], owner: 'alice' })
+    await c.wpost('/admin/api/tokens', { name: 'bob-a', scopes: ['read'], owner: 'bob' })
+    await c.del('/admin/api/tokens?tokenId=' + listTokens(h.home).find((t) => t.name === 'alice-old').tokenId)
+    const r = await c.patch('/admin/api/users', { username: 'alice', team: 'PayTool' })
+    assert.equal(r.status, 200, r.text)
+    assert.deepEqual(
+      listTokens(h.home).map((t) => [t.name, t.team]).sort((a, b) => (a[0] < b[0] ? -1 : 1)),
+      [['alice-a', 'PayTool'], ['alice-old', 'remittance'], ['bob-a', 'payments']],
+    )
+    // 直接调 updateUser（CLI 走这条）也同步
+    updateUser(h.home, 'bob', { team: 'ops' })
+    assert.equal(listTokens(h.home).find((t) => t.name === 'bob-a').team, 'ops')
   }, { seed: false })
 })

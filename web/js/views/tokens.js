@@ -5,14 +5,41 @@ import { h } from '../dom.js'
 import { get, post, patch, del } from '../api.js'
 import { notice, table, badge, timeEl, tagChip, icon, pageHead, secHead } from '../ui.js'
 import { fmtDate, fmtNum } from '../format.js'
-import { guard, toast, errText, confirmDialog, formDialog, openModal } from '../dialogs.js'
+import { guard, toast, errText, confirmDialog, formDialog, openModal as realOpenModal } from '../dialogs.js'
+import { howtoPanel } from './token-howto.js'
 
 const SCOPE_OPTIONS = [['read', 'read · 检索 / 统计 / 待审列表 / 整理计划 / lint'], ['write', 'write · 沉淀 memory_capture'], ['tidy:apply', 'tidy:apply · 整理执行类工具（默认不对 Agent 暴露，谨慎授予）']]
 const EXPIRY_OPTIONS = [['7', '7 天'], ['30', '30 天'], ['90', '90 天'], ['365', '1 年'], ['0', '不过期']]
+const ROLE_LABEL = { member: '成员', lead: '团队管理员', admin: '超级管理员' }
+const VIS_OPTIONS = [['team', 'team（本团队可见，默认）'], ['private', 'private（只给自己）'], ['public', 'public（其它团队也能看）']]
+
+/**
+ * 令牌表单字段。超级管理员：归属人从账号下拉里选，团队跟着账号自动带出（只显示、不能改，服务端也强制）；
+ * 成员 / 团队管理员：没有归属人一栏，服务端强制为本人。
+ */
+export function tokenFields({ isAdmin, users = [], me = null, current = null }) {
+  const teamOf = (name) => users.find((u) => u.username === name)?.team
+  const owner = isAdmin
+    ? [{
+        name: 'owner', label: '归属人', type: 'select', value: current ? current.owner || '' : '',
+        options: [['', '（无主令牌：给自动化脚本用）'], ...users.map((u) => [u.username, `${u.username} · ${u.team || '无团队'} · ${ROLE_LABEL[u.role] || u.role}`])],
+        help: (v) => (v ? `团队：${teamOf(v) || '无团队'}（跟着账号自动带出，不用选）` : '无主令牌：不属于任何人，也没有团队'),
+      }]
+    : []
+  void me
+  return owner
+}
+
+/** 管理员才需要账号列表（给归属人下拉）；别的角色不请求，免得吃 403。 */
+async function userOptions(me) {
+  if (me?.role !== 'admin') return []
+  try { return (await get('users/options')).items } catch { return [] }
+}
+
 const iso = (days) => (Number(days) > 0 ? new Date(Date.now() + Number(days) * 86400e3).toISOString() : null)
 
 /** 明文令牌弹窗：持久（点背景/Esc 不会关），必须点"我已保存"；带复制按钮。 */
-export function showTokenOnce(made) {
+export function showTokenOnce(made, { openModal = realOpenModal } = {}) {
   return new Promise((resolve) => {
     const field = h('input', { type: 'text', readonly: true, value: made.token, class: 'token-plain mono', 'aria-label': '令牌明文', autocomplete: 'off' })
     const copyMsg = h('span', { class: 'sub', role: 'status' }, '')
@@ -25,7 +52,9 @@ export function showTokenOnce(made) {
         notice('warn', '仅显示一次', '这是该令牌唯一一次显示明文：关闭窗口后无法再次查看，服务器只保存哈希。请立即复制并保存到安全的地方（比如目标客户端的配置里）。'),
         h('div', { class: 'token-row' }, [field, copy]),
         copyMsg,
-        h('p', { class: 'sub' }, ['范围：', ...made.scopes.map((s) => tagChip(s)), made.expiresAt ? `  ·  过期：${fmtDate(made.expiresAt)}` : '  ·  不过期']),
+        h('p', { class: 'sub' }, [`归属：${made.owner || '（无主）'} · 团队 ${made.team || '（无）'}  ·  范围：`, ...made.scopes.map((s) => tagChip(s)), made.expiresAt ? `  ·  过期：${fmtDate(made.expiresAt)}` : '  ·  不过期']),
+        h('h3', { class: 'howto-title' }, '怎么用'),
+        howtoPanel({ token: made.token, name: made.name }),
         h('label', { class: 'check modal-field' }, [saved, h('span', null, '我已复制并保存了这个令牌')]),
       ],
       actions: [done],
@@ -43,7 +72,7 @@ export function showTokenOnce(made) {
         copyMsg.textContent = '浏览器不允许自动复制：令牌已选中，请按 Ctrl/⌘+C 手动复制'
       }
     })
-    setTimeout(() => field.select(), 0)
+    setTimeout(() => field.select?.(), 0)
   })
 }
 
@@ -56,18 +85,19 @@ export default async function render(ctx) {
   const create = h('button', { type: 'button', class: 'btn btn-primary' }, [icon('key', 'icon-sm'), '创建令牌'])
   create.addEventListener('click', guard(create, async () => {
     let made = null
+    const users = await userOptions(ctx.me)
+    const isAdmin = ctx.me?.role === 'admin'
     await formDialog({
       title: '创建 Agent 令牌', submitText: '创建',
-      intro: '每个 Agent 一枚；写入的卡会以令牌名署名。归属（owner/team）决定检索分层：先搜自己、再搜本团队、最后其它团队的公开卡。名字只能含字母数字与 . _ : @ -，且不能与未撤销的令牌重名（已撤销的名字可复用）。',
+      intro: (isAdmin ? '' : `令牌归你本人：${ctx.me?.username || ''} · 团队 ${ctx.me?.team || '无'}。`) + '每个 Agent 一枚；写入的卡会以令牌名署名。归属人决定检索分层：先搜自己、再搜本团队、最后其它团队的公开卡。名字只能含字母数字与 . _ : @ -，且不能与未撤销的令牌重名（已撤销的名字可复用）。创建后会显示接入命令。',
       fields: [
-        { name: 'name', label: '令牌名', type: 'text', required: true, maxlength: 64, placeholder: '如 claude-code-kingo' },
-        { name: 'owner', label: '归属（人）', type: 'text', maxlength: 64, placeholder: '如 kingo' },
-        { name: 'team', label: '团队', type: 'text', maxlength: 64, placeholder: '如 remittance' },
-        { name: 'visibility', label: '新卡默认可见性', type: 'select', value: 'team', options: [['team', 'team（本团队可见，默认）'], ['private', 'private（只给自己）'], ['public', 'public（其它团队也能看）']] },
+        { name: 'name', label: '令牌名', type: 'text', required: true, maxlength: 64, placeholder: '如 guoyouma-claude' },
+        ...tokenFields({ isAdmin, users, me: ctx.me }),
+        { name: 'visibility', label: '新卡默认可见性', type: 'select', value: 'team', options: VIS_OPTIONS },
         { name: 'scopes', label: '范围', type: 'checkboxes', options: SCOPE_OPTIONS, value: ['read', 'write'], required: true },
         { name: 'days', label: '有效期', type: 'select', options: EXPIRY_OPTIONS, value: '90' },
       ],
-      onSubmit: async (v) => { made = await post('tokens', { name: v.name.trim(), scopes: v.scopes, expiresAt: iso(v.days), owner: v.owner.trim(), team: v.team.trim(), visibility: v.visibility }) },
+      onSubmit: async (v) => { made = await post('tokens', { name: v.name.trim(), scopes: v.scopes, expiresAt: iso(v.days), ...(isAdmin ? { owner: v.owner } : {}), visibility: v.visibility }) },
     })
     if (made) { await showTokenOnce(made); ctx.reload() }
   }))
@@ -83,21 +113,23 @@ export default async function render(ctx) {
   const edit = (t) => {
     const b = h('button', { type: 'button', class: 'btn btn-ghost btn-sm' }, '改名 / 归属 / 过期')
     b.addEventListener('click', guard(b, async () => {
+      const isAdmin = ctx.me?.role === 'admin'
+      const users = await userOptions(ctx.me)
+      // 归属人已停用 / 不在列表里：仍把它放进下拉，免得打开表单就悄悄改掉归属
+      if (isAdmin && t.owner && !users.some((u) => u.username === t.owner)) users.push({ username: t.owner, team: t.team, role: '（账号不存在或已停用）' })
       await formDialog({
         title: `修改令牌「${t.name}」`, submitText: '保存',
         intro: '改名只影响以后的署名（已写入的卡保留旧名字）；归属与可见性改动立即生效（影响以后的检索分层与写入）。令牌明文不变。',
         fields: [
           { name: 'name', label: '令牌名', type: 'text', value: t.name, maxlength: 64, required: true },
-          { name: 'owner', label: '归属（人）', type: 'text', value: t.owner || '', maxlength: 64, placeholder: '留空 = 无主' },
-          { name: 'team', label: '团队', type: 'text', value: t.team || '', maxlength: 64, placeholder: '留空 = 无团队' },
-          { name: 'visibility', label: '新卡默认可见性', type: 'select', value: t.defaultVisibility || 'team', options: [['team', 'team（本团队可见）'], ['private', 'private（只给自己）'], ['public', 'public（其它团队也能看）']] },
+          ...tokenFields({ isAdmin, users, current: t }),
+          { name: 'visibility', label: '新卡默认可见性', type: 'select', value: t.defaultVisibility || 'team', options: VIS_OPTIONS },
           { name: 'days', label: '过期时间', type: 'select', value: 'keep', options: [['keep', t.expiresAt ? `保持不变（${fmtDate(t.expiresAt)}）` : '保持不变（不过期）'], ...EXPIRY_OPTIONS.map(([v, l]) => [v, v === '0' ? '改为不过期' : `改为从现在起 ${l}`])] },
         ],
         onSubmit: async (v) => {
           const body = { tokenId: t.tokenId }
           if (v.name.trim() !== t.name) body.name = v.name.trim()
-          if (v.owner.trim() !== (t.owner || '')) body.owner = v.owner.trim()
-          if (v.team.trim() !== (t.team || '')) body.team = v.team.trim()
+          if (isAdmin && v.owner !== (t.owner || '')) body.owner = v.owner
           if (v.visibility !== (t.defaultVisibility || 'team')) body.visibility = v.visibility
           if (v.days !== 'keep') body.expiresAt = iso(v.days)
           if (Object.keys(body).length === 1) return
@@ -115,6 +147,7 @@ export default async function render(ctx) {
     h('section', { class: 'c12' }, [secHead('A1', '明文策略'), notice('info', '不显示令牌明文与哈希', '明文只在创建时显示一次。丢了请撤销后重建。撤销立即生效。')]),
     h('section', { class: 'c12' }, [secHead('B1', '令牌列表', `${d.total} 枚`), table([
       { label: '名称', render: (t) => h('strong', null, t.name) },
+      { label: '归属', render: (t) => (t.owner ? `${t.owner} · ${t.team || '无团队'}` : '无主') },
       { label: '范围', render: (t) => h('span', { class: 'inline' }, t.scopes.map((s) => tagChip(s))) },
       { label: '状态', render: (t) => badge(label[t.status], tone[t.status]) },
       { label: '创建', render: (t) => fmtDate(t.createdAt) },

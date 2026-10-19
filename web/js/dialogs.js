@@ -139,7 +139,11 @@ export function formDialog({ title, intro, fields, submitText = '确定', danger
         return h('fieldset', { class: 'modal-field fieldset' }, [h('legend', null, f.label), h('div', { class: 'checks' }, f.options.map(([v, l], i) => h('label', { class: 'check' }, [boxes[i], h('span', null, l)]))), f.help ? h('span', { class: 'sub' }, f.help) : null])
       } else ctl = h('input', { type: f.type === 'number' ? 'number' : f.type === 'datetime' ? 'datetime-local' : f.type === 'password' ? 'password' : 'text', name: f.name, value: f.value ?? '', maxlength: f.maxlength, placeholder: f.placeholder, min: f.min, max: f.max, step: f.step, autocomplete: f.type === 'password' ? 'new-password' : 'off' })
       controls[f.name] = { el: ctl, get: () => ctl.value }
-      return h('label', { class: 'modal-field' }, [f.label, ctl, f.help ? h('span', { class: 'sub' }, f.help) : null])
+      // help 可以是函数：随当前值联动（如选归属人后显示他的团队）
+      const helpText = (v) => (typeof f.help === 'function' ? f.help(v) : f.help)
+      const help = f.help ? h('span', { class: 'sub', role: 'status' }, helpText(ctl.value) || '') : null
+      if (help && typeof f.help === 'function') ctl.addEventListener('change', () => { help.textContent = helpText(ctl.value) || '' })
+      return h('label', { class: 'modal-field' }, [f.label, ctl, help])
     })
     const submit = h('button', { type: 'submit', class: 'btn ' + (danger ? 'btn-danger' : 'btn-primary') }, submitText)
     const cancel = h('button', { type: 'button', class: 'btn btn-ghost' }, '取消')
