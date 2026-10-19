@@ -18,6 +18,34 @@ import { HttpError } from './errors.js'
 import * as Ops from './ops.js'
 import * as Settings from './settings.js'
 import { createGraphSearch } from './graph-search.js'
+import { roleAllows, isAdmin, BREAK_GLASS } from './rbac.js'
+import * as Users from './users.js'
+
+const EVERYONE = Object.freeze(['member', 'lead', 'admin'])
+const LEADS = Object.freeze(['lead', 'admin'])
+const ADMINS = Object.freeze(['admin'])
+
+/**
+ * 每个管理路由允许的角色（docs/decisions/2026-10-19-admin-multi-user-rbac.md 的权限矩阵）。
+ * 默认拒绝：路由表里的每一项都必须在这里声明，否则 createAdminHandler 启动时直接抛错。
+ * 这只是「路由级」闸门；「数据级」（成员只看可见范围、只改自己的卡）在 queries / ops 里按 principal 过滤。
+ */
+export const ADMIN_ROUTE_ROLES = Object.freeze({
+  'GET /session': EVERYONE, 'POST /logout': EVERYONE, 'POST /password': EVERYONE,
+  'GET /overview': EVERYONE, 'GET /facets': EVERYONE, 'GET /cards': EVERYONE, 'GET /card': EVERYONE,
+  'GET /graph': EVERYONE, 'POST /graph/search': EVERYONE, 'POST /graph/summarize': EVERYONE,
+  'GET /queue': EVERYONE, 'GET /tags': EVERYONE,
+  'GET /tokens': EVERYONE, 'POST /tokens': EVERYONE, 'PATCH /tokens': EVERYONE, 'DELETE /tokens': EVERYONE,
+  'PATCH /card': EVERYONE, 'DELETE /card': EVERYONE, 'POST /card/rollback': EVERYONE,
+  'POST /queue/approve': LEADS, 'POST /queue/reject': LEADS,
+  'GET /recycle': ADMINS, 'POST /card/restore': ADMINS, 'POST /card/purge': ADMINS,
+  'POST /cards/batch': ADMINS, 'POST /cards/purge': ADMINS,
+  'GET /tidy/preview': ADMINS, 'POST /tidy/apply': ADMINS, 'GET /tidy/rollbacks': ADMINS, 'POST /tidy/rollback': ADMINS,
+  'GET /tags/preview': ADMINS, 'POST /tags/rename': ADMINS, 'POST /tags/merge': ADMINS, 'POST /tags/delete': ADMINS,
+  'GET /lint': ADMINS, 'GET /activity': ADMINS, 'GET /write-log': ADMINS,
+  'GET /settings': ADMINS, 'PATCH /settings': ADMINS,
+  'GET /users': ADMINS, 'POST /users': ADMINS, 'PATCH /users': ADMINS, 'POST /users/password': ADMINS,
+})
 
 const WEB_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../web')
 /** 虽是 POST 但不修改库的接口：只读模式下放行。 */
@@ -138,7 +166,10 @@ export function createAdminHandler({ config, log, llm = null }) {
   const deps = { config, log }
   const spider = createGraphSearch({ config, log, llm })
   const routes = {
-    'GET /session': (ctx) => ({ authenticated: true, passwordSet: true, readOnly: !!config.adminReadOnly, csrfToken: ctx.session.csrfToken, expiresAt: ctx.session.expiresAt, idleTimeoutMs: SESSION_IDLE_MS }),
+    'GET /session': (ctx) => ({
+      authenticated: true, passwordSet: true, readOnly: !!config.adminReadOnly, csrfToken: ctx.session.csrfToken, expiresAt: ctx.session.expiresAt, idleTimeoutMs: SESSION_IDLE_MS,
+      user: { username: ctx.user.username, team: ctx.user.team, role: ctx.user.role, breakGlass: ctx.user.breakGlass },
+    }),
     'GET /overview': async () => {
       const act = Q.activity(root, { days: 30, silentDays: 7 })
       return Q.overview(root, { config, alerts: act.alerts.filter((a) => a.type === 'read-only' || (a.type === 'idle-token' && !a.neverUsed)) })
@@ -252,10 +283,51 @@ export function createAdminHandler({ config, log, llm = null }) {
     },
     'POST /logout': (ctx) => {
       destroySession(root, ctx.sid)
-      try { writeLog(root, { actorType: 'admin', actorName: 'admin', action: 'logout', outcome: 'ok', ip: ctx.ip }) } catch (e) { log.error('write_log 写入失败', { error: String(e?.message || e).slice(0, 200) }) }
+      try { writeLog(root, { actorType: 'admin', actorName: ctx.user.username, action: 'logout', outcome: 'ok', ip: ctx.ip }) } catch (e) { log.error('write_log 写入失败', { error: String(e?.message || e).slice(0, 200) }) }
       return { ok: true, __headers: { 'set-cookie': `${SESSION_COOKIE}=; ${cookieAttrs(ctx.req, 0)}` } }
     },
+    // ---- 用户管理（仅超级管理员）----
+    'GET /users': () => ({ items: Users.listUsers(root) }),
+    'POST /users': async (ctx) => userOp(ctx, 'user_create', async () => {
+      const b = await ctx.json()
+      const u = Users.createUser(root, { username: b?.username, team: b?.team, role: b?.role, password: b?.password })
+      return { ok: true, user: u }
+    }),
+    'PATCH /users': async (ctx) => userOp(ctx, 'user_update', async () => {
+      const b = await ctx.json()
+      if (typeof b?.username !== 'string') throw new HttpError(400, 'bad_request', '缺少 username')
+      const changed = Users.updateUser(root, b.username, { team: b.team, role: b.role }).changed
+      if (b.disabled === true) { Users.disableUser(root, b.username); changed.push('disabled') }
+      if (b.disabled === false) { Users.enableUser(root, b.username); changed.push('enabled') }
+      return { ok: true, username: Users.normalizeUsername(b.username), changed }
+    }),
+    'POST /users/password': async (ctx) => userOp(ctx, 'user_password_reset', async () => {
+      const b = await ctx.json()
+      if (typeof b?.username !== 'string') throw new HttpError(400, 'bad_request', '缺少 username')
+      Users.setUserPassword(root, b.username, b.password)
+      return { ok: true, username: Users.normalizeUsername(b.username) }
+    }),
   }
+
+  /** 用户管理操作：UserError → HTTP 状态码，写审计（不含口令）。 */
+  async function userOp(ctx, action, fn) {
+    let out
+    try { out = await fn() } catch (e) {
+      if (e instanceof Users.UserError) {
+        const status = { conflict: 409, not_found: 404 }[e.kind] || 400
+        throw new HttpError(status, e.kind, e.message)
+      }
+      throw e
+    }
+    try { writeLog(root, { actorType: 'admin', actorId: Ops.actorOf(ctx.session, ctx.ip).id, actorName: ctx.user.username, tool: `${ctx.req.method} /users`, action, outcome: 'ok', ip: ctx.ip, args: { username: out.username || out.user?.username } }) } catch (e) { log.error('write_log 写入失败', { error: String(e?.message || e).slice(0, 200) }) }
+    log.info('用户管理', { action, target: out.username || out.user?.username, actor: ctx.user.username })
+    return out
+  }
+
+  // 默认拒绝：路由表与角色表必须一一对应。漏写角色的路由不是「悄悄放开」，而是服务起不来。
+  for (const key of Object.keys(routes)) if (!ADMIN_ROUTE_ROLES[key]) throw new Error(`管理路由未声明允许的角色：${key}（请在 ADMIN_ROUTE_ROLES 里加）`)
+  for (const key of Object.keys(ADMIN_ROUTE_ROLES)) if (!routes[key]) throw new Error(`ADMIN_ROUTE_ROLES 里有不存在的路由：${key}`)
+
   const knownPaths = new Set(Object.keys(routes).map((k) => k.split(' ')[1]).concat('/login'))
 
   async function login(req, res, ip) {
@@ -266,25 +338,32 @@ export function createAdminHandler({ config, log, llm = null }) {
       log.warn('管理员登录失败过多，已限流', { ip, retryAfterSec: wait })
       throw new HttpError(429, 'too_many_attempts', `尝试次数过多，请 ${wait} 秒后再试`, { 'retry-after': String(wait) })
     }
-    if (!hasAdminPassword(root)) {
-      throw new HttpError(503, 'password_not_set', '尚未设置管理员口令：请在服务器上运行 `memory-hub admin set-password` 后再登录')
-    }
     const body = await readJson(req, MAX_LOGIN_BODY)
     const pw = body?.password
     if (typeof pw !== 'string' || pw.length < 1 || pw.length > 1024) throw new HttpError(400, 'bad_request', '需要 password 字段（字符串）')
-    const ok = await verifyPasswordAsync(pw, getAdminPasswordHash(root))
-    if (!ok) {
+    const rawName = body?.username
+    if (rawName !== undefined && (typeof rawName !== 'string' || rawName.length > 64)) throw new HttpError(400, 'bad_request', 'username 必须是不超过 64 字符的字符串')
+    const username = String(rawName ?? '').trim()
+    // 用户名留空 = 应急入口（原单管理员口令）；填了就是具名用户。
+    if (!username && !hasAdminPassword(root)) {
+      throw new HttpError(503, 'password_not_set', '尚未设置管理员口令：请在服务器上运行 `memory-hub admin set-password` 后再登录')
+    }
+    const principal = username
+      ? await Users.authenticateUser(root, username, pw)
+      : ((await verifyPasswordAsync(pw, getAdminPasswordHash(root))) ? { ...BREAK_GLASS } : null)
+    const who = username ? Users.normalizeUsername(username) : 'admin'
+    if (!principal) {
       limiter.fail(ip)
-      log.warn('管理员登录失败', { ip })
-      try { writeLog(root, { actorType: 'admin', actorName: 'admin', action: 'login', outcome: 'denied', ip }) } catch (e) { log.error('write_log 写入失败', { error: String(e?.message || e).slice(0, 200) }) }
-      throw new HttpError(401, 'invalid_credentials', '口令不正确')
+      log.warn('管理界面登录失败', { ip, user: who })
+      try { writeLog(root, { actorType: 'admin', actorName: who, action: 'login', outcome: 'denied', ip }) } catch (e) { log.error('write_log 写入失败', { error: String(e?.message || e).slice(0, 200) }) }
+      throw new HttpError(401, 'invalid_credentials', username ? '用户名或口令不正确' : '口令不正确')
     }
     limiter.reset(ip)
     cleanupSessions(root)
-    const s = createSession(root)
-    log.info('管理员登录', { ip })
-    try { writeLog(root, { actorType: 'admin', actorName: 'admin', action: 'login', outcome: 'ok', ip }) } catch (e) { log.error('write_log 写入失败', { error: String(e?.message || e).slice(0, 200) }) }
-    sendJson(req, res, 200, { ok: true, csrfToken: s.csrfToken, expiresAt: s.expiresAt }, {
+    const s = createSession(root, Date.now(), principal.id)
+    log.info('管理界面登录', { ip, user: principal.username, role: principal.role, breakGlass: !!principal.breakGlass })
+    try { writeLog(root, { actorType: 'admin', actorName: principal.username, action: 'login', outcome: 'ok', ip }) } catch (e) { log.error('write_log 写入失败', { error: String(e?.message || e).slice(0, 200) }) }
+    sendJson(req, res, 200, { ok: true, csrfToken: s.csrfToken, expiresAt: s.expiresAt, user: { username: principal.username, team: principal.team, role: principal.role, breakGlass: !!principal.breakGlass } }, {
       'set-cookie': `${SESSION_COOKIE}=${s.sid}; ${cookieAttrs(req, Math.floor(SESSION_ABSOLUTE_MS / 1000))}`,
     })
   }
@@ -317,11 +396,16 @@ export function createAdminHandler({ config, log, llm = null }) {
         if (knownPaths.has(rel)) throw new HttpError(405, 'method_not_allowed', '该接口不支持此方法')
         throw new HttpError(404, 'not_found', '接口不存在')
       }
+      const user = session.user
+      if (!roleAllows(user, ADMIN_ROUTE_ROLES[key])) {
+        log.warn('角色不足，已拒绝', { method, path: rel, user: user.username, role: user.role, ip })
+        throw new HttpError(403, 'forbidden_role', '你的角色没有这个操作的权限')
+      }
       const json = async () => {
         if (!/^application\/json\b/i.test(String(req.headers['content-type'] || ''))) throw new HttpError(415, 'unsupported_media_type', '写请求必须是 application/json')
         return readJson(req, MAX_WRITE_BODY)
       }
-      const out = await fn({ req, url, session, sid, ip, json })
+      const out = await fn({ req, url, session, sid, ip, json, user })
       const { __headers, ...payload } = out && typeof out === 'object' ? out : { value: out }
       return sendJson(req, res, 200, payload, __headers || {})
     } catch (e) {

@@ -21,6 +21,7 @@ import { createToken, revokeToken, updateToken, parseScopes, validateParty, vali
 import { verifyPasswordAsync, getAdminPasswordHash, setAdminPassword, validatePassword, AdminAuthError } from './auth.js'
 import { HttpError } from './errors.js'
 import { tsMs } from './queries.js'
+import * as Users from './users.js'
 
 const KINDS = Object.keys(KIND_ROOTS)
 export const LIMITS = Object.freeze({ title: 200, body: 200_000, tagLen: 50, tagCount: 30, reason: 500, path: 500 })
@@ -39,12 +40,20 @@ function parseTagList(raw) {
   return []
 }
 
-/** actor: { sidHash, ip }。write_log 里只留会话哈希前 12 位，足以区分会话又无法用来冒用。 */
-export const actorOf = (session, ip) => ({ id: `session:${String(session?.sidHash || '').slice(0, 12)}`, ip: ip || '' })
+/**
+ * actor: { id, name, user, ip }。write_log 里 actor_id 只留会话哈希前 12 位（足以区分会话又无法用来冒用），
+ * actor_name 记真实用户名（应急入口记 admin）。user 是 rbac 的 principal，供数据级权限判定使用。
+ */
+export const actorOf = (session, ip) => ({
+  id: `session:${String(session?.sidHash || '').slice(0, 12)}`,
+  name: session?.user?.username || 'admin',
+  user: session?.user || null,
+  ip: ip || '',
+})
 
 function audit(root, actor, log, e) {
   try {
-    writeLog(root, { actorType: 'admin', actorId: actor.id, actorName: 'admin', ip: actor.ip, outcome: 'ok', ...e })
+    writeLog(root, { actorType: 'admin', actorId: actor.id, actorName: actor.name || 'admin', ip: actor.ip, outcome: 'ok', ...e })
   } catch (err) { log.error('write_log 写入失败', { action: e.action, error: String(err?.message || err).slice(0, 200) }) }
 }
 
@@ -638,18 +647,23 @@ export async function changePassword(root, actor, input, { limiter, log }) {
     log.warn('管理员改口令：尝试过多，已限流', { ip: actor.ip, retryAfterSec: wait })
     throw new HttpError(429, 'too_many_attempts', `尝试次数过多，请 ${wait} 秒后再试`, { 'retry-after': String(wait) })
   }
-  const ok = await verifyPasswordAsync(input.oldPassword, getAdminPasswordHash(root))
+  // 具名用户改的是自己的口令；应急入口（user.breakGlass）改的是应急口令。
+  const named = actor.user && !actor.user.breakGlass
+  const ok = named
+    ? (await Users.authenticateUser(root, actor.user.username, input.oldPassword)) !== null
+    : await verifyPasswordAsync(input.oldPassword, getAdminPasswordHash(root))
   if (!ok) {
     limiter.fail(actor.ip)
-    log.warn('管理员改口令：旧口令不正确', { ip: actor.ip })
+    log.warn('改口令：旧口令不正确', { ip: actor.ip, user: actor.name })
     audit(root, actor, log, { tool: 'POST /password', action: 'password_change', outcome: 'denied' })
     throw new HttpError(401, 'invalid_credentials', '旧口令不正确')
   }
   try { validatePassword(input.newPassword) } catch (e) { if (e instanceof AdminAuthError) throw bad(e.message); throw e }
   if (input.newPassword === input.oldPassword) throw bad('新口令不能与旧口令相同')
-  setAdminPassword(root, input.newPassword) // 同时让所有会话（含当前）失效
+  if (named) Users.setUserPassword(root, actor.user.username, input.newPassword) // 踢掉该用户的全部会话
+  else setAdminPassword(root, input.newPassword) // 应急口令：同时让所有会话（含当前）失效
   limiter.reset(actor.ip)
   audit(root, actor, log, { tool: 'POST /password', action: 'password_change' })
-  log.warn('管理员口令已修改，所有会话已失效', { actor: actor.id })
-  return { ok: true, message: '口令已修改，所有会话已失效，请用新口令重新登录' }
+  log.warn(named ? '用户口令已修改，该用户的会话已失效' : '应急管理员口令已修改，所有会话已失效', { actor: actor.id, user: actor.name })
+  return { ok: true, message: named ? '口令已修改，请用新口令重新登录' : '口令已修改，所有会话已失效，请用新口令重新登录' }
 }

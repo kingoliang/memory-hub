@@ -270,7 +270,8 @@ test('日志里不出现管理员口令（成功 / 失败 / 限流 / 畸形请�
     const text = h.logs.text()
     assert.ok(!text.includes(PW), '日志含管理员口令')
     assert.ok(!text.includes(bad), '日志含失败口令')
-    assert.match(text, /管理员登录/)
+    // 多用户后日志措辞统一为「管理界面登录」，并带上登录身份（应急入口记为 admin）
+    assert.match(text, /"msg":"管理界面登录","ip":"[^"]*","user":"admin","role":"admin","breakGlass":true/)
     const dbText = JSON.stringify(getDb(h.home).prepare('SELECT * FROM write_log').all())
     assert.ok(!dbText.includes(PW) && !dbText.includes(bad), 'write_log 含口令')
   })
