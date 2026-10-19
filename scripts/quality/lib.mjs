@@ -15,7 +15,9 @@ export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '
 export const SOURCE_GLOBS = ['src/**/*.js', 'web/js/**/*.js', 'bin/*.mjs']
 
 export function gitFiles(globs = SOURCE_GLOBS) {
-  const out = execFileSync('git', ['ls-files', ...globs], { cwd: ROOT, encoding: 'utf8' })
+  // 必须用 :(glob) 魔法：普通 pathspec 里 `**` 不匹配零层目录，'src/**/*.js' 会漏掉 src/server.js、web/js/*.js 这类顶层文件，
+  // 分母悄悄缩水 —— 正是本脚本要防的那种覆盖率幻觉（2026-10-19 实测漏了 17 个生产文件）。
+  const out = execFileSync('git', ['ls-files', ...globs.map((g) => `:(glob)${g}`)], { cwd: ROOT, encoding: 'utf8' })
   return out.split('\n').map((s) => s.trim()).filter(Boolean).sort()
 }
 

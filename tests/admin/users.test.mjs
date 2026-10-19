@@ -92,3 +92,23 @@ test('改角色 / 团队 / 口令：会话里的身份随之更新；改口令�
     assert.deepEqual(listUsers(home).map((x) => [x.username, x.disabled]), [['alice', false]])
   })
 })
+
+test('CLI user create/list/set-role/disable：口令只从 stdin 读，命令行带口令直接拒绝', async () => {
+  const { spawnSync } = await import('node:child_process')
+  const path = await import('node:path')
+  const { fileURLToPath } = await import('node:url')
+  const CLI = path.join(path.dirname(fileURLToPath(import.meta.url)), '../../bin/memory-hub.mjs')
+  await withRoot(async (home) => {
+    const env = { PATH: process.env.PATH, MEMORY_HUB_HOME: home }
+    const run = (args, input) => spawnSync(process.execPath, [CLI, ...args], { input, encoding: 'utf8', env, timeout: 30000 })
+    const made = run(['user', 'create', '--username', 'Alice', '--team', 'remittance', '--role', 'lead'], 'alice-strong-pass-1\n')
+    assert.equal(made.status, 0, made.stderr)
+    assert.equal(made.stdout, '已创建：alice（团队 remittance，角色 lead）\n')
+    assert.equal(run(['user', 'create', '--username', 'bob', '--password', 'x'], '').status, 1)
+    assert.equal(run(['user', 'set-role', 'alice', 'member']).stdout, 'alice：已修改\n')
+    assert.equal(run(['user', 'disable', 'alice']).stdout, 'alice：已停用并踢下线\n')
+    const list = JSON.parse(run(['user', 'list', '--json']).stdout)
+    assert.deepEqual(list.map((u) => [u.username, u.team, u.role, u.disabled]), [['alice', 'remittance', 'member', true]])
+    assert.equal(JSON.stringify(list).includes('alice-strong-pass-1'), false)
+  })
+})

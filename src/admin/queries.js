@@ -11,7 +11,7 @@ import path from 'node:path'
 import { getDb, checkMainStoreInvariant, DB_FILENAME } from '../core/db.js'
 import { queryTerms, TITLE_COLLATOR, RECYCLE_RETENTION_DAYS } from '../core/vault.js'
 import { VISIBILITIES as SCOPE_VISIBILITIES } from '../core/scope.js'
-import { canSeeCard, isAdmin, canManageToken } from './rbac.js'
+import { canSeeCard, canEditCard, canModerateCard, isAdmin, canManageToken } from './rbac.js'
 
 /**
  * 数据级过滤：查看者看不见的行一律剔除。user 缺省（老调用方 / 单测直调）按超级管理员处理，行为与多用户之前完全一致。
@@ -265,6 +265,9 @@ export function cardDetail(root, cardPath, { user } = {}) {
     retention,
     redacted: types.size > 0,
     secretTypes: [...types],
+    owner: row.owner || '', team: row.team || '', visibility: row.visibility || '',
+    // 当前查看者对这张卡能做什么（界面据此显示按钮；真正的拦截仍在写接口）。user 缺省 = 超级管理员。
+    can: user ? { edit: canEditCard(user, row), moderate: canModerateCard(user, row), purge: isAdmin(user) } : { edit: true, moderate: true, purge: true },
     updates, revisions, history, writes,
   }
 }

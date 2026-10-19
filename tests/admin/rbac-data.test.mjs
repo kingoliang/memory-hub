@@ -187,3 +187,13 @@ test('团队管理员换了团队后，不能审批自己留在旧团队的待�
     assert.equal(getDb(h.home).prepare('SELECT status FROM quarantine WHERE path = ?').get(r.path).status, 'pending')
   }, { seed: false })
 })
+
+test('GET /card 下发 can：自己的卡可改、别人的团队卡不可改、成员不能审批', async () => {
+  await withAdminHub(async (h) => {
+    const p = await seed(h.home)
+    const mia = await as(h, 'mia')
+    const can = async (path) => (await mia.get('/admin/api/card?path=' + encodeURIComponent(path))).json.can
+    assert.deepEqual(await can(p.miaPrivate), { edit: true, moderate: false, purge: false })
+    assert.deepEqual(await can(p.bobTeam), { edit: false, moderate: false, purge: false })
+  }, { seed: false })
+})

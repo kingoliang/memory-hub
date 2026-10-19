@@ -17,6 +17,7 @@ import { createToken, importLegacyToken, listTokens, revokeToken, TokenError } f
 import fs from 'node:fs'
 import { backupDb, closeAllDb } from '../src/core/db.js'
 import { setAdminPassword, AdminAuthError, MIN_PASSWORD_LENGTH } from '../src/admin/auth.js'
+import { createUser, listUsers, updateUser, setUserPassword, disableUser, enableUser, UserError } from '../src/admin/users.js'
 
 const argv = process.argv.slice(2)
 const opt = (name) => { const i = argv.indexOf('--' + name); return i >= 0 ? argv[i + 1] : undefined }
@@ -74,7 +75,12 @@ function usage() {
   memory-hub migrate verify --source <旧库或快照(目录或.db)> --target <新库> [--allow-target-extra] [--json]
   memory-hub migrate reverse --from <新库> --target <旧库> [--execute] [--prune-purged] [--export <文件.json>]
   memory-hub backup now
-  memory-hub admin set-password          （口令从 stdin 读取；终端交互输入两次，不回显）
+  memory-hub admin set-password          （应急入口口令；从 stdin 读取，终端交互输入两次，不回显）
+  memory-hub user create --username <名> --team <团队> --role member|lead|admin   （口令从 stdin 读取）
+  memory-hub user list [--json]
+  memory-hub user set-role <名> member|lead|admin  |  user set-team <名> <团队>
+  memory-hub user set-password <名>      （从 stdin 读取）
+  memory-hub user disable <名>  |  user enable <名>
 环境变量：MEMORY_HUB_HOME MEMORY_HUB_DB MEMORY_HUB_HOST MEMORY_HUB_PORT MEMORY_HUB_BASE_PATH MEMORY_HUB_ALLOW_REMOTE
   MEMORY_HUB_ALLOWED_ORIGINS MEMORY_HUB_ALLOWED_HOSTS MEMORY_HUB_TRUST_PROXY MEMORY_HUB_MCP_EXPOSE_TIDY_APPLY MEMORY_HUB_AGENT
   MEMORY_LLM_BASE_URL MEMORY_LLM_MODEL MEMORY_LLM_KEY
@@ -189,6 +195,38 @@ async function main() {
     return 0
   }
 
+  if (cmd === 'user') {
+    // 管理界面账号（docs/decisions/2026-10-19-admin-multi-user-rbac.md）。口令一律从 stdin 读，不经命令行参数。
+    if (sub === 'create') {
+      if (argv.includes('--password')) throw new UserError('口令不能通过命令行参数传入：从 stdin 读取')
+      const pw = await readPassword()
+      const u = createUser(config.dbRoot, { username: opt('username'), team: opt('team') || '', role: opt('role') || 'member', password: pw })
+      log.info('管理界面账号已创建', { username: u.username, team: u.team, role: u.role })
+      process.stdout.write(`已创建：${u.username}（团队 ${u.team || '-'}，角色 ${u.role}）\n`)
+      return 0
+    }
+    if (sub === 'list') {
+      const rows = listUsers(config.dbRoot)
+      if (flag('json')) { process.stdout.write(JSON.stringify(rows, null, 2) + '\n'); return 0 }
+      if (!rows.length) { process.stdout.write('（没有账号）\n'); return 0 }
+      for (const u of rows) process.stdout.write(`${u.username}\t${u.team || '-'}\t${u.role}\t${u.disabled ? '已停用' : '正常'}\t最近登录 ${u.lastLoginAt || '-'}\n`)
+      return 0
+    }
+    const target = argv[2]
+    if (!target) throw new UserError('缺少用户名')
+    if (sub === 'set-role') { const r = updateUser(config.dbRoot, target, { role: argv[3] }); process.stdout.write(`${r.username}：${r.changed.length ? '已修改' : '无变化'}\n`); return 0 }
+    if (sub === 'set-team') { const r = updateUser(config.dbRoot, target, { team: argv[3] ?? '' }); process.stdout.write(`${r.username}：${r.changed.length ? '已修改' : '无变化'}\n`); return 0 }
+    if (sub === 'set-password') {
+      if (argv.length > 3) throw new UserError('口令不能通过命令行参数传入：从 stdin 读取')
+      setUserPassword(config.dbRoot, target, await readPassword())
+      process.stdout.write(`${target}：口令已重置，该用户的会话已全部失效\n`)
+      return 0
+    }
+    if (sub === 'disable') { disableUser(config.dbRoot, target); process.stdout.write(`${target}：已停用并踢下线\n`); return 0 }
+    if (sub === 'enable') { enableUser(config.dbRoot, target); process.stdout.write(`${target}：已启用\n`); return 0 }
+    usage(); return 1
+  }
+
   if (cmd === 'admin' && sub === 'set-password') {
     if (argv.length > 2) throw new AdminAuthError('口令不能通过命令行参数传入：请直接运行 `memory-hub admin set-password`（从 stdin 读取）')
     const pw = await readPassword()
@@ -202,7 +240,7 @@ async function main() {
 }
 
 main().then((code) => { if (code !== null) { closeAllDb(); process.exit(code) } }).catch((e) => {
-  const known = e instanceof ConfigError || e instanceof TokenError || e instanceof AdminAuthError
+  const known = e instanceof ConfigError || e instanceof TokenError || e instanceof AdminAuthError || e instanceof UserError
   bootLog.error(known ? e.message : '未预期的错误', known ? undefined : { error: String(e?.stack || e).slice(0, 800) })
   process.exit(1)
 })

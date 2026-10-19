@@ -7,13 +7,17 @@ import { icon, loading, errorBlock } from './js/ui.js'
 import { fmtNum } from './js/format.js'
 import { getTheme, setTheme, nextTheme, THEME_LABEL, THEME_ICON } from './js/theme.js'
 
-// [路由键, 文字, 图标]。待审 / 回收站的数量徽标由 refreshBadges() 按路由键填充。
+// [路由键, 文字, 图标, 最低角色]。待审 / 回收站的数量徽标由 refreshBadges() 按路由键填充。
+// 最低角色只用于裁剪导航（体验）；真正的权限在服务端（ADMIN_ROUTE_ROLES + 数据级过滤），这里漏了也不会越权。
 const NAV = [
-  { group: '概览', items: [['overview', '总览', 'overview']] },
-  { group: '记忆', items: [['cards', '卡片', 'cards'], ['queue', '待审队列', 'queue'], ['recycle', '回收站', 'trash'], ['tags', '标签', 'tag'], ['graph', '图谱', 'graph']] },
-  { group: '维护', items: [['tidy', '整理中心', 'broom'], ['lint', '健康报告', 'heart'], ['account', '账户', 'lock'], ['settings', '设置', 'sliders']] },
-  { group: '观测', items: [['activity', '沉淀活跃度', 'pulse'], ['tokens', '令牌', 'key'], ['audit', '审计日志', 'log']] },
+  { group: '概览', items: [['overview', '总览', 'overview', 'member']] },
+  { group: '记忆', items: [['cards', '卡片', 'cards', 'member'], ['queue', '待审队列', 'queue', 'member'], ['recycle', '回收站', 'trash', 'admin'], ['tags', '标签', 'tag', 'member'], ['graph', '图谱', 'graph', 'member']] },
+  { group: '维护', items: [['tidy', '整理中心', 'broom', 'admin'], ['lint', '健康报告', 'heart', 'admin'], ['account', '账户', 'lock', 'member'], ['settings', '设置', 'sliders', 'admin']] },
+  { group: '观测', items: [['activity', '沉淀活跃度', 'pulse', 'admin'], ['tokens', '令牌', 'key', 'member'], ['audit', '审计日志', 'log', 'admin'], ['users', '用户', 'user', 'admin']] },
 ]
+const ROLE_RANK = { member: 0, lead: 1, admin: 2 }
+const roleAtLeast = (role, min) => (ROLE_RANK[role] ?? 0) >= (ROLE_RANK[min] ?? 2)
+const ROLE_LABEL = { member: '成员', lead: '团队管理员', admin: '超级管理员' }
 const GROUP_OF = Object.fromEntries(NAV.flatMap((g) => g.items.map(([k]) => [k, g.group])))
 GROUP_OF.card = '记忆'
 const LABEL_OF = Object.fromEntries(NAV.flatMap((g) => g.items.map(([k, l]) => [k, l])))
@@ -23,11 +27,14 @@ const VIEWS = {
   queue: () => import('./js/views/queue.js'), recycle: () => import('./js/views/recycle.js'), tags: () => import('./js/views/tags.js'), graph: () => import('./js/views/graph.js'),
   tidy: () => import('./js/views/tidy.js'), lint: () => import('./js/views/lint.js'), activity: () => import('./js/views/activity.js'),
   tokens: () => import('./js/views/tokens.js'), audit: () => import('./js/views/audit.js'), account: () => import('./js/views/account.js'), settings: () => import('./js/views/settings.js'),
+  users: () => import('./js/views/users.js'),
 }
 
 const root = document.getElementById('app')
 let shell = null
 let readOnly = false
+/** 当前登录身份（来自 GET /session）：{ username, team, role, breakGlass } */
+let me = { username: '', team: '', role: 'member', breakGlass: false }
 let navBadges = {}
 let renderToken = 0
 
@@ -66,7 +73,8 @@ function buildShell() {
     else if (sidebar.contains(document.activeElement)) menu.focus()
   }
   let navNo = 0 // 导航编号：01、02… 贯穿所有分组
-  const nav = h('nav', { class: 'nav', 'aria-label': '主导航' }, NAV.map((g) => h('div', { class: 'nav-group' }, [
+  const visibleNav = NAV.map((g) => ({ ...g, items: g.items.filter(([, , , min]) => roleAtLeast(me.role, min)) })).filter((g) => g.items.length)
+  const nav = h('nav', { class: 'nav', 'aria-label': '主导航' }, visibleNav.map((g) => h('div', { class: 'nav-group' }, [
     h('div', { class: 'nav-title' }, g.group),
     ...g.items.map(([key, label, ic]) => {
       const b = h('span', { class: 'nav-badge', hidden: true })
@@ -102,7 +110,10 @@ function buildShell() {
   const sidebar = h('aside', { class: 'sidebar', id: 'sidebar' }, [
     h('a', { class: 'brand', href: '#/overview', on: { click: () => setNav(false) } }, [h('span', { class: 'brand-mark', 'aria-hidden': 'true' }, 'M'), h('div', null, [h('strong', null, '记忆中枢'), h('span', null, 'Memory Hub')])]),
     nav,
-    h('div', { class: 'sidebar-foot' }, [h('span', { class: readOnly ? 'chip-ro' : 'chip-rw', title: readOnly ? '服务端已禁用所有写操作（MEMORY_HUB_ADMIN_READONLY=1）' : '' }, readOnly ? '只读模式' : '管理模式')]),
+    h('div', { class: 'sidebar-foot' }, [
+      h('span', { class: 'whoami', title: me.breakGlass ? '应急入口登录（原管理员口令）' : `团队 ${me.team || '-'}` }, [icon('user', 'icon-sm'), me.username, h('em', null, ` · ${ROLE_LABEL[me.role] || me.role}${me.breakGlass ? '（应急）' : ''}`)]),
+      h('span', { class: readOnly ? 'chip-ro' : 'chip-rw', title: readOnly ? '服务端已禁用所有写操作（MEMORY_HUB_ADMIN_READONLY=1）' : '' }, readOnly ? '只读模式' : (me.role === 'admin' ? '管理模式' : '成员模式')),
+    ]),
   ])
   const el = h('div', { class: 'shell' }, [
     skip,
@@ -116,7 +127,9 @@ function buildShell() {
 async function renderRoute() {
   if (!shell) return
   const { name, params } = parseHash()
-  const key = VIEWS[name] ? name : 'overview'
+  // 没有导航入口的页面（角色不够）一律回总览：服务端也会 403，这里只是别让人看到一个报错页
+  const allowed = name === 'card' || NAV.some((g) => g.items.some(([k, , , min]) => k === name && roleAtLeast(me.role, min)))
+  const key = VIEWS[name] && allowed ? name : 'overview'
   const my = ++renderToken
   for (const [k, a] of Object.entries(shell.links)) {
     const active = k === key || (key === 'card' && k === 'cards')
@@ -127,7 +140,7 @@ async function renderRoute() {
   mount(shell.view, loading())
   try {
     const mod = await VIEWS[key]()
-    const ctx = { params, go, reload: () => renderRoute(), setTitle: (t) => { shell.crumbTitle.textContent = t; document.title = `${t} · 记忆中枢` } }
+    const ctx = { params, go, me, reload: () => renderRoute(), setTitle: (t) => { shell.crumbTitle.textContent = t; document.title = `${t} · 记忆中枢` } }
     const node = await mod.default(ctx)
     if (my !== renderToken) return
     mount(shell.view, node)
@@ -157,6 +170,7 @@ async function start() {
     const s = await api.get('session')
     api.setCsrf(s.csrfToken)
     readOnly = !!s.readOnly
+    me = s.user || me
   } catch (e) {
     if (e.status === 401) return showLogin({ passwordSet: e.extra?.passwordSet !== false })
     root.className = ''

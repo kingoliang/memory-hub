@@ -137,7 +137,7 @@ export function formDialog({ title, intro, fields, submitText = '确定', danger
         const boxes = f.options.map(([v, l]) => h('input', { type: 'checkbox', value: v, checked: (f.value || []).includes(v), 'aria-label': l }))
         controls[f.name] = { boxes, get: () => boxes.filter((b) => b.checked).map((b) => b.value) }
         return h('fieldset', { class: 'modal-field fieldset' }, [h('legend', null, f.label), h('div', { class: 'checks' }, f.options.map(([v, l], i) => h('label', { class: 'check' }, [boxes[i], h('span', null, l)]))), f.help ? h('span', { class: 'sub' }, f.help) : null])
-      } else ctl = h('input', { type: f.type === 'number' ? 'number' : f.type === 'datetime' ? 'datetime-local' : 'text', name: f.name, value: f.value ?? '', maxlength: f.maxlength, placeholder: f.placeholder, min: f.min, max: f.max, step: f.step, autocomplete: 'off' })
+      } else ctl = h('input', { type: f.type === 'number' ? 'number' : f.type === 'datetime' ? 'datetime-local' : f.type === 'password' ? 'password' : 'text', name: f.name, value: f.value ?? '', maxlength: f.maxlength, placeholder: f.placeholder, min: f.min, max: f.max, step: f.step, autocomplete: f.type === 'password' ? 'new-password' : 'off' })
       controls[f.name] = { el: ctl, get: () => ctl.value }
       return h('label', { class: 'modal-field' }, [f.label, ctl, f.help ? h('span', { class: 'sub' }, f.help) : null])
     })

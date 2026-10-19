@@ -97,9 +97,11 @@ export function renderCardDetail(card, ctx = {}) {
   if (ctx.reload || ctx.go) editBtn.addEventListener('click', startEdit); else editBtn.disabled = true
 
   // ---- 状态操作 ----
+  // 按钮按服务端下发的 can 显示（老接口没有 can 字段时按全部允许，保持原行为）
+  const can = card.can || { edit: true, moderate: true, purge: true }
   const actions = []
-  if (card.status !== 'deleted') actions.push(editBtn)
-  if (card.status === 'pending' || card.status === 'rejected') {
+  if (card.status !== 'deleted' && can.edit) actions.push(editBtn)
+  if ((card.status === 'pending' || card.status === 'rejected') && can.moderate) {
     actions.push(actionButton('批准', 'btn-primary', async () => {
       if (!(await confirmDialog({ title: '批准这张卡？', message: '批准后卡片进入记忆库，其他 Agent 可以通过 memory_recall 检索到它。', confirmText: '批准' }))) return
       try { await post('queue/approve', { paths: [card.path] }); done('已批准，卡片已进入记忆库') } catch (e) { failed(e) }
@@ -115,11 +117,11 @@ export function renderCardDetail(card, ctx = {}) {
     }
   }
   if (card.status !== 'deleted') {
-    actions.push(actionButton('软删', 'btn-danger-ghost', async () => {
+    if (can.edit) actions.push(actionButton('软删', 'btn-danger-ghost', async () => {
       if (!(await confirmDialog({ title: '把这张卡移入回收站？', message: `「${card.title}」将不再被检索到，${card.retention?.days ?? 30} 天内可以在回收站恢复，之后自动永久清除。`, confirmText: '移入回收站', danger: true }))) return
       try { await del('card', { path: card.path }); done('已移入回收站') } catch (e) { failed(e) }
     }, ctx))
-  } else {
+  } else if (can.purge) {
     actions.push(actionButton('恢复', 'btn-primary', async () => {
       try { await post('card/restore', { path: card.path }); done('已恢复到记忆库') } catch (e) { failed(e) }
     }, ctx))
@@ -170,7 +172,7 @@ export function renderCardDetail(card, ctx = {}) {
       h('summary', null, [h('strong', null, r.title || '（无标题）'), ` · ${r.editedBy || '—'} · ${fmtDate(r.editedAt)}`]),
       h('div', { class: 'rev-meta' }, [kindBadge(r.kind), ...(r.tags || []).map((t) => tagChip(t))]),
       h('pre', { class: 'raw' }, r.body || ''),
-      card.status !== 'deleted' && r.id !== undefined ? h('div', { class: 'rev-actions' }, rollbackBtn(r)) : null,
+      card.status !== 'deleted' && can.edit && r.id !== undefined ? h('div', { class: 'rev-actions' }, rollbackBtn(r)) : null,
     ]))), { sub: '每次保存前的旧版本；回滚本身也会留下一个版本' }) : null,
     card.history?.length ? panel('状态流转', h('ol', { class: 'timeline' }, card.history.map((x) => h('li', null, [h('time', null, fmtDate(x.createdAt)), h('p', null, [statusLabel(x.oldStatus), ' → ', statusLabel(x.newStatus), ` · ${x.changedBy || '—'}`, x.reason ? ` · ${x.reason}` : ''])])))) : null,
     card.writes?.length ? panel('写入审计', h('ol', { class: 'timeline' }, card.writes.map((w) => h('li', null, [h('time', null, fmtDate(w.ts)), h('p', null, `${w.actorName || w.actorType} · ${w.tool || '—'} · ${w.action} · ${w.outcome}`)])))) : null,

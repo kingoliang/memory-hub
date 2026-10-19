@@ -28,7 +28,10 @@ export default async function render(ctx) {
   const kinds = Object.entries(o.cards.byKind).sort((a, b) => b[1] - a[1])
   const maxKind = Math.max(1, ...kinds.map((k) => k[1]))
   const maxAgent = Math.max(1, ...o.agents.map((a) => a.cards))
-  const last = o.vault.lastBackup
+  // 非超级管理员：服务端不下发库大小 / 备份 / 全站写日志（vault=null），回收站、审计也没有入口
+  const isAdmin = (ctx.me?.role || 'admin') === 'admin'
+  const vault = o.vault
+  const last = vault?.lastBackup
   const pending = o.quarantine.pending
 
   // ① 行动区（A1 待审大数字 + A2 提醒）：有待审时给出显眼入口；一切正常时只给一行安心的状态
@@ -62,7 +65,7 @@ export default async function render(ctx) {
     h('span', { class: 'metric-value' }, unit ? [value, h('small', null, ` ${unit}`)] : value),
     hint ? h('span', { class: 'metric-hint' }, hint) : null,
   ])
-  const size = fmtBytes(o.vault.dbBytes).split(' ')
+  const size = vault ? fmtBytes(vault.dbBytes).split(' ') : ['—']
   const bytesParts = size.length === 2 ? size : [size[0], '']
 
   // ③ 近 30 天新增：柱状列（高度走 CSSOM 变量）
@@ -70,16 +73,16 @@ export default async function render(ctx) {
   const cols = h('div', { class: 'cols', role: 'img', 'aria-label': `近 30 天每日新增卡片柱状图，峰值 ${dailyMax}` }, o.daily.map((d) => h('i', { class: d.count ? '' : 'zero', title: `${d.date}：${d.count}`, css: { '--h': Math.round((d.count / dailyMax) * 100) + '%' } })))
 
   return h('div', { class: 'page overview' }, [
-    pageHead('01', 'Overview', '总览', '先看有没有要处理的事，再看规模与近期活动。'),
+    pageHead('01', 'Overview', '总览', isAdmin ? '先看有没有要处理的事，再看规模与近期活动。' : '你能看到的范围：自己的全部卡片 + 本团队的团队卡 + 其它团队公开的卡。'),
     pending
       ? h('section', { class: 'ov-a', 'aria-label': '待办' }, [pendingBlock, o.alerts.length ? alertList(o.alerts) : null])
       : h('section', { class: 'ov-a ov-a-compact', 'aria-label': '待办' }, [calmBlock, o.alerts.length ? alertList(o.alerts) : null]),
     h('section', { class: 'metrics', 'aria-label': '规模' }, [
       metric('B1', '卡片总数', fmtNum(o.cards.total), { hint: `近 7 天新增 ${fmtNum(o.cards.recent7d)}`, href: '#/cards' }),
-      metric('B2', '回收站', fmtNum(o.quarantine.deleted), { hint: '保留 30 天后清除', href: '#/recycle' }),
+      isAdmin ? metric('B2', '回收站', fmtNum(o.quarantine.deleted), { hint: '保留 30 天后清除', href: '#/recycle' }) : null,
       metric('B3', '标签', fmtNum(o.cards.tags), { hint: '去重后的种类', href: '#/tags' }),
-      metric('B4', '库大小', bytesParts[0], { unit: bytesParts[1], hint: o.vault.walBytes ? `WAL ${fmtBytes(o.vault.walBytes)}` : '无 WAL 积压' }),
-      metric('B5', '备份', last ? relTime(last.at) : '暂无', { tone: last ? '' : 'tone-warn', hint: last ? `${fmtBytes(last.bytes)} · 共 ${o.vault.backupCount} 份` : '服务运行后自动备份' }),
+      vault ? metric('B4', '库大小', bytesParts[0], { unit: bytesParts[1], hint: vault.walBytes ? `WAL ${fmtBytes(vault.walBytes)}` : '无 WAL 积压' }) : null,
+      vault ? metric('B5', '备份', last ? relTime(last.at) : '暂无', { tone: last ? '' : 'tone-warn', hint: last ? `${fmtBytes(last.bytes)} · 共 ${vault.backupCount} 份` : '服务运行后自动备份' }) : null,
     ]),
     h('section', { class: 'ov-cols' }, [
       h('div', null, [
@@ -98,7 +101,7 @@ export default async function render(ctx) {
         o.agents.length ? h('div', { class: 'bars' }, o.agents.slice(0, 10).map((a) => barRow(a.name, a.cards, maxAgent, { href: a.name === '(未署名)' ? '#/cards?agent=__none__' : `#/cards?agent=${encodeURIComponent(a.name)}` }))) : empty('没有署名数据'),
       ]),
     ]),
-    panel('最近写入记录', table([
+    !isAdmin ? null : panel('最近写入记录', table([
       { label: '时间', render: (r) => timeEl(r.ts) },
       { label: '谁', render: (r) => r.actorName || r.actorType },
       { label: '动作', render: (r) => h('span', { class: 'mono-text' }, `${r.tool || '—'} · ${r.action}`) },

@@ -1116,3 +1116,8 @@ label.set-chip { flex-direction: row; font-size: 13px; letter-spacing: 0; text-t
 .set-seg label:has(input:checked) { color: var(--bg); }
 label.set-opt strong { font-size: var(--fs-base); }
 .set-form { display: grid; gap: 20px; }
+
+/* 侧栏底部：当前登录身份（多用户） */
+.sidebar-foot { display: flex; flex-direction: column; gap: 6px; align-items: flex-start; }
+.whoami { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; color: var(--text, inherit); max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.whoami em { font-style: normal; color: var(--muted, #888); }
