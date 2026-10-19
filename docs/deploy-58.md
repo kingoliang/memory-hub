@@ -2,7 +2,7 @@
 
 日期：2026-10-15。依据 `PLAN.md` 6.3.1 / 6.3.3 / 7（M4）/ 9。本文所有"实测"均来自 2026-10-15 在 58 上的真实命令输出；**正式切换已于 2026-10-15 执行，见第 13 节「切换记录」**；切换前的状态：旧服务（`memory-mcp-http.service`，7990）、nginx、DSH 及其插件、两台机器的客户端配置均未被改动。
 
-> 约定：命令里的 `<...>` 是占位（示例），不是真实值。本文不含任何口令 / 令牌 / 密钥。58 的 tailnet 名 `astra-ai-server-02.tail5357dc.ts.net` 与 IP `100.113.34.77` 沿用 PLAN 1.9 已有写法。
+> 约定：命令里的 `<...>` 是占位（示例），不是真实值。本文不含任何口令 / 令牌 / 密钥。58 的 tailnet 名 `<server>.<tailnet>.ts.net` 与 IP `<server-tailnet-ip>` 沿用 PLAN 1.9 已有写法。
 
 ## 0. 现状一句话
 
@@ -15,12 +15,12 @@
 
 | 项 | 实测结果 |
 |---|---|
-| 主机 | `astra-ai-server-02`，Ubuntu（内核 6.8.0-53），x86_64；根盘 879G，剩 184G（79%） |
+| 主机 | `<server>`，Ubuntu（内核 6.8.0-53），x86_64；根盘 879G，剩 184G（79%） |
 | node | `~/.local/bin/node` = **v25.6.1**（`~/.local/lib/node-v25.6.1-linux-x64`）。≥22.16 ✔，`node:sqlite` 与 `sqlite.backup` 可用 ✔。**非交互 ssh 的 PATH 里没有 node**，脚本里都显式 `export PATH=$HOME/.local/bin:$PATH` |
 | npm / 联网装依赖 | npm 11.9.0；registry `https://registry.npmjs.org/` 可达（`npm view zod@4.6.7` 返回 4.6.7；`npm ci --omit=dev` 5 秒装好 6 个包）。运行时依赖仅 `@modelcontextprotocol/server`、`@modelcontextprotocol/node`、`zod`，无需本机打包 |
 | systemd --user | 可用：`systemctl --user is-system-running` = running；`loginctl show-user`：**Linger=yes**（用户退出登录后服务仍运行）；`XDG_RUNTIME_DIR=/run/user/1001` |
 | 端口 | 7991、7992 空闲（部署前核对）；占用情况：7990 旧 MCP（pid 随时间变化）、7999/8000 旧面板（DSH 子进程）、8787 / 8504 / 19387 / 19390 等为其它服务。80/443 为 nginx |
-| nginx | 1.24.0；`/etc/nginx/sites-enabled/dsh-piweb` → `sites-available/dsh-piweb`。`server{listen 80 default_server; server_name _;}`：`location = /dsh-ca.crt`、`location ^~ /memory/`（→ `127.0.0.1:7990`）、`location /`（→ DSH）。`server{listen 443 ssl http2 default_server; server_name _;}`：`location = /piweb`、`^~ /piweb/`（→ 8504）、`= /memory`、`^~ /memory/`（→ 7990）、`/`（→ `100.113.34.77:3080`）。只读查看，未改 |
+| nginx | 1.24.0；`/etc/nginx/sites-enabled/dsh-piweb` → `sites-available/dsh-piweb`。`server{listen 80 default_server; server_name _;}`：`location = /dsh-ca.crt`、`location ^~ /memory/`（→ `127.0.0.1:7990`）、`location /`（→ DSH）。`server{listen 443 ssl http2 default_server; server_name _;}`：`location = /piweb`、`^~ /piweb/`（→ 8504）、`= /memory`、`^~ /memory/`（→ 7990）、`/`（→ `<server-tailnet-ip>:3080`）。只读查看，未改 |
 | 旧服务 | `memory-mcp-http.service` active（since 10-14 11:13 UTC，NRestarts=0，内存约 72MB），`~/.config/systemd/user/memory-mcp-http.service`，`ExecStart=%h/.local/bin/node %h/.dsh/memory-mcp-http/server.mjs`，`Restart=always`；日志仅 `[memory-mcp] <ip> mcp-http:claude-code/…` 行。**鉴权方式：令牌文件 `~/.dsh/memory-mcp-http/token`（明文，≥32 字符，原样作为 Bearer）** → 见 `token import-hash` |
 | 旧库 | `~/.dsh/memory-vault/memory-eternal.db`（WAL）≈5.8MB；快照时 cards=662（kind 分布 business 4 / content 72 / knowledge 78 / mistake 33 / project 404 / prompt 25 / tool 46），quarantine：deleted 253、pending 13（此后线上继续有新待审卡，切换当天重新取基线），`card_sequence.seq`=2101，`user_version`=0。旧插件自带每日备份在 `~/.dsh/memory-vault/backups/` |
 | 蒸馏（DSH 现有配置） | `cordis.patch.yml` 的 `llm-deepseek` 条目（`@deepseek-ai/dsh-llm-deepseek-api-key`）有 `baseURL: <LLM 网关地址>`（**不是** `api.deepseek.com`；具体地址见 58 上该文件第 11 行附近）；密钥引用名 `DEEPSEEK_API_KEY`，值在 `~/.dsh/.credentials.yaml` 的 `refs` 下。模型 `deepseek-v4.1-flash` |
@@ -38,7 +38,7 @@
 | `~/.config/systemd/user/memory-hub-staging.service` | staging unit（第 3 节）；切换准备后还有 `memory-hub.service` | — |
 | 临时 | `/tmp/memory-hub-*`（用后清理） | — |
 
-重新部署代码：在本机仓库（工作区须干净）运行 `scripts/deploy-remote.sh kingo.liang@100.120.90.58`，然后 `systemctl --user restart <unit>`。
+重新部署代码：在本机仓库（工作区须干净）运行 `scripts/deploy-remote.sh <user>@<server-ip>`，然后 `systemctl --user restart <unit>`。
 
 查看日志：`journalctl --user -u memory-hub-staging.service -f`（JSON 行；不含口令/令牌/密钥）。
 
@@ -106,7 +106,7 @@ WantedBy=default.target
 新服务以 `MEMORY_HUB_BASE_PATH=/memory` 监听 `127.0.0.1:7990`，就直接是这个反代的后端：`/memory/mcp`、`/memory/healthz`、`/memory/admin/`。需要配合的服务端设置（已写进 `prod.env`，见第 5 节）：
 
 - `MEMORY_HUB_TRUST_PROXY=1`：按 `X-Forwarded-For` 区分来源（否则同机反代下所有客户端共用一个失败限流桶）、按 `X-Forwarded-Proto` 判断是否 https（决定 cookie 的 `Secure`）。
-- `MEMORY_HUB_ALLOWED_HOSTS`：`Host: $host` 会把客户端访问用的主机名带过来，**不在白名单的 Host 一律 403**。默认值含 `astra-ai-server-02.tail5357dc.ts.net`、`astra-ai-server-02`、`100.113.34.77`。实测：白名单外 → 403，白名单内 → 200。
+- `MEMORY_HUB_ALLOWED_HOSTS`：`Host: $host` 会把客户端访问用的主机名带过来，**不在白名单的 Host 一律 403**。默认值含 `<server>.<tailnet>.ts.net`、`<server>`、`<server-tailnet-ip>`。实测：白名单外 → 403，白名单内 → 200。
 - `MEMORY_HUB_ALLOWED_ORIGINS`：管理界面登录/写操作的 Origin 白名单（http/https × 上述主机名）。
 
 **可选加固（需要 sudo，人工确认后再应用）：只允许你的机器访问管理界面。** 管理界面经 nginx 的 `/memory/admin/` 暴露给能访问 58:80 的整个 tailnet（口令登录，80 端口是明文 HTTP，仅靠 WireGuard 加密）。如要收窄，在 80 与 443 两个 server 里、`location ^~ /memory/` **之前**各加一段（更长的前缀优先）：
@@ -128,7 +128,7 @@ WantedBy=default.target
     }
 ```
 
-应用：先备份 `sudo cp /etc/nginx/sites-available/dsh-piweb /etc/nginx/sites-available/dsh-piweb.bak.$(date +%Y%m%d)`，改完 `sudo nginx -t && sudo systemctl reload nginx`。没有 sudo 的替代：不经 nginx，用 `ssh -L 17990:127.0.0.1:7990 kingo.liang@<58>` 访问 `http://127.0.0.1:17990/memory/admin/`。
+应用：先备份 `sudo cp /etc/nginx/sites-available/dsh-piweb /etc/nginx/sites-available/dsh-piweb.bak.$(date +%Y%m%d)`，改完 `sudo nginx -t && sudo systemctl reload nginx`。没有 sudo 的替代：不经 nginx，用 `ssh -L 17990:127.0.0.1:7990 <user>@<server>` 访问 `http://127.0.0.1:17990/memory/admin/`。
 
 ## 5. 环境文件键名清单（不含值）
 
@@ -251,9 +251,9 @@ journalctl --user -u memory-hub.service -n 5 --no-pager        # memory-hub list
 # Mac 上（令牌来自你自己保管的旧令牌文件，不要打印）：
 curl -s -o /dev/null -w '%{http_code}\n' -X POST -H "Authorization: Bearer $(cat <旧令牌文件>)" \
   -H 'content-type: application/json' -H 'accept: application/json, text/event-stream' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' http://astra-ai-server-02.tail5357dc.ts.net/memory/mcp    # 200
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' http://<server>.<tailnet>.ts.net/memory/mcp    # 200
 ```
-管理界面：`http://astra-ai-server-02.tail5357dc.ts.net/memory/admin/`，口令在 58 的 `~/.config/memory-hub/prod-admin-password`（登录后可在"账户"页改密）。再按手册第 8 节完成客户端侧，并在管理界面"令牌"页为每个客户端创建独立令牌。
+管理界面：`http://<server>.<tailnet>.ts.net/memory/admin/`，口令在 58 的 `~/.config/memory-hub/prod-admin-password`（登录后可在"账户"页改密）。再按手册第 8 节完成客户端侧，并在管理界面"令牌"页为每个客户端创建独立令牌。
 
 ### 7.5 阶段 4：观察期（建议 7 天）
 
@@ -274,7 +274,7 @@ node ~/memory-hub/bin/memory-hub.mjs token create --name 58-claude-code   --scop
 ```bash
 claude mcp remove memory -s user                # 旧条目（~/.claude.json 顶层 mcpServers.memory）
 claude mcp add --transport http -s user memory \
-  http://astra-ai-server-02.tail5357dc.ts.net/memory/mcp \
+  http://<server>.<tailnet>.ts.net/memory/mcp \
   --header "Authorization: Bearer <mac-claude-code 的令牌>"
 claude mcp list                                  # memory: ✓ Connected
 ```
@@ -284,13 +284,13 @@ URL 不变，所以只换令牌也行；换发后旧令牌即可废弃。**移�
 `~/.codex/config.toml`：
 ```toml
 [mcp_servers.memory]
-url = "http://astra-ai-server-02.tail5357dc.ts.net/memory/mcp"
+url = "http://<server>.<tailnet>.ts.net/memory/mcp"
 bearer_token_env_var = "MEMORY_HUB_TOKEN"     # 令牌放进环境变量（如 shell profile / 钥匙串导出），不要写进 toml
 ```
 替换原来的 `http_headers = { Authorization = "Bearer …" }`（明文令牌）写法。
 
 ### 8.3 58 上的 Claude Code 与 MCP 聚合配置
-- `/home/kingo.liang/.claude.json` 的 `mcpServers.memory` 由 stdio 改为 HTTP 回环（避免 stdio 直连 DB 多写入者）：
+- `/home/<user>/.claude.json` 的 `mcpServers.memory` 由 stdio 改为 HTTP 回环（避免 stdio 直连 DB 多写入者）：
   `claude mcp add --transport http -s user memory http://127.0.0.1:7990/memory/mcp --header "Authorization: Bearer <58-claude-code 的令牌>"`
 - `~/.config/mcp/mcp.json` 的 `memory`（stdio）与 `memory-remote` 两条：同样改成 HTTP + 各自令牌（**谁在读这个文件仍未确认**，改之前先确认）。
 - 摘掉 `~/.claude/settings.json` 的 `SessionEnd` hook（沉淀只靠 MCP `memory_capture`）。

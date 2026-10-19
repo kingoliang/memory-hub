@@ -8,8 +8,8 @@
 - 标注约定：**[已核实]** = 本阶段亲自读代码/跑命令/查官方文档得到；**[未确认]** = 没有证据，不能当事实；**[推断]** = 由代码推导，未实测。
 
 证据来源：
-- 本机 fork：`/Users/kingo/projects/memory-eternal-fork`（HEAD 57c4384，含 tidy/dedup；以下 `文件:行` 均指该仓库）。
-- 58 线上：`100.120.90.58`，代码 `~/.dsh/profiles/web/node_modules/memory-eternal`（v0.10.8，与 fork 基线 a8a3f2c 同源），数据 `~/.dsh/memory-vault/memory-eternal.db`。
+- 本机 fork：`~/projects/memory-eternal-fork`（HEAD 57c4384，含 tidy/dedup；以下 `文件:行` 均指该仓库）。
+- 58 线上：`<server-ip>`，代码 `~/.dsh/profiles/web/node_modules/memory-eternal`（v0.10.8，与 fork 基线 a8a3f2c 同源），数据 `~/.dsh/memory-vault/memory-eternal.db`。
 - 官方文档：MCP 规范 2026-07-28、TypeScript SDK v2 文档、npm registry、Node.js 24 sqlite 文档（URL 见 3.1）。
 
 ---
@@ -114,19 +114,19 @@
 | 端口 | 进程 | 说明 |
 |---|---|---|
 | `127.0.0.1:7990` | `memory-mcp-http.service`（用户级 systemd，`~/.config/systemd/user/memory-mcp-http.service`）运行 `~/.dsh/memory-mcp-http/server.mjs` | 旧共享 MCP（HTTP，Bearer）。环境变量只列出 HOST/PORT/BASE=/memory、令牌文件路径、`MEMORY_VAULT_DIR`、LOG；**没有 `MEMORY_LLM_*`** → 经此入口的 `memory_capture` 当前应为降级原文卡 **[推断]** |
-| `0.0.0.0:80`、`:443` | nginx（`/etc/nginx/sites-available/dsh-piweb`） | `location ^~ /memory/` → `127.0.0.1:7990`（80 与 443 各一份，`:27-28`、`:76-80`）；`/` → DSH 自身 `100.113.34.77:3080`；`/piweb/` → 8504 |
-| `127.0.0.1:7999` | `lib/web.js --port 7999`，父进程为 DSH（pid 1827411，启动 10-14 09:17） | 旧管理面板（无鉴权） |
+| `0.0.0.0:80`、`:443` | nginx（`/etc/nginx/sites-available/dsh-piweb`） | `location ^~ /memory/` → `127.0.0.1:7990`（80 与 443 各一份，`:27-28`、`:76-80`）；`/` → DSH 自身 `<server-tailnet-ip>:3080`；`/piweb/` → 8504 |
+| `127.0.0.1:7999` | `lib/web.js --port 7999`，父进程为 DSH（pid <N>，启动 10-14 09:17） | 旧管理面板（无鉴权） |
 | `127.0.0.1:8000` | `lib/web.js --port 8000`，同一 DSH 父进程（10-14 09:37 启动） | 第二个面板实例，用途 **[未确认]**（疑为端口退让/重复拉起） |
-| `100.113.34.77:7998 → 7999` | `memory-eternal-proxy.service` 运行 `~/.dsh/profiles/web/memory-eternal-tailnet-proxy.mjs`（`ME_PROXY_ALLOW` 限定单个账号） | 面板的 tailnet 入口；该 7998 当前是否在监听**未单独核对** |
-| `100.113.34.77:3080` | DSH 主进程 | DSH 的 tailscale-web-entry 另把面板挂在 DSH 站点下（`tailscale-web-entry.mjs:29-32,405-447`，改写 `/memory-eternal/api/web-info`） |
+| `<server-tailnet-ip>:7998 → 7999` | `memory-eternal-proxy.service` 运行 `~/.dsh/profiles/web/memory-eternal-tailnet-proxy.mjs`（`ME_PROXY_ALLOW` 限定单个账号） | 面板的 tailnet 入口；该 7998 当前是否在监听**未单独核对** |
+| `<server-tailnet-ip>:3080` | DSH 主进程 | DSH 的 tailscale-web-entry 另把面板挂在 DSH 站点下（`tailscale-web-entry.mjs:29-32,405-447`，改写 `/memory-eternal/api/web-info`） |
 
 **各 Agent 客户端如何连到旧 MCP**
 
 | 客户端 | 位置 | 方式 | 影响 |
 |---|---|---|---|
-| 本机 Mac 的 Claude Code | `~/.claude.json` 顶层 `mcpServers.memory` | **HTTP** `http://astra-ai-server-02.tail5357dc.ts.net/memory/mcp` + `Authorization` 头（共享令牌，值未读） | 走 nginx:80 → 7990；**明文 HTTP**（仅靠 tailnet 的 WireGuard 加密） |
+| 本机 Mac 的 Claude Code | `~/.claude.json` 顶层 `mcpServers.memory` | **HTTP** `http://<server>.<tailnet>.ts.net/memory/mcp` + `Authorization` 头（共享令牌，值未读） | 走 nginx:80 → 7990；**明文 HTTP**（仅靠 tailnet 的 WireGuard 加密） |
 | 本机 Mac 的 Codex | `~/.codex/config.toml` `[mcp_servers.memory]` | **HTTP** 同上 URL + `http_headers`（共享令牌） | 同上 |
-| 58 上的 Claude Code | `/home/kingo.liang/.claude.json` `mcpServers.memory` | **stdio**：`node …/profiles/web/node_modules/memory-eternal/bin/dsh-memory.mjs mcp`（直连 DB） | 路径在插件目录内，插件卸载即失效 |
+| 58 上的 Claude Code | `/home/<user>/.claude.json` `mcpServers.memory` | **stdio**：`node …/profiles/web/node_modules/memory-eternal/bin/dsh-memory.mjs mcp`（直连 DB） | 路径在插件目录内，插件卸载即失效 |
 | 58 上某 MCP 聚合配置 | `~/.config/mcp/mcp.json` | `memory`（stdio，同上路径，`MEMORY_VAULT_DIR` 指向旧库）与 `memory-remote`（HTTP 同 URL + 令牌），均 `lifecycle: lazy` | 使用方是哪个程序 **[未确认]** |
 | 58 上 Claude Code hooks | `~/.claude/settings.json` | `SessionEnd` → `…/memory-eternal/hooks/capture.mjs claude`；`PreToolUse` → `…/memory-eternal/hooks/secret-guard.mjs` | 两个 hook 都指向插件目录 |
 | DSH 宿主内部 | `cordis.patch.yml:309-330` 插件条目：`autoCapture/autoRecall:true`、`captureProvider: deepseek-official`、`captureModel: deepseek-v4.1-flash`、`vaultProfiles: []`、`activeVault: ""` | 进程内：注册 `memory_recall` 工具、注入系统提示、会话结束自动沉淀 | 线上 `source=deepseek-harness` 的卡 626/662（约 94.6%）→ **DSH 自动沉淀是现有最主要的入库通道**；蒸馏用的是 DSH 里配置的 provider，不是 `MEMORY_LLM_*` |
@@ -425,7 +425,7 @@
 | # | 依赖点 | 位置 | 卸载后的后果 / 处置 |
 |---|---|---|---|
 | 1 | 旧 MCP 服务直接 import 插件代码与 SDK | `~/.dsh/memory-mcp-http/node_modules` 是指向 `~/.dsh/profiles/web/node_modules` 的软链；`server.mjs:27-29` 导入 `memory-eternal/lib/mcp.js`、`capture-run.js`，SDK 1.32.1 也来自这里 | 插件目录一删，7990 服务立即启动失败 → 切换必须先于卸载 |
-| 2 | 58 上 Claude Code 的 stdio MCP 条目 | `/home/kingo.liang/.claude.json`（`mcpServers.memory`） | 失效 → 改 HTTP 回环（6.3.1 阶段 2-5） |
+| 2 | 58 上 Claude Code 的 stdio MCP 条目 | `/home/<user>/.claude.json`（`mcpServers.memory`） | 失效 → 改 HTTP 回环（6.3.1 阶段 2-5） |
 | 3 | `~/.config/mcp/mcp.json` 的 `memory`（stdio）条目 | 同上路径 | 失效；谁在读这个文件 **[未确认]** |
 | 4 | **`PreToolUse` hook = `secret-guard.mjs`**（阻止 Agent 读凭据文件）| `~/.claude/settings.json` | 脚本文件消失后：保护**悄然失效**，或 hook 命令报错影响工具调用（行为 **[未确认]**）。**卸载前必须把该脚本迁出到独立位置并重指 hook**——它与记忆无关，却寄居在插件目录 |
 | 5 | `SessionEnd` hook = `capture.mjs claude` | 同上 | 失效 → **直接摘除，不替代**（9.0 #3）；改由 4.1 的 instructions + 客户端片段驱动 |
@@ -524,7 +524,7 @@ memory-hub backup now && memory-hub backup restore <file> --dry-run      # 演�
 ## 9 待拍板决策（含已拍板项）
 
 ### 9.0 已拍板（用户 2026-10-15 补充，不再列入待拍板）
-1. **部署目标 = 58**（100.120.90.58）。新服务取代现有 memory MCP 服务（`memory-mcp-http.service` / 7990）；新管理界面取代现有 web 面板（7999 / 8000 / 7998 代理）。
+1. **部署目标 = 58**（<server-ip>）。新服务取代现有 memory MCP 服务（`memory-mcp-http.service` / 7990）；新管理界面取代现有 web 面板（7999 / 8000 / 7998 代理）。
 2. **用户自己下掉 DSH 里的 memory-eternal 插件**。设计据此覆盖：现网接入点清单（1.9）、并行→切换→下线与回滚（6.3.1）、旧库接管方式论证（6.3）、卸载后的依赖点（6.3.3）。
 3. **沉淀只靠 MCP `memory_capture`，不做宿主 hook、不做会话兜底**（用户决策）。配套见 4.1，代价见 R15/R16。
 

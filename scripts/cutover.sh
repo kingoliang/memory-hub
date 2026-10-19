@@ -32,8 +32,11 @@ STAGING_ENV="${CUT_STAGING_ENV:-$CFG_DIR/staging.env}"   # 蒸馏三项从这里
 PW_FILE="${CUT_PW_FILE:-$CFG_DIR/prod-admin-password}"
 PORT="${CUT_PORT:-7990}"
 BASE_PATH="${CUT_BASE_PATH:-/memory}"
-HOSTNAMES="${CUT_ALLOWED_HOSTS:-astra-ai-server-02.tail5357dc.ts.net,astra-ai-server-02,100.113.34.77}"
-ORIGINS="${CUT_ALLOWED_ORIGINS:-http://astra-ai-server-02.tail5357dc.ts.net,https://astra-ai-server-02.tail5357dc.ts.net,http://astra-ai-server-02,https://astra-ai-server-02,http://100.113.34.77,https://100.113.34.77}"
+# 主机名 / Origin 白名单必须显式给出（不再把具体服务器地址写死在仓库里）。
+# 例：CUT_ALLOWED_HOSTS=<server>.<tailnet>.ts.net,<server>,<server-tailnet-ip>
+HOSTNAMES="${CUT_ALLOWED_HOSTS:-}"
+# 缺省由 HOSTNAMES 推出 http/https 两种形式
+ORIGINS="${CUT_ALLOWED_ORIGINS:-}"
 LEGACY_NAME="${CUT_LEGACY_NAME:-legacy-shared}"
 LEGACY_EXPIRES="${CUT_LEGACY_EXPIRES:-14d}"
 CHECK_NGINX="${CUT_CHECK_NGINX:-1}"           # 1 = 切换后经 nginx(80) 再验一遍；演练关闭
@@ -63,6 +66,10 @@ sha()  { { sha256sum "$1" 2>/dev/null || shasum -a 256 "$1"; } | cut -d' ' -f1; 
 say()  { printf '[cutover] %s\n' "$*"; }
 step() { printf '\n[cutover] === %s ===\n' "$*"; }
 die()  { printf '[cutover] 错误：%s\n' "$*" >&2; exit 1; }
+[ -n "$HOSTNAMES" ] || die "请设置 CUT_ALLOWED_HOSTS（逗号分隔的主机名 / IP，不含端口），例如 <server>.<tailnet>.ts.net,<server>,<server-tailnet-ip>"
+if [ -z "$ORIGINS" ]; then
+  ORIGINS="$(printf '%s' "$HOSTNAMES" | tr ',' '\n' | sed '/^$/d' | sed 's#.*#http://&\nhttps://&#' | paste -sd, -)"
+fi
 # 只读命令照常执行；有副作用的命令走 act：dry-run 只打印
 act()  { if [ "$EXECUTE" = 1 ]; then printf '+ %s\n' "$*"; "$@"; else printf '[dry-run] 将执行：%s\n' "$*"; fi; }
 ucmd() { systemctl --user "$@"; }

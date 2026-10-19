@@ -12,7 +12,8 @@ PIDFILE="$DEV/server.pid"
 LOGFILE="$DEV/server.log"
 PORT=7992
 HOST=127.0.0.1
-REMOTE="${MEMORY_HUB_SNAPSHOT_REMOTE:-kingo.liang@100.120.90.58}"
+# 必须显式给出 ssh 目标（user@host），不在仓库里写死服务器地址
+REMOTE="${MEMORY_HUB_SNAPSHOT_REMOTE:?请设置 MEMORY_HUB_SNAPSHOT_REMOTE=<user>@<server>}"
 REMOTE_DB='$HOME/.dsh/memory-vault/memory-eternal.db'
 REMOTE_NODE_GLOB='$HOME/.local/lib/node-v*/bin/node'
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10)

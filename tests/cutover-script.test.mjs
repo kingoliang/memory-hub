@@ -78,6 +78,7 @@ echo $! > ${st}/$unit.service.pid`)
     CUT_DATA_DIR: path.join(root, 'data'), CUT_STATE_DIR: path.join(root, 'cutover'),
     CUT_CFG_DIR: path.join(home, '.config/memory-hub'), CUT_PORT: String(port), CUT_BASE_PATH: '/memory',
     CUT_CHECK_NGINX: '0',
+    CUT_ALLOWED_HOSTS: 'hub.example.test,hub,127.0.0.2',
   }
   const sbx = {
     root, home, st, log, port, env, oldToken, llmKey, oldVault,

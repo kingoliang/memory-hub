@@ -1,7 +1,7 @@
 # 本机用真实数据看管理界面
 
 目的：在本机浏览器里查看自己真实的记忆（58 线上库的一致性快照），不改 58 上任何东西。
-脚本：`scripts/dev-snapshot.sh`（需要本机 Node >= 22.16、`ssh`/`scp` 免密到 `kingo.liang@100.120.90.58`、`openssl`）。
+脚本：`scripts/dev-snapshot.sh`（需要本机 Node >= 22.16、`ssh`/`scp` 免密到服务器（通过 `MEMORY_HUB_SNAPSHOT_REMOTE=<user>@<server>` 指定）、`openssl`）。
 
 ## 用法
 
