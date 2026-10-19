@@ -20,8 +20,8 @@ const arg = (name, def) => {
   const i = process.argv.indexOf('--' + name)
   return i > 0 ? process.argv[i + 1] : def
 }
-const FILES = String(arg('files', 'src/core/scope.js,src/core/gate.js')).split(',').map((s) => s.trim()).filter(Boolean)
-const TESTS = String(arg('tests', 'tests/team-scope.test.mjs,tests/experience-gate.test.mjs,tests/gate-scope-hardening.test.mjs')).split(',').map((s) => s.trim()).filter(Boolean)
+const FILES = String(arg('files', 'src/core/scope.js,src/core/gate.js,src/admin/rbac.js')).split(',').map((s) => s.trim()).filter(Boolean)
+const TESTS = String(arg('tests', 'tests/team-scope.test.mjs,tests/experience-gate.test.mjs,tests/gate-scope-hardening.test.mjs,tests/admin/rbac.test.mjs')).split(',').map((s) => s.trim()).filter(Boolean)
 const MAX = Number(arg('max', 60))
 const TIMEOUT_MS = Number(arg('timeout', 90)) * 1000
 const REPEAT = Number(arg('repeat', 2))

@@ -81,3 +81,13 @@ test('令牌：非管理员只能管自己的，且新建时 owner/team 强制�
   assert.deepEqual(tokenScopeFor(ALICE, { owner: 'bob', team: 'payments' }), { owner: 'alice', team: 'remittance' })
   assert.deepEqual(tokenScopeFor(ROOT, { owner: 'bob', team: 'payments' }), { owner: 'bob', team: 'payments' })
 })
+
+test('canSeeCard：卡上缺 status / owner 字段时按「已批准、无主」处理（不把缺字段当成待审）', () => {
+  // 图谱节点等调用方只带 owner/team/visibility，不带 status
+  assert.deepEqual(
+    [canSeeCard(ALICE, { owner: 'bob', team: 'remittance', visibility: 'team' }), canSeeCard(ALICE, { owner: 'bob', team: 'remittance', visibility: 'team', status: null })],
+    [true, true],
+  )
+  // owner 缺失 ≠ 字符串 'undefined'：成员不会因此被当成本人
+  assert.equal(canEditCard(principalOf({ id: 9, username: 'undefined', team: 'remittance', role: 'member' }), { team: 'remittance', visibility: 'team' }), false)
+})

@@ -60,3 +60,11 @@ npm run mutate                                  # 默认靶区 + 阈值门禁
 node scripts/quality/mutate.mjs --max 200 --repeat 2   # 全量
 cat reports/mutation.json                       # 机器可读结果（Git 忽略了 reports/）
 ```
+
+## 补充（2026-10-19）：靶区加入 `src/admin/rbac.js`
+
+管理界面多用户 RBAC 的判定集中在 `rbac.js`（纯函数），按「权限与准入语义 = 变异存活即无保护」的原则加入默认靶区。
+
+- 首轮 39 个变异体存活 2 个，都指向同一个缺口：卡上缺 `status` 字段时应按「已批准」处理（图谱节点等调用方不带 status），
+  没有测试锁住。补用例后 **39/39 全部 KILLED（100%）**。
+- 三个文件合并靶区：190 个变异体，KILLED 177，**93.16%**（阈值 90%）。剩余 13 个仍是 scope.js / gate.js 里已逐条判定的等价变异体。
