@@ -27,7 +27,10 @@ export class FakeElement extends FakeNode {
   set textContent(v) { this.children = []; if (v !== '' && v != null) this.appendChild(new FakeText(v)) }
   get textContent() { return this.children.map((c) => c.textContent).join('') }
   set value(v) { this._value = v }
-  get value() { return this._value ?? '' }
+  // 与浏览器一致：没被脚本赋值前，value 取 value 属性（默认值）
+  get value() { return this._value ?? this.attributes.value ?? '' }
+  get disabled() { return 'disabled' in this.attributes }
+  set disabled(v) { if (v) this.attributes.disabled = ''; else delete this.attributes.disabled }
   set href(v) { this.attributes.href = String(v) }
   get href() { return this.attributes.href }
   set title(v) { this.attributes.title = String(v) }

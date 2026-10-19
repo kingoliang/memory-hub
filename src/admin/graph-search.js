@@ -147,7 +147,9 @@ const snippetOf = (h) => redactSecrets(String(h.summary || h.excerpt || '').repl
 /**
  * @param {{config:object, log:object, llm:object|null}} deps
  */
-export function createGraphSearch({ config, log, llm }) {
+export function createGraphSearch({ config, log, llm: llmArg }) {
+  // llm 可以是函数（每次现取，管理界面改了设置立即生效）或固定对象
+  const llmNow = typeof llmArg === 'function' ? llmArg : () => llmArg
   const gs = config.graphSearch || { topN: 12, searchMinIntervalMs: 400, summarizeMinIntervalMs: 3000 }
   const searchLimiter = new SpiderLimiter({ minIntervalMs: gs.searchMinIntervalMs })
   const summarizeLimiter = new SpiderLimiter({ minIntervalMs: gs.summarizeMinIntervalMs })
@@ -191,6 +193,7 @@ export function createGraphSearch({ config, log, llm }) {
   async function summarize(root, body, actor, session) {
     const q = parseQuery(body)
     const paths = parsePaths(body)
+    const llm = llmNow()
     if (!llm) throw new HttpError(503, 'llm_not_configured', 'AI 汇总不可用：服务端未配置 LLM（搜索与命中展示不受影响）')
     const g = gate(summarizeLimiter, session)
     const t0 = Date.now()

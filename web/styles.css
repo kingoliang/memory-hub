@@ -1130,3 +1130,12 @@ label.set-opt strong { font-size: var(--fs-base); }
 .howto-code { margin: 0; white-space: pre-wrap; word-break: break-all; font-size: 12.5px; line-height: 1.5; user-select: all; }
 /* 字段说明（如「团队：PayTool」）不跟随 label 大写：团队名大小写有意义 */
 .modal-field > .sub { text-transform: none; letter-spacing: normal; }
+
+/* 设置 · 蒸馏 LLM */
+.set-llm { gap: 14px; }
+.set-field { display: grid; gap: 6px; text-transform: none; letter-spacing: normal; font-size: var(--fs-md); color: inherit; }
+.set-field-label { font-family: var(--mono); font-size: 11.5px; letter-spacing: .06em; text-transform: uppercase; color: var(--faint); }
+.set-field > .sub { text-transform: none; letter-spacing: normal; }
+.set-llm-result { padding: 10px 12px; border: 1px solid var(--line-strong); font-size: var(--fs-md); }
+.set-llm-result.ok { border-color: var(--ok, #2e7d32); }
+.set-llm-result.bad { border-color: var(--bad, #c62828); }

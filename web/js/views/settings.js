@@ -6,6 +6,7 @@ import { get, patch } from '../api.js'
 import { pageHead } from '../ui.js'
 import { fmtBytes, kindLabel, relTime } from '../format.js'
 import { guard, toast, errText } from '../dialogs.js'
+import { llmSection } from './settings-llm.js'
 import { getTheme, setTheme, THEMES, THEME_LABEL, getAccent, setAccent, ACCENTS, ACCENT_LABEL } from '../theme.js'
 
 const ALL = '__all__'
@@ -80,7 +81,6 @@ export default async function render(ctx) {
   const ro = d.readonly
   const dd = ro.dedup
   const last = ro.backup.last
-  const llm = ro.llm
   const sectionB = kv([
     ['近似重复阈值', dd.threshold, 'MEMORY_DEDUP_THRESHOLD（默认 0.62）'],
     ['同标题 + 中等正文相似去重', yn(dd.titleAware), 'MEMORY_DEDUP_TITLE_AWARE'],
@@ -101,10 +101,6 @@ export default async function render(ctx) {
     ['摄入：冷却（秒，0=无）', ro.ingest.cooldownS, 'MEMORY_HUB_INGEST_COOLDOWN_S'],
     ['摄入：每日配额', ro.ingest.dailyQuota, 'MEMORY_HUB_INGEST_DAILY_QUOTA'],
     ['摄入：请求体上限', fmtBytes(ro.ingest.maxBodyBytes), 'MEMORY_HUB_INGEST_MAX_BODY_BYTES'],
-    ['蒸馏 LLM', llm.configured ? `已配置 · ${llm.model} @ ${llm.baseHost}` : '未配置（降级为原文卡）', 'MEMORY_LLM_BASE_URL / MEMORY_LLM_MODEL'],
-    ['蒸馏 LLM 密钥', llm.configured ? (llm.keySet ? '已设置（不显示）' : '未设置') : '—', 'MEMORY_LLM_KEY'],
-    ['蒸馏超时', `${llm.timeoutMs} ms`, 'MEMORY_LLM_TIMEOUT_MS'],
-    ['蒸馏 reasoning_effort', llm.reasoningEffort || '（不传）', 'MEMORY_LLM_REASONING_EFFORT'],
     ['MCP 暴露 tidy apply', yn(ro.mcp.exposeTidyApply), 'MEMORY_HUB_MCP_EXPOSE_TIDY_APPLY'],
     ['监听', `${ro.network.host}:${ro.network.port}${ro.network.basePath}`, 'MEMORY_HUB_HOST / _PORT / _BASE_PATH'],
     ['允许非回环监听', yn(ro.network.allowRemote), 'MEMORY_HUB_ALLOW_REMOTE'],
@@ -124,6 +120,7 @@ export default async function render(ctx) {
     pageHead('10', 'Settings', '设置', '审核规则可在此即时修改；其余运行参数只读展示当前生效值（脱敏）。'),
     section('A', '审核', '决定新卡写入后是否先进入待审队列。保存后立即生效，无需重启；每次保存记入审计日志。', [form,
       h('div', { class: 'set-save' }, [save, reset, h('span', { class: 'sub' }, '保存会记入审计日志。')])]),
+    section('L', '蒸馏 LLM', '用于把对话提炼成卡片、经验闸门的 LLM 判定、图谱的 AI 汇总。OpenAI 兼容接口。保存后立即生效，无需重启。', await llmSection(ctx)),
     section('B', '去重与图谱', '阈值越低越容易判为近似重复。', [sectionB, readonlyNote()]),
     section('C', '保留与备份', '回收站清除周期与自动备份。', [sectionC, readonlyNote()]),
     section('D', '外观', '只存于当前浏览器（localStorage），不影响其他设备与用户。', [

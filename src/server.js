@@ -94,10 +94,11 @@ export async function startServer(config, { logger = getLogger(), scheduler = tr
   validateBind(config)
   getDb(config.dbRoot) // 打开并迁移；失败直接抛出，不带病启动
   const log = logger
-  const llm = llmFromConfig(config)
+  // 每次用到时按当前 config 现建：管理界面改了 LLM 设置后，下一次请求就用新值（适配器只是几个闭包，成本可忽略）
+  const currentLlm = () => llmFromConfig(config)
   const limiter = new FailureLimiter()
   const base = config.basePath
-  const admin = createAdminHandler({ config, log, llm })
+  const admin = createAdminHandler({ config, log, llm: currentLlm })
 
   const factory = (ctx) => {
     const a = ctx.authInfo
@@ -107,7 +108,7 @@ export async function startServer(config, { logger = getLogger(), scheduler = tr
         type: 'agent', id: String(a.extra?.tokenId || ''), name: a.clientId, ip: String(a.extra?.ip || ''),
         owner: String(a.extra?.owner || ''), team: String(a.extra?.team || ''), visibility: String(a.extra?.visibility || ''),
       },
-      scopes: a.scopes, config, log, llm, transport: 'http',
+      scopes: a.scopes, config, log, llm: currentLlm(), transport: 'http',
     })
   }
   const nodeHandler = toNodeHandler(createMcpHandler(factory), { onerror: (e) => log.error('MCP 适配层错误', { error: String(e?.message || e) }) })
@@ -179,7 +180,7 @@ export async function startServer(config, { logger = getLogger(), scheduler = tr
       log.warn('ingest 请求校验失败', { actor: tok.name, reason: v.reason })
       return sendJson(res, 400, { status: 'invalid', reason: v.reason })
     }
-    const out = await runIngest({ config, identity: { tokenId: tok.tokenId, name: tok.name, ip, owner: tok.owner, team: tok.team, visibility: tok.visibility }, llm, log, input: v.value })
+    const out = await runIngest({ config, identity: { tokenId: tok.tokenId, name: tok.name, ip, owner: tok.owner, team: tok.team, visibility: tok.visibility }, llm: currentLlm(), log, input: v.value })
     return sendJson(res, out.http, out.body)
   }
 

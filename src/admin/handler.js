@@ -17,6 +17,7 @@ import { writeLog } from '../core/writelog.js'
 import { HttpError } from './errors.js'
 import * as Ops from './ops.js'
 import * as Settings from './settings.js'
+import { createLlmSettings } from './llm-settings.js'
 import { createGraphSearch } from './graph-search.js'
 import { roleAllows, isAdmin, BREAK_GLASS } from './rbac.js'
 import * as Users from './users.js'
@@ -44,6 +45,7 @@ export const ADMIN_ROUTE_ROLES = Object.freeze({
   'GET /tags/preview': ADMINS, 'POST /tags/rename': ADMINS, 'POST /tags/merge': ADMINS, 'POST /tags/delete': ADMINS,
   'GET /lint': ADMINS, 'GET /activity': ADMINS, 'GET /write-log': ADMINS,
   'GET /settings': ADMINS, 'PATCH /settings': ADMINS,
+  'GET /settings/llm': ADMINS, 'PUT /settings/llm': ADMINS, 'POST /settings/llm/test': ADMINS,
   'GET /users': ADMINS, 'GET /users/options': ADMINS, 'POST /users': ADMINS, 'PATCH /users': ADMINS, 'POST /users/password': ADMINS,
 })
 
@@ -164,7 +166,9 @@ export function createAdminHandler({ config, log, llm = null }) {
 
   // ---- 路由表 ----
   const deps = { config, log }
-  const spider = createGraphSearch({ config, log, llm })
+  const getLlm = typeof llm === 'function' ? llm : () => llm
+  const spider = createGraphSearch({ config, log, llm: getLlm })
+  const llmSettings = createLlmSettings({ config, log })
   const routes = {
     'GET /session': (ctx) => ({
       authenticated: true, passwordSet: true, readOnly: !!config.adminReadOnly, csrfToken: ctx.session.csrfToken, expiresAt: ctx.session.expiresAt, idleTimeoutMs: SESSION_IDLE_MS,
@@ -247,6 +251,8 @@ export function createAdminHandler({ config, log, llm = null }) {
     'GET /activity': (ctx) => Q.activity(root, { days: intParam(ctx.url, 'days', { def: 30, min: 1, max: 365 }), silentDays: intParam(ctx.url, 'silentDays', { def: 7, min: 1, max: 365 }) }),
     'GET /tokens': (ctx) => Q.tokenList(root, { user: ctx.user }),
     'GET /settings': () => Settings.getSettings(root, { config }),
+    'GET /settings/llm': () => llmSettings.get(),
+    'POST /settings/llm/test': async (ctx) => llmSettings.test(await ctx.json()),
     'GET /write-log': (ctx) => {
       const u = ctx.url
       return Q.writeLogPage(root, {
@@ -278,6 +284,7 @@ export function createAdminHandler({ config, log, llm = null }) {
     'PATCH /tokens': async (ctx) => Ops.updateTokenAdmin(root, Ops.actorOf(ctx.session, ctx.ip), await ctx.json(), deps),
     'DELETE /tokens': (ctx) => Ops.revokeTokenAdmin(root, Ops.actorOf(ctx.session, ctx.ip), strParam(ctx.url, 'tokenId', 100), deps),
     'PATCH /settings': async (ctx) => Settings.updateSettings(root, Ops.actorOf(ctx.session, ctx.ip), await ctx.json(), deps),
+    'PUT /settings/llm': async (ctx) => llmSettings.put(Ops.actorOf(ctx.session, ctx.ip), await ctx.json()),
     'POST /password': async (ctx) => {
       const out = await Ops.changePassword(root, Ops.actorOf(ctx.session, ctx.ip), await ctx.json(), { ...deps, limiter })
       return { ...out, __headers: { 'set-cookie': `${SESSION_COOKIE}=; ${cookieAttrs(ctx.req, 0)}` } }

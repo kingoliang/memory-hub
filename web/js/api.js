@@ -41,4 +41,5 @@ async function request(method, path, { params, body } = {}) {
 export const get = (path, params) => request('GET', path, { params })
 export const post = (path, body) => request('POST', path, { body: body ?? {} })
 export const patch = (path, body) => request('PATCH', path, { body })
+export const put = (path, body) => request('PUT', path, { body })
 export const del = (path, params) => request('DELETE', path, { params })

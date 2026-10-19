@@ -70,6 +70,28 @@ export function parseLlmRequestOptions(env = {}, fileLlm = {}) {
   return { reasoningEffort: effortRaw, extraBody: extra, timeoutMs }
 }
 
+/** 这些环境变量任一非空 = LLM 由运维锁定，管理界面只读。 */
+export const LLM_ENV_KEYS = ['MEMORY_LLM_BASE_URL', 'MEMORY_LLM_MODEL', 'MEMORY_LLM_KEY']
+/** 管理界面保存的 LLM 配置文件名（在 MEMORY_HUB_HOME 下，0600）。 */
+export const LLM_SETTINGS_FILE = 'llm-settings.json'
+
+/**
+ * 读管理界面保存的 LLM 配置。不存在返回 null；坏文件告警后当作不存在（不让一个坏文件挡住服务启动）。
+ * 权限不是 0600 时忽略 key 并告警（与 memory-hub.json 同规则）。
+ */
+export function readLlmSettingsFile(home, warn = () => {}) {
+  const f = path.join(home, LLM_SETTINGS_FILE)
+  if (!fs.existsSync(f)) return null
+  let v
+  try { v = JSON.parse(fs.readFileSync(f, 'utf8')) } catch { warn(`${LLM_SETTINGS_FILE} 不是合法 JSON，已忽略`); return null }
+  if (!v || typeof v !== 'object' || Array.isArray(v)) { warn(`${LLM_SETTINGS_FILE} 顶层必须是对象，已忽略`); return null }
+  const mode = fs.statSync(f).mode & 0o777
+  const keyOk = (mode & 0o077) === 0
+  if (!keyOk && v.key) warn(`${LLM_SETTINGS_FILE} 权限为 ${mode.toString(8)}，应为 0600；已忽略其中的 key（请 chmod 600）`)
+  const str = (x) => (typeof x === 'string' ? x : '')
+  return { baseUrl: str(v.baseUrl), model: str(v.model), key: keyOk ? str(v.key) : '', reasoningEffort: str(v.reasoningEffort), timeoutMs: Number.isInteger(v.timeoutMs) ? v.timeoutMs : undefined }
+}
+
 /**
  * @param {NodeJS.ProcessEnv|object} env
  * @param {{warn?: (msg: string) => void}} [hooks]
@@ -115,11 +137,17 @@ export function loadConfig(env = process.env, { warn = () => {} } = {}) {
   const adminReadOnly = env.MEMORY_HUB_ADMIN_READONLY !== undefined ? truthy(env.MEMORY_HUB_ADMIN_READONLY) : truthy(file.admin?.readOnly ?? file.adminReadOnly)
 
   // 蒸馏 LLM：通用 OpenAI 兼容端点。BASE_URL 与 MODEL 缺一即视为未配置（降级为原文卡）；不回退到 OPENAI_* 变量。
-  const baseUrl = String(env.MEMORY_LLM_BASE_URL ?? file.llm?.baseUrl ?? '').trim()
-  const model = String(env.MEMORY_LLM_MODEL ?? file.llm?.model ?? '').trim()
-  const apiKey = String(env.MEMORY_LLM_KEY ?? (fileKeyAllowed ? file.llm?.key : '') ?? '')
-  const llmOpts = parseLlmRequestOptions(env, file.llm) // 即使未配置端点也校验，写错的值启动即报
+  // 来源优先级：环境变量 > 管理界面（llm-settings.json）> 配置文件 memory-hub.json。
+  // 见 docs/decisions/2026-10-19-llm-settings-in-admin.md
+  const envLocked = LLM_ENV_KEYS.some((k) => String(env[k] ?? '').trim() !== '')
+  const ui = envLocked ? null : readLlmSettingsFile(home, warn)
+  const fileLlm = ui ? { ...ui, extraBody: file.llm?.extraBody } : file.llm
+  const baseUrl = String(env.MEMORY_LLM_BASE_URL ?? fileLlm?.baseUrl ?? '').trim()
+  const model = String(env.MEMORY_LLM_MODEL ?? fileLlm?.model ?? '').trim()
+  const apiKey = String(env.MEMORY_LLM_KEY ?? (ui ? ui.key : fileKeyAllowed ? file.llm?.key : '') ?? '')
+  const llmOpts = parseLlmRequestOptions(env, fileLlm) // 即使未配置端点也校验，写错的值启动即报
   const llm = baseUrl && model ? { baseUrl, model, apiKey } : null
+  const llmSource = !llm ? 'none' : envLocked ? 'env' : ui ? 'admin' : 'file'
 
   // 会话文本摄入（POST {base}/api/ingest）闸门。均为非负整数；cooldownS=0 表示不设冷却。
   const intOpt = (envName, fileVal, def, lo, hi) => {
@@ -175,6 +203,8 @@ export function loadConfig(env = process.env, { warn = () => {} } = {}) {
     graphSearch,
     gate,
     llm,
+    llmSource, // none | env | admin | file
+    llmEnvLocked: envLocked, // 有 MEMORY_LLM_BASE_URL/MODEL/KEY 环境变量时，管理界面不能改
     llmRequest: llmOpts, // { reasoningEffort, extraBody, timeoutMs }：蒸馏请求的可选参数
     instructions,
     logLevel: String(env.MEMORY_HUB_LOG_LEVEL ?? file.logLevel ?? 'info').toLowerCase(),
