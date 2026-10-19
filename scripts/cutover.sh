@@ -12,7 +12,7 @@
 # 脚本不碰：DSH 及其插件、客户端（Mac/58）配置、hook、旧服务的文件与 unit 文件本体（只 stop/start/disable/enable 旧 unit）。
 # 不打印任何口令 / 令牌 / 密钥（令牌只经 0600 临时 header 文件喂给 curl）。
 #
-# 所有路径 / 名字都可用环境变量覆盖，用于在隔离环境里演练（见 docs/deploy-58.md 的"演练"一节）。
+# 所有路径 / 名字都可用环境变量覆盖，用于在隔离环境里演练（见 scripts/rehearse-cutover.sh）。
 set -euo pipefail
 
 export PATH="$HOME/.local/bin:$PATH"

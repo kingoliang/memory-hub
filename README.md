@@ -190,7 +190,7 @@ memory-hub backup now
 
 - systemd 用户单元模板：[`deploy/memory-hub.service`](deploy/memory-hub.service)（staging 版 `memory-hub-staging.service`），环境键名清单见 [`deploy/env.keys.txt`](deploy/env.keys.txt)。秘密放 `0600` 的 `EnvironmentFile`，不进仓库、不进命令行。
 - 远端导出部署：[`scripts/deploy-remote.sh`](scripts/deploy-remote.sh)（导出 HEAD、`npm ci --omit=dev`、冒烟 import，不碰 systemd / nginx / 数据）。
-- 切换与回滚：`scripts/rehearse-cutover.sh`（演练，不碰线上）、`scripts/cutover.sh`（默认 dry-run，`--execute` 才动手）。真实切换手册见 [`docs/deploy-58.md`](docs/deploy-58.md)。
+- 切换与回滚：`scripts/rehearse-cutover.sh`（演练，不碰线上）、`scripts/cutover.sh`（默认 dry-run，`--execute` 才动手）。
 - 本机拿真实数据快照看界面：`scripts/dev-snapshot.sh`，见 [`docs/dev-with-real-data.md`](docs/dev-with-real-data.md)。
 
 ## 测试
@@ -227,7 +227,6 @@ PLAN.md                 第一阶段调研与设计全文（含取舍与证据�
 
 - [`PLAN.md`](PLAN.md)：调研 + 设计 + 里程碑（含逐项证据与不确定性标注）
 - [`docs/decisions.md`](docs/decisions.md)：SDK spike 结论与关键决策
-- [`docs/deploy-58.md`](docs/deploy-58.md)：并行验证、切换、回滚手册
 - [`docs/deployment-config.md`](docs/deployment-config.md)：蒸馏 LLM 配置
 - [`docs/ingest-api.md`](docs/ingest-api.md)：摄入接口协议
 - [`docs/m2-admin.md`](docs/m2-admin.md) / [`docs/m3-admin.md`](docs/m3-admin.md)：管理界面只读 / 写接口与约束
