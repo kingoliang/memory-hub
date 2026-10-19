@@ -66,10 +66,11 @@ test('端到端：多团队多人下的召回分层、跨团队私卡不可见�
 
     // 2) alice 召回：自己的（含私卡）→ 本团队 bob → 其它团队 carol 的公开卡；carol 的私卡不出现
     const recall = toolText(await rpc(h.url, tokens.alice, 'tools/call', { name: 'memory_recall', arguments: { query: '部署流程' } }))
-    assert.deepEqual(
-      recall.split('\n').filter((l) => /^### /.test(l)).map((l) => l.replace(/^### \d+\. /, '')),
-      ['部署流程-alice自己的', '部署流程-alice团队卡', '部署流程-bob团队卡', '部署流程-carol公开卡'],
-    )
+    const order = recall.split('\n').filter((l) => /^### /.test(l)).map((l) => l.replace(/^### \d+\. /, ''))
+    // 层间顺序是契约（自己 → 本团队 → 其它团队）；同层同分时只剩 mtime 决定，两张卡在同一毫秒写入就会互换，
+    // 所以自己这一层按集合比（合并后实测 5 次里 1 次互换，不是排序 bug，是旧断言把非契约写死了）
+    assert.deepEqual(order.slice(0, 2).sort(), ['部署流程-alice团队卡', '部署流程-alice自己的'])
+    assert.deepEqual(order.slice(2), ['部署流程-bob团队卡', '部署流程-carol公开卡'])
     assert.deepEqual(recall.split('\n').filter((l) => /^\[/.test(l)), ['[自己的记忆] 2 条', '[本团队 · bob] 1 条', '[其它团队 · carol] 1 条'])
 
     // 3) scope 能收窄：只看自己 / 只看自己+本团队（跨团队公开卡被排除）
