@@ -5,7 +5,8 @@
 // 对外只读节点位置（{x,y,c,id}），不改图谱布局；绘制层与命中测试无关，不会拦截任何指针事件。
 
 const TAU = Math.PI * 2
-export const BODY_R = 15 // 屏幕像素：随缩放不变
+export const BODY_R = 22 // 屏幕像素：随缩放不变（探针盘长半轴）
+export const BODY_TILT = 0.58 // 探针盘倾斜：短轴 = 长轴 × BODY_TILT（俯视的圆盘，对标 Alter 空间图谱的探针外观）
 export const THROW_AT = 0.4 // 脚踩到命中节点后，停留进行到该比例时把卡片“扔出去”
 const TRAIL_MAX = 80
 
@@ -361,37 +362,43 @@ function makeCanvas(size) {
   if (typeof OffscreenCanvas === 'function') return new OffscreenCanvas(size, size)
   const c = globalThis.document.createElement('canvas'); c.width = size; c.height = size; return c
 }
-/** 蜘蛛身体：青绿色圆环 + 网格纹 + 中心品红方块。 */
+/**
+ * 蜘蛛身体 = 探针盘（对标 Alter 空间图谱）：暗色盘面 + 方格网纹 + 青绿双层轮廓（表现厚度）+ 粉色菱形核心 + 三个端口小圈。
+ * 画成正圆 sprite，绘制时按 BODY_TILT 压扁成俯视椭圆。反光高光在 sprite 里是固定的，盘转向时一起转。
+ */
 function bodySprite() {
   let c = sprites.get('body')
   if (c) return c
-  const S = 256; const m = S / 2
+  const S = 256; const m = S / 2; const R = 104
   c = makeCanvas(S)
   const g = c.getContext('2d')
-  const teal = '#2ee6c8'
-  // 底盘：深色圆盘 + 内部网格（同心圆 + 放射线 + 斜向网线）
-  g.fillStyle = 'rgba(4,22,26,.92)'; g.beginPath(); g.arc(m, m, 104, 0, TAU); g.fill()
-  g.save(); g.beginPath(); g.arc(m, m, 104, 0, TAU); g.clip()
-  g.strokeStyle = 'rgba(46,230,200,.42)'; g.lineWidth = 2
-  for (const r of [28, 52, 78]) { g.beginPath(); g.arc(m, m, r, 0, TAU); g.stroke() }
-  for (let i = 0; i < 16; i++) { const a = (i / 16) * TAU; g.beginPath(); g.moveTo(m + Math.cos(a) * 14, m + Math.sin(a) * 14); g.lineTo(m + Math.cos(a) * 104, m + Math.sin(a) * 104); g.stroke() }
-  g.strokeStyle = 'rgba(46,230,200,.2)'; g.lineWidth = 1.5
-  for (let k = -5; k <= 5; k++) { g.beginPath(); g.moveTo(m + k * 22 - 110, m - 110); g.lineTo(m + k * 22 + 110, m + 110); g.stroke(); g.beginPath(); g.moveTo(m + k * 22 + 110, m - 110); g.lineTo(m + k * 22 - 110, m + 110); g.stroke() }
+  // 厚度：底面轮廓往下偏一点（压扁后就是盘的侧边）
+  g.strokeStyle = 'rgba(46,170,140,.75)'; g.lineWidth = 7; g.beginPath(); g.arc(m, m + 12, R, 0, TAU); g.stroke()
+  // 盘面
+  const face = g.createRadialGradient(m - 30, m - 36, 10, m, m, R)
+  face.addColorStop(0, '#1d5a50'); face.addColorStop(0.55, '#123e38'); face.addColorStop(1, '#082621')
+  g.fillStyle = face; g.beginPath(); g.arc(m, m, R, 0, TAU); g.fill()
+  // 方格网纹（裁在盘内）
+  g.save(); g.beginPath(); g.arc(m, m, R - 4, 0, TAU); g.clip()
+  g.strokeStyle = 'rgba(72,163,138,.5)'; g.lineWidth = 1.6
+  for (let k = -R; k <= R; k += 15) { g.beginPath(); g.moveTo(m + k, m - R); g.lineTo(m + k, m + R); g.stroke(); g.beginPath(); g.moveTo(m - R, m + k); g.lineTo(m + R, m + k); g.stroke() }
   g.restore()
-  // 外环：亮青绿 + 极细外圈
-  const rg = g.createLinearGradient(0, 0, S, S)
-  rg.addColorStop(0, '#7dfbe6'); rg.addColorStop(0.5, teal); rg.addColorStop(1, '#16a892')
-  g.strokeStyle = rg; g.lineWidth = 16; g.beginPath(); g.arc(m, m, 112, 0, TAU); g.stroke()
-  g.strokeStyle = 'rgba(125,251,230,.55)'; g.lineWidth = 3; g.beginPath(); g.arc(m, m, 126, 0, TAU); g.stroke()
-  // 环上的“节”：16 个小刻痕
-  g.fillStyle = 'rgba(4,22,26,.75)'
-  for (let i = 0; i < 16; i++) { const a = (i / 16) * TAU; g.save(); g.translate(m + Math.cos(a) * 112, m + Math.sin(a) * 112); g.rotate(a); g.fillRect(-3, -9, 6, 18); g.restore() }
-  // 中心：品红光晕 + 方块
-  const cg = g.createRadialGradient(m, m, 0, m, m, 46)
-  cg.addColorStop(0, 'rgba(255,47,160,.85)'); cg.addColorStop(1, 'rgba(255,47,160,0)')
-  g.fillStyle = cg; g.beginPath(); g.arc(m, m, 46, 0, TAU); g.fill()
-  g.fillStyle = '#ff2fa0'; g.fillRect(m - 17, m - 17, 34, 34)
-  g.fillStyle = '#ffd6ef'; g.fillRect(m - 7, m - 7, 14, 14)
+  // 顶面轮廓：亮青绿粗边 + 内侧细线
+  const rim = g.createLinearGradient(0, 0, S, S)
+  rim.addColorStop(0, '#b6ffe9'); rim.addColorStop(0.45, '#72ddbd'); rim.addColorStop(1, '#2b9a80')
+  g.strokeStyle = rim; g.lineWidth = 7; g.beginPath(); g.arc(m, m, R, 0, TAU); g.stroke()
+  g.strokeStyle = 'rgba(161,244,218,.45)'; g.lineWidth = 2; g.beginPath(); g.arc(m, m, R - 9, 0, TAU); g.stroke()
+  // 三个端口小圈（与 Alter 同角度）
+  g.strokeStyle = 'rgba(161,244,218,.85)'; g.lineWidth = 2.4
+  for (const a of [0.8, 3.1, 4.9]) { g.beginPath(); g.arc(m + Math.cos(a) * R, m + Math.sin(a) * R, 9, 0, TAU); g.stroke() }
+  // 核心：粉色菱形 + 淡光晕
+  const cg = g.createRadialGradient(m, m, 0, m, m, 40)
+  cg.addColorStop(0, 'rgba(255,69,157,.55)'); cg.addColorStop(1, 'rgba(255,69,157,0)')
+  g.fillStyle = cg; g.beginPath(); g.arc(m, m, 40, 0, TAU); g.fill()
+  g.save(); g.translate(m, m); g.rotate(Math.PI / 4)
+  g.fillStyle = '#ff459d'; g.fillRect(-17, -17, 34, 34)
+  g.fillStyle = 'rgba(255,214,235,.85)'; g.fillRect(-17, -17, 34, 7)
+  g.restore()
   sprites.set('body', c)
   return c
 }
@@ -421,7 +428,7 @@ export function createSpider(env) {
   const MONO = env.mono || 'ui-monospace, Menlo, monospace'
   const colorOf = env.colorOf || ((n) => n?.c?.color || '#2ee6ff')
   const S = {
-    enabled: true, inited: false, x: 0, y: 0, rot: rand() * TAU, T: 0,
+    enabled: true, inited: false, x: 0, y: 0, rot: rand() * TAU, face: 0, T: 0,
     mode: 'wander', seg: null, dwell: 1, lastCluster: '', preferCluster: '',
     trail: [], trailT: 0, trailColor: '#2ee6c8',
     legs: Array.from({ length: LEG_SLOTS }, (_, i) => ({ fx: 0, fy: 0, node: -1, last: -1, pin: -1, a: 0, air: false, fl: null, t: 0, life: 0.6 + rand() * 1.0, seed: rand() * TAU, starvedUntil: 0, i })),
@@ -692,6 +699,12 @@ export function createSpider(env) {
     if (!S.inited && !spawn()) return dimAnim
     if (reduced) { updateLegs(dt); return dimAnim }
     S.rot += dt * 0.5
+    // 探针盘朝向：平滑转向行进方向（时间常数 ~0.35s，取最短转角）；没有航向时保持不动
+    if (S.heading && Math.hypot(S.heading.x, S.heading.y) > 1e-6) {
+      const want = Math.atan2(S.heading.y, S.heading.x)
+      const d = Math.atan2(Math.sin(want - S.face), Math.cos(want - S.face))
+      S.face += d * (1 - Math.exp(-dt / 0.35))
+    }
     if (S.mode === 'wander') {
       if (!S.seg) { S.dwell -= dt; if (S.dwell <= 0) nextWanderSeg() }
     } else if (S.mode === 'scan') {
@@ -787,45 +800,75 @@ export function createSpider(env) {
     // 身体光晕
     const think = S.mode === 'think'
     g.globalCompositeOperation = 'lighter'
-    const hg = BODY_R * (think ? 3.6 + Math.sin(S.T * 6) * 0.5 : 3.1)
-    g.globalAlpha = alpha * (think ? 0.65 : 0.4)
+    const hg = BODY_R * (think ? 3.2 + Math.sin(S.T * 6) * 0.4 : 2.2)
+    g.globalAlpha = alpha * (think ? 0.55 : 0.16) // 平时只留一层淡淡的青绿底光（Alter 的探针盘没有大光晕）
     g.drawImage(glow(think ? '#ff2fa0' : '#2ee6c8'), bx - hg, by - hg, hg * 2, hg * 2)
-    // 触手：所有腿合并成一条 path，一次 stroke（点状虚线，沿腿向外流动）
-    // 透明度分 4 档合批：每档一条 path、一次 stroke（过渡中的触手只是档位不同，不额外增加绘制次数）
+    // 触手（对标 Alter）：实心青绿管，根部粗、末端细，三次贝塞尔从盘边向外弯出；管上有流动的细点；末端空心小圈。
+    // 粗细用 3 段子曲线分别描边实现（段内 de Casteljau 拆分，整条曲线形状不变）；透明度分 4 档合批，每档每段一次 stroke。
     const nn = nodes()
-    const tiers = [0.25, 0.5, 0.75, 1].map((a) => ({ a, legs: new Path2D(), dots: new Path2D(), used: false }))
-    const heroPath = new Path2D(); let hasHero = false
+    const ry = BODY_R * BODY_TILT
+    const ca = Math.cos(S.face); const sa = Math.sin(S.face)
+    const SEG = 3; const W = [3.2, 2.1, 1.1] // 各段线宽（根 → 末端）
+    const mk = () => ({ used: false, seg: Array.from({ length: SEG }, () => new Path2D()), dots: new Path2D(), ends: new Path2D() })
+    const tiers = [0.25, 0.5, 0.75, 1].map((a) => ({ a, ...mk() }))
+    const hero = mk()
+    const lerp = (p, q, u) => ({ x: p.x + (q.x - p.x) * u, y: p.y + (q.y - p.y) * u })
+    /** 三次贝塞尔 [u0,u1] 子段的控制点（两次 de Casteljau）。 */
+    const sub = (P, u0, u1) => {
+      const split = (Q, u) => { const a = lerp(Q[0], Q[1], u); const b = lerp(Q[1], Q[2], u); const c = lerp(Q[2], Q[3], u); const d = lerp(a, b, u); const e = lerp(b, c, u); const f = lerp(d, e, u); return [[Q[0], a, d, f], [f, e, c, Q[3]]] }
+      const right = split(P, u0)[1]
+      return split(right, (u1 - u0) / (1 - u0 || 1))[0]
+    }
+    const at = (P, u) => { const v = 1 - u; return { x: v * v * v * P[0].x + 3 * v * v * u * P[1].x + 3 * v * u * u * P[2].x + u * u * u * P[3].x, y: v * v * v * P[0].y + 3 * v * v * u * P[1].y + 3 * v * u * u * P[2].y + u * u * u * P[3].y } }
     for (const s of legStrokes()) {
       const n = nn[s.node]
       // 脚尖 = 锚点节点的屏幕位置（世界坐标 → 屏幕，随缩放跟随），任何状态下都不缩短、不插值
       const ex = n.x * z + view.panX; const ey = n.y * z + view.panY
       const dx0 = ex - bx; const dy0 = ey - by; const l0 = Math.hypot(dx0, dy0)
       if (l0 < BODY_R) continue // 节点在身体下面：脚尖被身体盖住，不画触手
-      const sx0 = bx + (dx0 / l0) * BODY_R * 0.92; const sy0 = by + (dy0 / l0) * BODY_R * 0.92
-      const dx = ex - sx0; const dy = ey - sy0
-      // 触手弯曲：垂直方向的缓慢摆动（只摆中间，不动脚尖）；换脚时中段甩一下
-      const bend = (reduced ? 0.1 : 0.16 * Math.sin(S.T * 2.6 + s.leg.seed)) + 0.08 + 0.22 * s.lift
-      const cx = (sx0 + ex) / 2 - dy * bend; const cy = (sy0 + ey) / 2 + dx * bend
-      if (s.hero) { hasHero = true; heroPath.moveTo(sx0, sy0); heroPath.quadraticCurveTo(cx, cy, ex, ey); continue }
-      const t = tiers[clamp(Math.ceil(s.alpha * 4) - 1, 0, 3)]
-      t.used = true
-      t.legs.moveTo(sx0, sy0); t.legs.quadraticCurveTo(cx, cy, ex, ey)
-      t.dots.moveTo(ex + 1.9, ey); t.dots.arc(ex, ey, 1.9, 0, TAU)
+      // 根部 = 盘边（压扁的椭圆上，朝向脚尖的一点）
+      const ux = dx0 / l0; const uy = dy0 / l0
+      const lx = ux * ca + uy * sa; const ly = -ux * sa + uy * ca
+      const k = 1 / Math.hypot(lx / BODY_R, ly / ry)
+      const root = { x: bx + ux * k * 0.94, y: by + uy * k * 0.94 }
+      const tip = { x: ex, y: ey }
+      const len = Math.hypot(ex - root.x, ey - root.y)
+      // 弯曲：先沿盘的径向弹出，再弯向脚尖；侧向卷曲奇偶交替，缓慢摆动；换脚时弯得更狠
+      const side = (s.leg.i % 2 ? 1 : -1)
+      const sway = reduced ? 0 : Math.sin(S.T * 1.6 + s.leg.seed) * 0.12
+      const curl = Math.min(len * 0.28, 46) * (side * (0.55 + 0.45 * s.lift) + sway)
+      const nx = -uy; const ny = ux
+      const lift = Math.min(len * 0.22, 26) // 向「上」拱（屏幕 -y）：俯视盘里伸出的腿先抬起再落下
+      const c1 = { x: root.x + ux * Math.min(len * 0.32, 40) + nx * curl * 0.4, y: root.y + uy * Math.min(len * 0.32, 40) + ny * curl * 0.4 - lift }
+      const c2 = { x: root.x + (ex - root.x) * 0.7 + nx * curl, y: root.y + (ey - root.y) * 0.7 + ny * curl - lift * 0.6 }
+      const P = [root, c1, c2, tip]
+      const T = s.hero ? hero : tiers[clamp(Math.ceil(s.alpha * 4) - 1, 0, 3)]
+      T.used = true
+      for (let j = 0; j < SEG; j++) { const Q = sub(P, j / SEG, (j + 1) / SEG); T.seg[j].moveTo(Q[0].x, Q[0].y); T.seg[j].bezierCurveTo(Q[1].x, Q[1].y, Q[2].x, Q[2].y, Q[3].x, Q[3].y) }
+      // 管上流动的细点（从根部向末端）
+      const nd = Math.max(3, Math.min(9, Math.round(len / 22)))
+      const flow = reduced ? 0 : (S.T * (think ? 1.6 : 0.7) + s.leg.seed) % 1
+      for (let j = 0; j < nd; j++) { const p = at(P, (j + flow) / nd); T.dots.moveTo(p.x + 1, p.y); T.dots.arc(p.x, p.y, 1, 0, TAU) }
+      T.ends.moveTo(ex + 3.6, ey); T.ends.arc(ex, ey, 3.6, 0, TAU)
     }
-    g.strokeStyle = '#ffffff'; g.lineWidth = 1.6
-    g.setLineDash([0.1, 4.6]); g.lineDashOffset = reduced ? 0 : -(S.T * (think ? 76 : 28))
-    for (const t of tiers) if (t.used) { g.globalAlpha = alpha * 0.9 * t.a; g.stroke(t.legs) }
-    if (hasHero) { g.globalAlpha = alpha; g.lineWidth = 2.4; g.setLineDash([0.1, 3.6]); g.strokeStyle = '#ffe3f6'; g.stroke(heroPath) }
-    g.setLineDash([]); g.lineDashOffset = 0
     g.globalCompositeOperation = 'source-over'
-    g.fillStyle = '#ffffff'
-    for (const t of tiers) if (t.used) { g.globalAlpha = alpha * t.a; g.fill(t.dots) }
-    // 身体：环缓慢旋转
+    g.lineCap = 'round'
+    const paint = (T, a, col) => {
+      if (!T.used) return
+      g.strokeStyle = col
+      for (let j = 0; j < SEG; j++) { g.globalAlpha = alpha * a * (0.92 - j * 0.12); g.lineWidth = W[j]; g.stroke(T.seg[j]) }
+      g.globalAlpha = alpha * a * 0.8; g.fillStyle = '#dcefe7'; g.fill(T.dots)
+      g.globalAlpha = alpha * a * 0.9; g.lineWidth = 1.2; g.strokeStyle = '#cff8e8'; g.stroke(T.ends)
+    }
+    for (const t of tiers) paint(t, t.a, '#66c9aa')
+    paint(hero, 1, '#b6ffe9')
+    // 身体：压扁的探针盘，缓慢转向行进方向
     g.globalAlpha = alpha
-    g.translate(bx, by); g.rotate(S.rot)
+    g.save() // 调用方已按 devicePixelRatio 设好变换：只在其上叠加，画完恢复
+    g.translate(bx, by); g.rotate(S.face); g.scale(1, BODY_TILT)
     const sp = bodySprite()
-    g.drawImage(sp, -BODY_R, -BODY_R, BODY_R * 2, BODY_R * 2)
-    g.rotate(-S.rot); g.translate(-bx, -by)
+    g.drawImage(sp, -BODY_R * 1.18, -BODY_R * 1.18, BODY_R * 2.36, BODY_R * 2.36)
+    g.restore()
     // 思考：绕身体旋转的三个小亮点
     if (think && !reduced) {
       g.globalCompositeOperation = 'lighter'; g.fillStyle = '#ff7ad9'
