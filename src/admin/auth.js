@@ -1,10 +1,14 @@
-// memory-hub · 管理员认证：单管理员口令（scrypt 哈希存 config 表）+ 服务端会话（admin_sessions，只存会话 id 的 sha256）。
+// memory-hub · 管理界面认证：应急管理员口令（scrypt 哈希存 config 表）+ 服务端会话（admin_sessions，只存会话 id 的 sha256）。
 //
 // 口令从不以明文落库/落日志；会话 id 是 256 位随机数，库里只存其 sha256；
 // CSRF token = HMAC(会话哈希, 固定标签)，与会话绑定，会话销毁即失效。
+//
+// 多用户（schema v4）：会话的 user_id 指向 admin_users；NULL = 应急入口（身份为 rbac.BREAK_GLASS）。
+// 会话每次都回表取用户：停用 / 删除即时失效，改角色 / 团队下一次请求即生效。
 
 import crypto from 'node:crypto'
 import { getDb } from '../core/db.js'
+import { BREAK_GLASS, principalOf } from './rbac.js'
 
 export const MIN_PASSWORD_LENGTH = 10
 export const MAX_PASSWORD_LENGTH = 1024
@@ -108,13 +112,22 @@ export function setAdminPassword(root, password, { cost } = {}) {
 
 const SID_RE = /^[A-Za-z0-9_-]{43}$/
 
-export function createSession(root, now = Date.now()) {
+/** @param {number|null} [userId] admin_users.id；省略 / null = 应急入口会话 */
+export function createSession(root, now = Date.now(), userId = null) {
   const sid = crypto.randomBytes(32).toString('base64url')
   const sidHash = sha256hex(sid)
   const iso = new Date(now).toISOString()
   const expiresAt = new Date(now + SESSION_ABSOLUTE_MS).toISOString()
-  getDb(root).prepare('INSERT INTO admin_sessions (sid_hash, created_at, expires_at, last_seen) VALUES (?, ?, ?, ?)').run(sidHash, iso, expiresAt, iso)
+  getDb(root).prepare('INSERT INTO admin_sessions (sid_hash, created_at, expires_at, last_seen, user_id) VALUES (?, ?, ?, ?, ?)').run(sidHash, iso, expiresAt, iso, userId ?? null)
   return { sid, sidHash, expiresAt, csrfToken: csrfFor(sidHash) }
+}
+
+/** 会话→身份：user_id 为空是应急入口；用户已删 / 已停用 → null（调用方视为会话失效）。 */
+function principalForSession(db, userId) {
+  if (userId === null || userId === undefined) return { ...BREAK_GLASS }
+  const row = db.prepare('SELECT id, username, team, role, disabled_at FROM admin_users WHERE id = ?').get(userId)
+  if (!row || row.disabled_at) return null
+  return principalOf(row)
 }
 
 export function csrfFor(sidHash) {
@@ -127,7 +140,7 @@ export function csrfValid(session, token) {
   return a.length === b.length && crypto.timingSafeEqual(a, b)
 }
 
-/** @returns {{sidHash:string, csrfToken:string, expiresAt:string}|null} 过期（空闲或绝对）的会话会被顺手删除。 */
+/** @returns {{sidHash:string, csrfToken:string, expiresAt:string, user:object}|null} 过期（空闲或绝对）或用户已停用的会话会被顺手删除。 */
 export function lookupSession(root, sid, now = Date.now()) {
   if (typeof sid !== 'string' || !SID_RE.test(sid)) return null
   const db = getDb(root)
@@ -140,8 +153,13 @@ export function lookupSession(root, sid, now = Date.now()) {
     db.prepare('DELETE FROM admin_sessions WHERE sid_hash = ?').run(sidHash)
     return null
   }
+  const user = principalForSession(db, row.user_id)
+  if (!user) {
+    db.prepare('DELETE FROM admin_sessions WHERE sid_hash = ?').run(sidHash)
+    return null
+  }
   if (now - seen >= TOUCH_THROTTLE_MS) db.prepare('UPDATE admin_sessions SET last_seen = ? WHERE sid_hash = ?').run(new Date(now).toISOString(), sidHash)
-  return { sidHash, csrfToken: csrfFor(sidHash), expiresAt: row.expires_at }
+  return { sidHash, csrfToken: csrfFor(sidHash), expiresAt: row.expires_at, user }
 }
 
 export function destroySession(root, sid) {

@@ -12,7 +12,7 @@ const { DatabaseSync } = sqlite
 const DB_FILE = 'memory-eternal.db'
 export const DB_FILENAME = DB_FILE
 /** 当前 schema 版本（PRAGMA user_version）。0 = 旧版 memory-eternal 库。 */
-export const SCHEMA_VERSION = 3
+export const SCHEMA_VERSION = 4
 /** 归属列：新增列名+建表默认值，迁移与建表共用一份，避免两边漂移。 */
 export const SCOPE_COLUMNS = { owner: "TEXT NOT NULL DEFAULT ''", team: "TEXT NOT NULL DEFAULT 'default'", visibility: "TEXT NOT NULL DEFAULT 'team'" }
 export const BUSY_TIMEOUT_MS = 5000
@@ -298,6 +298,35 @@ export function migrateSchema(db) {
       // 老行归属回填：owner 从署名推断（空署名 = 本机单机，保留空串，走 tierOf 的"本地人"通配）。
       db.exec("UPDATE cards SET owner = submitted_by WHERE owner = '' AND COALESCE(submitted_by,'') <> ''")
       db.exec("UPDATE quarantine SET owner = submitted_by WHERE owner = '' AND COALESCE(submitted_by,'') <> ''")
+    }
+    if (current() < 4) {
+      // 3 → 4：管理界面多用户（docs/decisions/2026-10-19-admin-multi-user-rbac.md）。只加表加列。
+      // admin_sessions.user_id 为 NULL = 应急入口（原单管理员口令）会话，升级前的旧会话自然落在这一类。
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS admin_users (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          username TEXT NOT NULL UNIQUE,
+          team TEXT NOT NULL DEFAULT '',
+          role TEXT NOT NULL DEFAULT 'member',
+          password_hash TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          disabled_at TEXT,
+          last_login_at TEXT
+        );
+      `)
+      // 不假设 admin_sessions 一定已存在：在走捷径升上来的库（比如测试里的合成 v1 库）里它可能没有。
+      // 建表语句与 v0→1 一致，只是多了 user_id。
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS admin_sessions (
+          sid_hash TEXT PRIMARY KEY,
+          created_at TEXT NOT NULL,
+          expires_at TEXT NOT NULL,
+          last_seen TEXT NOT NULL
+        );
+      `)
+      addColumnIfMissing(db, 'admin_sessions', 'user_id', 'INTEGER')
+      db.exec('CREATE INDEX IF NOT EXISTS idx_admin_sessions_user ON admin_sessions(user_id)')
     }
     db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`)
     db.exec('COMMIT')
