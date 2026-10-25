@@ -1,0 +1,14 @@
+[Unit]
+Description=memory-hub daily tidy (backup -> lint/plan -> apply high-confidence reversible batches -> report)
+
+[Service]
+Type=oneshot
+# 与 memory-hub.service 共用同一个 EnvironmentFile（取 MEMORY_HUB_HOME 等）；与服务进程互不依赖，本任务失败不影响服务。
+EnvironmentFile=@ENV_FILE@
+Environment=NODE_NO_WARNINGS=1
+# 脚本随代码一起部署，路径固定在代码目录内，升级代码即升级脚本。去掉 --apply 即 dry-run（只出报告）。
+ExecStart=%h/.local/bin/node %h/memory-hub/scripts/tidy-daily.mjs --apply
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=30min
+NoNewPrivileges=true

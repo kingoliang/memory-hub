@@ -189,7 +189,25 @@ memory-hub backup now
 ## 部署
 
 - systemd 用户单元模板：[`deploy/memory-hub.service`](deploy/memory-hub.service)（staging 版 `memory-hub-staging.service`），环境键名清单见 [`deploy/env.keys.txt`](deploy/env.keys.txt)。秘密放 `0600` 的 `EnvironmentFile`，不进仓库、不进命令行。
-- 远端导出部署：[`scripts/deploy-remote.sh`](scripts/deploy-remote.sh)（导出 HEAD、`npm ci --omit=dev`、冒烟 import，不碰 systemd / nginx / 数据）。
+- 远端导出部署：[`scripts/deploy-remote.sh`](scripts/deploy-remote.sh)。主机、路径、单元名都由参数或环境变量传入（仓库里不写任何具体值）：
+
+  ```bash
+  scripts/deploy-remote.sh --env-file <远端 EnvironmentFile> --restart <user@host>
+  scripts/deploy-remote.sh --dry-run ...        # 只打印步骤
+  ```
+
+  顺序：读远端当前 `REVISION` → **在线备份**（用旧代码跑 `memory-hub backup now`，失败即中止，线上未改动）→ 导出 HEAD 到 `<dir>.new`、写 `REVISION`、`npm ci --omit=dev`、冒烟 import（失败时线上目录原封不动）→ `<dir>` 换成新版，**上一份留在 `<dir>.prev`** →（`--restart`）重启 systemd 用户单元，轮询 `/healthz`，要求返回的 `revision` 与刚部署的完整 sha 一致。核对失败时退出 1 并打印可直接复制的回滚命令：`scripts/deploy-remote.sh --rollback --restart ...`（把 `<dir>.prev` 换回，被替换的版本留在 `<dir>.failed`）。没有 `--restart` 时只换代码，服务仍是旧进程，脚本会提示。
+  - `REVISION`（代码目录根部）三行：`sha=<完整 40 位>`、`time=<提交时间 ISO 8601>`、`describe=<git describe --tags --always>`。`/healthz` 返回 `revision` / `revisionTime` / `describe`（服务启动时读一次，反映的是本进程加载的代码；没有 `REVISION` 则为 `null`），线上落后多少一眼可查。
+  - 选项：`--env-file`（备份与默认健康检查地址必需，地址由其中的 `MEMORY_HUB_HOST/PORT/BASE_PATH` 推出）、`--unit`（默认 `memory-hub.service`）、`--dir`（默认 `~/memory-hub`）、`--health-url`、`--skip-backup`；环境变量 `MEMORY_HUB_DEPLOY_{REMOTE,ENV_FILE,UNIT,DIR,HEALTH_URL,HEALTH_WAIT}`。
+  - 部署的是 HEAD，要求工作区干净。schema 迁移只增不删，回滚代码一般不需要还原数据；万一要还原，用部署前备份（脚本会打印路径）。
+- 每日整理：[`scripts/tidy-daily.mjs`](scripts/tidy-daily.mjs) + systemd 模板 [`deploy/memory-hub-tidy.service`](deploy/memory-hub-tidy.service) / [`deploy/memory-hub-tidy.timer`](deploy/memory-hub-tidy.timer)。流程：（`--apply` 时）在线备份 → lint / plan → 只应用高置信可逆批次（`merge` 近重复合并、`tags` 标签规整；先 `VACUUM INTO` 备份、批次事务 + 自检、只软删、写回滚文件）→ 写 Markdown 报告（标题截断并脱敏，正文不进报告）。噪声卡、kind 错放、密钥疑似、超大 raw 卡、较低相似度重复组只进报告，不自动执行。缺省 dry-run，不改库、不备份。
+
+  ```bash
+  node scripts/tidy-daily.mjs --home <数据目录>            # dry-run
+  node scripts/tidy-daily.mjs --home <数据目录> --apply    # 备份 + 应用 + 报告
+  ```
+
+  选项：`--report-dir`（默认 `<home>/tidy-reports`）、`--threshold`（0.85）、`--max-delete`（10）、`--batches`（`merge,tags`，`noise` 不允许），对应环境变量 `MEMORY_HUB_HOME` / `TIDY_THRESHOLD` / `TIDY_MAX_DELETE` / `TIDY_AUTO_BATCHES`。脚本按自身位置加载同一代码树的 `src/core/tidy.js`，随部署一起升级，不会与整理接口错配。启用定时：把两个模板复制到 `~/.config/systemd/user/`，`@ENV_FILE@` 换成实际 EnvironmentFile，再 `systemctl --user enable --now memory-hub-tidy.timer`。
 - 切换与回滚：`scripts/rehearse-cutover.sh`（演练，不碰线上）、`scripts/cutover.sh`（默认 dry-run，`--execute` 才动手）。
 - 本机拿真实数据快照看界面：`scripts/dev-snapshot.sh`，见 [`docs/dev-with-real-data.md`](docs/dev-with-real-data.md)。
 
@@ -217,7 +235,7 @@ src/admin/              管理 API（handler、queries、ops、auth、settings�
 src/migrate.js          旧库对账 / 反向增量
 web/                    管理界面（纯静态，零构建）
 clients/                DSH 插件、Pi 扩展
-deploy/ systemd 单元与环境键名清单
+deploy/ systemd 单元（服务、每日整理 service + timer）与环境键名清单
 docs/                   设计、部署、接口、界面文档
 tests/                  node:test 用例与 e2e
 PLAN.md                 第一阶段调研与设计全文（含取舍与证据）

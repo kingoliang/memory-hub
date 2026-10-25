@@ -1,7 +1,7 @@
 // memory-hub · HTTP 服务：单进程单端口，默认 127.0.0.1。
 //   POST {base}/mcp     MCP Streamable HTTP（无状态，dual-era：2025 年代 initialize 与 2026-07-28 server/discover 皆可）
 //   POST {base}/api/ingest 会话文本摄入（Bearer 令牌，需 write scope；见 docs/ingest-api.md）
-//   GET  {base}/healthz 存活探针（无需鉴权）
+//   GET  {base}/healthz 存活探针（无需鉴权）；返回 version 与部署修订（revision/revisionTime/describe，来自 REVISION 文件，无则 null）
 //   {base}/admin/        管理界面静态文件（M2，只读）；{base}/admin/api/* 管理 API（会话 cookie 认证，与 /mcp 的令牌认证互相独立）
 //   GET  {base}/         302 → {base}/admin/
 
@@ -19,6 +19,7 @@ import { findTool, toolEnabled } from './tools/registry.js'
 import { runIngest, validateIngestBody } from './core/ingest.js'
 import { buildMcpServer, llmFromConfig, SERVER_VERSION } from './transport/mcp-server.js'
 import { getLogger } from './logger.js'
+import { readRevision } from './revision.js'
 import fs from 'node:fs'
 import path from 'node:path'
 
@@ -87,16 +88,17 @@ async function readBody(req, max) {
 
 /**
  * @param {object} config loadConfig 的结果
- * @param {{logger?: object, scheduler?: boolean}} [opts]
+ * @param {{logger?: object, scheduler?: boolean, codeRoot?: string}} [opts] codeRoot：REVISION 文件所在目录（默认本代码树根；测试用）
  * @returns {Promise<{port:number, host:string, close: () => Promise<void>, server: http.Server}>}
  */
-export async function startServer(config, { logger = getLogger(), scheduler = true } = {}) {
+export async function startServer(config, { logger = getLogger(), scheduler = true, codeRoot } = {}) {
   validateBind(config)
   getDb(config.dbRoot) // 打开并迁移；失败直接抛出，不带病启动
   const log = logger
   const llm = llmFromConfig(config)
   const limiter = new FailureLimiter()
   const base = config.basePath
+  const revision = readRevision(codeRoot) // 启动时读一次：healthz 报告的是本进程加载的代码版本，而不是磁盘上此刻的文件
   const admin = createAdminHandler({ config, log, llm })
 
   const factory = (ctx) => {
@@ -188,7 +190,7 @@ export async function startServer(config, { logger = getLogger(), scheduler = tr
       return sendJson(res, 403, { error: 'forbidden host' })
     }
     if (pathname === `${base}/healthz`) {
-      return sendJson(res, 200, { ok: true, version: SERVER_VERSION, bind: req.socket.localAddress })
+      return sendJson(res, 200, { ok: true, version: SERVER_VERSION, revision: revision?.sha ?? null, revisionTime: revision?.time ?? null, describe: revision?.describe ?? null, bind: req.socket.localAddress })
     }
     if (admin.owns(pathname)) return admin.handle(req, res, url)
     if (pathname === `${base}/api/ingest`) return handleIngest(req, res)
