@@ -2,6 +2,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { withAdminHub, FAKE_SK } from './admin-helpers.mjs'
+import { GRAPH_AUTO_LIMIT, GRAPH_MAX_LIMIT } from '../../src/admin/graph.js'
 import { writeCard, deleteCard } from '../../src/core/vault.js'
 import { getDb } from '../../src/core/db.js'
 
@@ -116,6 +117,37 @@ test('limit / truncated：按加权度数保留，边只留两端都在的；超
     const full = await c.get(G)
     assert.equal(full.json.truncated, false)
     assert.equal((await c.get(`${G}?limit=999999`)).json.stats.limit, 2000)
+  })
+})
+
+test('自动上限：不带 limit 时用 GRAPH_AUTO_LIMIT（=2000），不截断且 stats.limitAuto=true', async () => {
+  await withAdminHub(async (h) => {
+    const c = await logged(h)
+    const r = await c.get(G)
+    assert.equal(r.status, 200, r.text)
+    assert.equal(r.json.truncated, false)
+    assert.equal(r.json.stats.limitAuto, true)
+    assert.equal(r.json.stats.limit, 2000)
+    assert.equal(r.json.stats.limit, GRAPH_AUTO_LIMIT)
+    // 空 limit 参数等价于不带
+    const blank = await c.get(`${G}?limit=`)
+    assert.equal(blank.json.stats.limitAuto, true)
+    assert.equal(blank.json.stats.limit, GRAPH_AUTO_LIMIT)
+  })
+})
+
+test('显式 limit：仍然截断且 stats.limitAuto=false；自动上限就是最大上限', async () => {
+  assert.equal(GRAPH_AUTO_LIMIT, GRAPH_MAX_LIMIT)
+  await withAdminHub(async (h) => {
+    const c = await logged(h)
+    const r = await c.get(`${G}?limit=5`)
+    assert.equal(r.json.truncated, true)
+    assert.equal(r.json.stats.limitAuto, false)
+    assert.equal(r.json.stats.limit, 5)
+    assert.equal(r.json.nodes.length, 5)
+    const max = await c.get(`${G}?limit=${GRAPH_MAX_LIMIT}`)
+    assert.equal(max.json.truncated, false)
+    assert.equal(max.json.stats.limitAuto, false)
   })
 })
 

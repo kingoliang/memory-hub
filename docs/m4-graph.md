@@ -19,7 +19,8 @@
 
 与原版差异：标签边 type 统一为 `tag`（共享标签放 `tags` 字段）；wikilink 解析单次命中（原版可能因标题回退多加一条）；相似度只取正文前 4000 字；标题经 `redactSecrets` 遮蔽。
 
-性能：全量建图结果按"指纹"（卡数/最大 updated_at/Σid/Σ标签长/Σ标题长/Σ正文长/audit_log 与 card_updates 水位）缓存在进程内，指纹变即失效；过滤/limit/focus 都在缓存上做。实测 662 卡（58 快照）建图 ≈250ms，命中缓存 ≈5ms。不落盘。
+性能：全量建图结果按"指纹"（卡数/最大 updated_at/Σid/Σ标签长/Σ标题长/Σ正文长/audit_log 与 card_updates 水位）缓存在进程内，指纹变即失效；过滤/limit/focus 都在缓存上做。不落盘。
+规模实测（合成数据、7 种 kind、带标签/正文/wikilink，非生产库，脚本 `tests/e2e/graph-perf-server.mjs` + `graph-perf-api.mjs` + `graph-perf-e2e.mjs`）：1500 卡冷建图 193ms / 命中缓存 20ms；2000 卡冷建图 323ms / 命中缓存 24ms；2000 卡默认视图进入页面 → canvas 首帧 267ms、单帧绘制均值 1.44ms。因此「自动上限」保持在 2000（= `GRAPH_MAX_LIMIT`），日常 1475 卡规模默认视图零截断。
 
 ## API
 `GET {base}/admin/api/graph`，只读、需管理员会话（未登录 401；Agent 令牌 401；POST 等 405）。`MEMORY_HUB_ADMIN_READONLY=1` 下可访问。
@@ -32,16 +33,17 @@
 | `min_weight` | 1–20，默认 1 |
 | `focus` | 卡片 **path**（本管理 API 以 path 为键，不暴露数字 id）；返回焦点 + `depth`（1–3，默认 1）跳邻域；不在图中（不存在/已删/隔离）→ 404 |
 | `hide_isolated` | `1` 去掉无边节点 |
-| `limit` | 默认 800，最大 2000（超出钳到 2000）；超限按加权度数（边权和）降序截断（焦点必留），`truncated:true` |
+| `limit` | 不带 = 自动上限（= 最大上限 2000，即默认显示全部节点）；显式 1–2000（超出钳到 2000）；超限按加权度数（边权和）降序截断（焦点必留），`truncated:true`，此时 `stats.limitAuto:true` |
 | `status` | 仅接受 `approved`（图只含主库），其它值 400 |
 
 处理顺序：kind/tag 选点 → types/min_weight 选边 → focus 邻域 → hide_isolated → limit 截断。
 
-响应：`{ nodes:[{id,title,kind,tags,status,createdAt,updatedAt,degree}], edges:[{source,target,type,weight,tags?,sim?}], truncated, stats:{totalCards,matchedNodes,nodes,edges,isolated,byKind,byType,limit,focus,cached,buildMs} }`。`degree` = 返回边里的出现次数。**不含正文/摘要**；点击节点后前端才请求现有 `GET /admin/api/card?path=` 取摘要。
+响应：`{ nodes:[{id,title,kind,tags,status,createdAt,updatedAt,degree}], edges:[{source,target,type,weight,tags?,sim?}], truncated, stats:{totalCards,matchedNodes,nodes,edges,isolated,byKind,byType,limit,limitAuto,focus,cached,buildMs} }`。`degree` = 返回边里的出现次数。**不含正文/摘要**；点击节点后前端才请求现有 `GET /admin/api/card?path=` 取摘要。
 
 ## 前端
-`web/js/views/graph.js`（视图）+ `web/js/graph-core.js`（纯函数：过滤/搜索/力导向/视图变换/命中测试，单测）。零依赖、canvas、自写力导向（O(n²) 斥力，≤1000 节点流畅），无构建、无外网、遵守现有 CSP 与 DOM 助手约束。
-交互：滚轮缩放（以光标为锚）、拖空白平移、拖节点、悬停提示与邻居高亮、点击→右侧面板（kind/标签/时间/度数/正文摘要/相邻卡片/「打开卡片详情」/「以此为中心展开」邻域模式 `#/graph?focus=`）；搜索高亮（标题/标签/kind/path）；kind 图例点选过滤；标签下拉；最小权重滑块；边类型开关；隐藏孤立点；最多节点数；适应/重新布局；键盘 `+ - 0 Esc`。颜色按 kind（簇色），大小按度数。
+`web/js/views/graph.js`（视图）+ `web/js/graph-core.js`（纯函数：过滤/搜索/力导向/视图变换/命中测试，单测）。零依赖、canvas、自写力导向（网格近邻斥力，2000 节点仍流畅：实测单帧绘制 ≈1.4ms），无构建、无外网、遵守现有 CSP 与 DOM 助手约束。
+交互：滚轮缩放（以光标为锚）、拖空白平移、拖节点、悬停提示与邻居高亮、点击→右侧面板（kind/标签/时间/度数/正文摘要/相邻卡片/「打开卡片详情」/「以此为中心展开」邻域模式 `#/graph?focus=`）；搜索高亮（标题/标签/kind/path）；kind 图例点选过滤；标签下拉；最小权重滑块；边类型开关；隐藏孤立点；最多节点数（默认「全部节点（自动）」，不写进 URL；手动可选 200/500/800/1500/2000）；适应/重新布局；键盘 `+ - 0 Esc`。颜色按 kind（簇色），大小按度数。
+截断提示是信息级（`notice('info')`）：只有卡数超过自动上限、或用户手动压小了上限才出现；默认视图没有任何截断提示。
 URL：`#/graph?focus=&tag=&kind=&limit=`。
 
 ### 暗色霓虹簇云风格
@@ -77,7 +79,7 @@ LLM：复用蒸馏的 OpenAI 兼容适配器（`MEMORY_LLM_*`，同一超时配�
 框选/合并/删除（管理台图谱只读）、右键菜单、导出、全屏、"时间模式"、视口剔除 LOD（改为标签预算 + 隐藏孤立点/最小权重/limit 降噪）、多库聚合、磁盘缓存。
 
 ## 测试
-`tests/admin/graph.test.mjs`（API：鉴权/结构/不泄露/过滤/limit/focus/边类型/只读/规模）、`tests/admin/graph-core.test.mjs`（纯函数）。截图 `docs/screenshots/m4/`（合成数据 260 卡，非真实数据）。
+`tests/admin/graph.test.mjs`（API：鉴权/结构/不泄露/过滤/limit/自动上限/focus/边类型/只读/规模）、`tests/admin/graph-core.test.mjs`（纯函数）。规模 / 首帧性能实测脚本见上（`tests/e2e/graph-perf-*.mjs`）。截图 `docs/screenshots/m4/`（合成数据，非真实数据；`07` 默认视图带截断警告（改动前，800 上限），`08`/`09` 1500/2000 卡默认视图无提示（改动后），`10` 手动上限 200 时的信息级提示，`11` 2100 卡（超自动上限）时的信息级自动截断提示）。
 
 ## 部署
 改了 `src/admin/{graph,graph-search,handler}.js`、`src/config.js`、`src/server.js` 与 `web/`：**需重启 hub**；**无 schema 变更**、无新依赖、无新配置。

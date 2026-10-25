@@ -186,7 +186,8 @@ export function createAdminHandler({ config, log, llm = null }) {
           focus: strParam(u, 'focus', 500),
           depth: intParam(u, 'depth', { def: 1, min: 1, max: 3 }),
           hideIsolated: hi === '1',
-          limit: intParam(u, 'limit', { def: G.GRAPH_DEFAULT_LIMIT, min: 1, max: G.GRAPH_MAX_LIMIT, clamp: true }),
+          // 不带 limit = 自动上限（全部节点，除非超过 GRAPH_AUTO_LIMIT）；显式 limit 1~2000，超出钳到 2000
+          limit: intParam(u, 'limit', { min: 1, max: G.GRAPH_MAX_LIMIT, clamp: true }),
         })
       } catch (e) {
         if (e instanceof G.GraphNotFound) throw new HttpError(404, 'not_found', e.message)

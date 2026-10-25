@@ -17,8 +17,10 @@ import {
   createLayout, LAYOUT_DONE, fitView, screenToWorld, zoomAt, hitTest, topLabelIds, clampZoom, filterGraph,
 } from '../graph-core.js'
 
-const LIMITS = [200, 500, 800, 1500, 2000]
-const DEFAULT_LIMIT = 800
+const LIMITS = ['auto', 200, 500, 800, 1500, 2000]
+const DEFAULT_LIMIT = 'auto'
+/** 规范化 limit：URL 里只认 'auto' 或 LIMITS 里的数字，其余回落到自动（= 不带参数）。 */
+const normLimit = (raw) => { const n = Number(raw); return LIMITS.includes(n) ? n : DEFAULT_LIMIT }
 const KIND_ORDER = ['project', 'knowledge', 'content', 'prompt', 'business', 'tool', 'mistake']
 /** 簇主题色（霓虹：青 / 紫 / 黄 / 品红 / 橙 / 薄荷 / 红）。画布恒为深色，与全站主题无关。 */
 const NEON = { project: '#2ee6ff', knowledge: '#b47bff', content: '#ffd23f', prompt: '#ff4fd8', business: '#ff8a2b', tool: '#3dffb0', mistake: '#ff4d5e', other: '#8b93a7' }
@@ -166,11 +168,11 @@ function recomputeClusters(L) {
 export default async function render(ctx) {
   const p = ctx.params
   const focus = p.get('focus') || ''
-  const limit = LIMITS.includes(Number(p.get('limit'))) ? Number(p.get('limit')) : DEFAULT_LIMIT
+  const limit = normLimit(p.get('limit'))
   const st = { tag: p.get('tag') || '', kind: p.get('kind') || '', minWeight: 1, hideIsolated: false, types: new Set(['link', 'tag', 'similar']), kinds: null, search: '' }
   let data
   try {
-    data = await get('graph', { focus, limit, depth: focus ? 2 : undefined })
+    data = await get('graph', { focus, limit: limit === DEFAULT_LIMIT ? undefined : limit, depth: focus ? 2 : undefined })
   } catch (e) {
     if (e.status === 404 && focus) { ctx.go('#/graph'); return h('div') }
     throw e
@@ -897,8 +899,8 @@ export default async function render(ctx) {
   const weight = h('input', { type: 'range', min: '1', max: '4', step: '1', value: '1', 'aria-label': '最小边权重', on: { input: (e) => { st.minWeight = Number(e.target.value); weightLbl.textContent = String(st.minWeight); rebuild() } } })
   const isoBox = h('input', { type: 'checkbox', 'aria-label': '隐藏孤立点', on: { change: (e) => { st.hideIsolated = e.target.checked; rebuild() } } })
   const typeBox = (t) => h('label', { class: 'check' }, [h('input', { type: 'checkbox', checked: true, 'aria-label': EDGE_LABEL[t], on: { change: (e) => { if (e.target.checked) st.types.add(t); else st.types.delete(t); rebuild() } } }), h('span', null, EDGE_LABEL[t])])
-  const limitSel = h('select', { 'aria-label': '最多节点数', on: { change: (e) => nav({ limit: Number(e.target.value) === DEFAULT_LIMIT ? '' : e.target.value }) } },
-    LIMITS.map((n) => h('option', { value: String(n), selected: n === limit }, `最多 ${n} 节点`)))
+  const limitSel = h('select', { 'aria-label': '最多节点数', on: { change: (e) => nav({ limit: e.target.value === DEFAULT_LIMIT ? '' : e.target.value }) } },
+    LIMITS.map((n) => h('option', { value: String(n), selected: n === limit }, n === DEFAULT_LIMIT ? '全部节点（自动）' : `最多 ${n} 节点`)))
   const zbtn = (label, fn, ic) => h('button', { type: 'button', class: 'graph-zbtn', title: label, 'aria-label': label, on: { click: fn } }, icon(ic))
 
   // 图例：kind 色块，点击切换显示该 kind（再点恢复）
@@ -971,11 +973,18 @@ export default async function render(ctx) {
     if (shown.nodes.length > top.length) nodeListEl.append(h('p', { class: 'sub' }, `仅列出关联数最高的 ${top.length} 个，共 ${fmtNum(shown.nodes.length)} 个；可用搜索或过滤缩小范围。`))
   }
 
+  // 截断提示降为 info：默认视图（自动上限 + 卡数没超）根本不出提示，只有超上限或用户手动压小上限才出现
+  function cutNotice() {
+    if (!data.truncated) return null
+    if (data.stats.limitAuto) return notice('info', `卡片数超过 ${fmtNum(data.stats.limit)}，仅显示关联度最高的 ${fmtNum(data.stats.nodes)} 个`, '可用标签 / 类型 / 最小权重缩小范围，或调低“最多节点数”只看重点。')
+    return notice('info', '已按所选上限显示', `已按所选上限显示关联度最高的 ${fmtNum(data.stats.nodes)} 个（共匹配 ${fmtNum(data.stats.matchedNodes)} 个）。可调高“最多节点数”，或用标签/类型/最小权重缩小范围。`)
+  }
+
   const head = pageHead('06', 'Graph', '知识图谱', `主库 ${fmtNum(data.stats.totalCards)} 张卡 · 边 = [[链接]] / 共享标签 Top-6 / 正文相似（≥0.42）· 只读`, [countEl, focus ? h('button', { type: 'button', class: 'btn btn-sm', on: { click: () => nav({ focus: '' }) } }, '返回全图') : null])
 
   const root = h('div', { class: 'page graph-page' }, [
     head,
-    data.truncated ? notice('warn', '节点过多，已按关联度截断', `匹配 ${fmtNum(data.stats.matchedNodes)} 个节点，仅显示关联度最高的 ${fmtNum(data.stats.nodes)} 个。可调高“最多节点数”，或用标签/类型/最小权重缩小范围。`) : null,
+    cutNotice(),
     panel(null, [toolbar, legendEl], { cls: 'panel-filters graph-controls' }),
     data.nodes.length === 0 ? empty('主库里还没有卡片', '图谱只展示已批准的卡片；沉淀并批准几张卡后这里会出现关系网络', h('a', { class: 'btn', href: '#/queue' }, '去待审队列'), 'graph') : h('div', { class: 'graph-layout' }, [stage, side]),
     data.nodes.length ? h('details', { class: 'fold graph-fold' }, [h('summary', null, [h('span', { class: 'fold-title' }, '节点列表（键盘 / 读屏替代入口）'), h('span', { class: 'sub' }, '按关联数排序，回车选中并定位')]), h('div', { class: 'fold-body' }, nodeListEl)]) : null,

@@ -11,8 +11,9 @@ import { minhashSignature, lshCandidates } from '../core/minhash.js'
 import { redactSecrets } from '../core/tidy.js'
 
 export const EDGE_TYPES = ['link', 'tag', 'similar']
-export const GRAPH_DEFAULT_LIMIT = 800
 export const GRAPH_MAX_LIMIT = 2000
+/** 「自动上限」：请求不带 limit 时用它，默认等于 GRAPH_MAX_LIMIT（= 全部节点，除非撑不住）。 */
+export const GRAPH_AUTO_LIMIT = GRAPH_MAX_LIMIT
 /** 边权重：显式 [[链接]] 最强；正文相似次之；标签边 = 共享标签个数。 */
 export const WEIGHT_LINK = 3
 export const WEIGHT_SIMILAR = 2
@@ -193,10 +194,12 @@ export class GraphNotFound extends Error {
 /**
  * @param {object} o { tags?:string[], kind?:string, types?:string[], minWeight?:number, focus?:string, depth?:number, hideIsolated?:boolean, limit?:number }
  * 处理顺序：kind/tag 选点 → 按类型/权重选边 → focus 邻域 → 去孤立点 → 按加权度数截断到 limit。
+ * 不带 limit（= 自动上限 GRAPH_AUTO_LIMIT）时 stats.limitAuto = true，前端据此区分“卡片太多自动截断”和“用户选了更小的上限”。
  */
 export function graphQuery(root, o = {}) {
   const { full, cached } = getFull(root)
-  const limit = o.limit ?? GRAPH_DEFAULT_LIMIT
+  const limitAuto = o.limit === undefined || o.limit === null
+  const limit = limitAuto ? GRAPH_AUTO_LIMIT : o.limit
   const minWeight = o.minWeight ?? 1
   const types = o.types?.length ? new Set(o.types) : null
   const tags = o.tags || []
@@ -259,7 +262,7 @@ export function graphQuery(root, o = {}) {
     truncated,
     stats: {
       totalCards: full.cards.length, matchedNodes: totalNodes, nodes: nodes.length, edges: edges.length,
-      isolated: nodes.filter((n) => n.degree === 0).length, byKind, byType, limit, focus: o.focus || null,
+      isolated: nodes.filter((n) => n.degree === 0).length, byKind, byType, limit, limitAuto, focus: o.focus || null,
       cached, buildMs: full.buildMs,
     },
   }
