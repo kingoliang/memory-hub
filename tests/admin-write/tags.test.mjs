@@ -124,3 +124,36 @@ test('自检失败 → 整批回滚、数据不变、返回错误（用触发器
     assert.equal(h.db().prepare("SELECT COUNT(*) n FROM write_log WHERE action='tag_rename' AND outcome='error'").get().n, 1)
   })
 })
+
+// GH #5：管理员的 rename / merge 就是新的规范写法，要写进规范表与同义表；回滚一并还原。
+const cfg = (h, k) => { const v = h.db().prepare('SELECT value FROM config WHERE key = ?').get(k)?.value; return v ? JSON.parse(v) : null }
+
+test('rename/merge 同步规范表与同义表；之后写入的变体归到新写法；回滚还原规范表', async () => {
+  await withHubW(async (h) => {
+    const c = await loggedIn(h)
+    const canon0 = h.db().prepare("SELECT value FROM config WHERE key='tagCanon'").get()?.value ?? null
+    const r = await c.wpost('/admin/api/tags/merge', { from: ['Node.js', 'nodejs', 'node-js'], to: 'NodeJS', confirm: true })
+    assert.equal(r.status, 200, r.text)
+    assert.equal(cfg(h, 'tagCanon').nodejs, 'NodeJS', '同键目标：规范写法改为管理员选的写法')
+    const rn = await c.wpost('/admin/api/tags/rename', { from: 'alpha', to: 'Alpha-Two', confirm: true })
+    assert.equal(rn.status, 200, rn.text)
+    assert.equal(cfg(h, 'tagSynonyms').alpha, 'Alpha-Two', '跨键重命名记进同义表')
+    assert.equal(cfg(h, 'tagCanon').alphatwo, 'Alpha-Two')
+    // 管理界面编辑卡片：输入旧写法 / 变体，保存后归到规范写法
+    const p = h.db().prepare('SELECT path FROM cards ORDER BY id LIMIT 1').get().path
+    const d0 = (await c.get('/admin/api/card?path=' + encodeURIComponent(p))).json
+    const e = await c.patch('/admin/api/card', { path: p, expectedUpdatedAt: d0.updatedAt, tags: ['node.js', 'ALPHA', 'brand-new'] })
+    assert.equal(e.status, 200, e.text)
+    assert.deepEqual(tagsOf(h, p), ['NodeJS', 'Alpha-Two', 'brand-new'])
+    // 回滚 rename：同义表回到 rename 之前
+    const rb = await c.wpost('/admin/api/tidy/rollback', { rollbackFile: rn.json.rollbackFile, confirm: true })
+    assert.equal(rb.status, 200, rb.text)
+    assert.equal(cfg(h, 'tagSynonyms')?.alpha, undefined)
+    const rb2 = await c.wpost('/admin/api/tidy/rollback', { rollbackFile: r.json.rollbackFile, confirm: true })
+    assert.equal(rb2.status, 200, rb2.text)
+    // 编辑时新钉入的 brand-new 不属于这两次操作，回滚后只确认 nodejs 回到操作前状态
+    const after = cfg(h, 'tagCanon') || {}
+    const before = canon0 ? JSON.parse(canon0) : {}
+    assert.equal(after.nodejs, before.nodejs)
+  })
+})

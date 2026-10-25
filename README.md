@@ -113,7 +113,7 @@ stdio（本机单 Agent，身份取环境变量 `MEMORY_HUB_AGENT`，不经网�
 | `memory_capture` | `write` | 沉淀一条自包含知识（一次一个主题，上限 64K 字符） |
 | `memory_stats` | `read` | 库概览：总数、分类分布、近期新增 |
 | `memory_audit_list` | `read` | 列出待审 / 已驳回卡片（只读，不改变状态） |
-| `memory_tidy_plan` | `read` | 整理预览：重复、超长 raw、标签异常 |
+| `memory_tidy_plan` | `read` | 整理预览：重复、同主题组、周期性快照序列、超长 raw、标签异常 |
 | `memory_tidy_apply` | `tidy:apply` | 执行整理（需 `confirm`，先备份后自检）；默认不出现在 `tools/list`，用 `MEMORY_HUB_MCP_EXPOSE_TIDY_APPLY=1` 打开 |
 | `memory_lint` | `read` | 结构 / 标签 / 疑似密钥检查 |
 | `memory_tag_normalize` | `tidy:apply` | 标签归一（同上，默认隐藏） |
@@ -165,12 +165,20 @@ stdio（本机单 Agent，身份取环境变量 `MEMORY_HUB_AGENT`，不经网�
 | `MEMORY_HUB_INGEST_MIN_CHARS` / `_COOLDOWN_S` / `_DAILY_QUOTA` / `_MAX_BODY_BYTES` | `300` / `120` / `200` / `256KiB` | 摄入闸门 |
 | `MEMORY_HUB_LOG_LEVEL` | `info` | 日志级别（日志走 stderr） |
 | `MEMORY_HUB_AGENT` | — | 仅 stdio：自报身份，写进署名 |
+| `MEMORY_TAG_MAX` | `6` | 每卡标签上限（1~20），蒸馏与 tidy 共用 |
 
 蒸馏（DeepSeek 等 OpenAI 兼容端点；`BASE_URL` 与 `MODEL` 缺一则降级为原文卡，不回退到 `OPENAI_*`）：
 
 `MEMORY_LLM_BASE_URL`、`MEMORY_LLM_MODEL`、`MEMORY_LLM_KEY`、可选 `MEMORY_LLM_REASONING_EFFORT` / `MEMORY_LLM_EXTRA_BODY` / `MEMORY_LLM_TIMEOUT_MS`。细节与重试阶梯见 [`docs/deployment-config.md`](docs/deployment-config.md)。
 
 密钥永不进日志：日志只记录是否配置、模型名、key 是否已设置。
+
+### 内容组织与标签
+
+- **规范标签表**：DB `config` 表的 `tagCanon`（归一键 → 规范写法）与 `tagSynonyms`（归一键 → 目标写法）。capture / ingest / 管理界面编辑写入时按归一键（NFKC + 小写 + 去空白/连字符/下划线/点）映射到已有规范写法；首次出现的写法被钉进规范表，之后不随计数翻转。管理界面「标签 → 重命名 / 合并」会同步改规范表与同义表，可回滚。蒸馏 prompt 附带热门已有标签供模型复用。
+- **同主题组**：`tidy plan` 用标题主干（去掉日期/时间/序号）+ 正文 + 标签 + 实体（型号/版本/驼峰名/缩写）多信号分组，只报告；可选批次 `topics` 才合并（独特行并入保留卡，其余软删，带备份与回滚文件）。
+- **周期性快照**：同标题主干 + 标题带时间戳、至少 3 张的序列在报告里给出「归入时间线卡」建议；可选批次 `snapshots` 才执行（最新一张改名为「主干（时间线）」，其余按时间追加为小节后软删，可回滚）。
+- 默认批次仍是 `noise` / `merge` / `tags`，`topics` 与 `snapshots` 只有显式指定才执行。前后对比：`node scripts/demo/organize-compare.mjs <临时目录>`。
 
 ## CLI
 

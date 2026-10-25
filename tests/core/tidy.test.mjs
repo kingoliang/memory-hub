@@ -39,9 +39,10 @@ test('tidyPlan：只读，且覆盖五类发现', async () => {
   assert.equal(plan.duplicates[0].canonical.path, '02-Projects/sop-canon.md')
   assert.deepEqual(plan.duplicates[0].absorbs.map((a) => a.path).sort(), ['02-Projects/sop-dup1.md', '02-Projects/sop-dup2.md'])
   assert.ok(plan.duplicates[0].absorbs.every((a) => a.sim >= 0.6 && a.uniqueLines >= 1))
-  // 标签：Docker/docker 归一，Docker-Compose/docker compose 归一，超 4 的卡去掉单次标签
+  // 标签：Docker/docker 归一，Docker-Compose/docker compose 归一，超上限（MEMORY_TAG_MAX，默认 6）的卡去掉单次标签
+  assert.equal(plan.options.maxTags, 6)
   const t3 = plan.tags.changes.find((c) => c.path === '07-Tools/t3.md')
-  assert.ok(t3 && t3.new.length <= 4 && t3.new.includes('docker'))
+  assert.ok(t3 && t3.new.length <= plan.options.maxTags && t3.new.includes('docker'))
   assert.ok(plan.tags.distinctAfter < plan.tags.distinctBefore)
   // kind 错放
   assert.deepEqual(plan.kindMisplaced.map((k) => [k.path, k.kind, k.expectedKind]), [['03-Knowledge/misplaced.md', 'tool', 'knowledge']])
@@ -114,7 +115,9 @@ test('tidyApply confirm：备份 → 软删 → 合并保留独特信息 → 自
   assert.equal(db.prepare('SELECT COUNT(*) n FROM cards').get().n, total0)
   const canon2 = db.prepare("SELECT body FROM cards WHERE path='02-Projects/sop-canon.md'").get()
   assert.ok(!canon2.body.includes(U1))
-  assert.equal(JSON.parse(db.prepare("SELECT tags FROM cards WHERE path='07-Tools/t3.md'").get().tags).length, 6)
+  assert.equal(JSON.parse(db.prepare("SELECT tags FROM cards WHERE path='07-Tools/t3.md'").get().tags).length, 8)
+  // 标签批次钉进规范表的写法随回滚一起撤销（整理前没有 tagCanon 键）
+  assert.equal(db.prepare("SELECT value FROM config WHERE key='tagCanon'").get(), undefined)
   assert.equal(content(), contentBefore, '回滚后每张卡的 path/kind/title/tags/body 与整理前逐字一致')
 })
 
@@ -183,7 +186,7 @@ test('tidyLint：只读指标，不含密钥值', async () => {
   assert.equal(m.kindMisplaced, 1)
   assert.equal(m.oversizeRaw.length, 1)
   assert.equal(m.oversizeRaw[0].path, '04-Content/big-raw.md')
-  assert.ok(m.tagsOver4 >= 1 && m.tagVariantGroups >= 1)
+  assert.ok(m.tagsOverMax >= 1 && m.tagVariantGroups >= 1 && m.maxTags === 6)
   assert.equal(m.integrity, 'ok')
   const text = formatTidyLint(m)
   assert.ok(/健康检查/.test(text) && !text.includes(FAKE.github()) && !text.includes(FAKE.pass()))

@@ -14,6 +14,7 @@ import { createLlmFromEnv } from './llm-openai.js'
 import { DEFAULT_LLM_TIMEOUT_MS } from '../config.js'
 import { resolveDedupConfig } from './dedup-config.js'
 import { enforceAudit, getDb } from './db.js'
+import { topTags, resolveMaxTags } from './tags.js'
 import { detectSecrets } from './tidy.js'
 import { truncateAtBoundary, normalizeLiteralEscapes } from './vault.js'
 import { getLogger } from '../logger.js'
@@ -56,8 +57,10 @@ export async function runStandaloneCapture(vaultRoot, text, { source = '', submi
   // 有 LLM：蒸馏判定链
   if (llmClient && route) {
     try {
-      const neighbors = await pickNeighbors(vaultRoot, { title: '', body: clean.slice(0, 400) }, 8)
-      const { detailed, attempts, outBudget } = await distillWithRetry(llmClient, route, clean, neighbors, log)
+      // 邻居按「推导标题 + 正文前 2000 字」多信号召回（旧版只用前 400 字、标题为空，同主题卡常被挤出前 8）
+      const neighbors = await pickNeighbors(vaultRoot, { title, body: clean.slice(0, 2000) }, 8)
+      const knownTags = topTags(getDb(vaultRoot), 40)
+      const { detailed, attempts, outBudget } = await distillWithRetry(llmClient, route, clean, neighbors, log, { knownTags, maxTags: resolveMaxTags(env) })
       let result = detailed.card
       if (detailed.failure) {
         const f = detailed.failure
@@ -151,14 +154,14 @@ const RETRYABLE_CATEGORIES = new Set(['empty', 'length', 'truncated'])
  *    摄入请求的尾延迟翻倍，而超时通常是上游整体慢 / 不可用，重试收益低。异常向上抛，由调用方降级。
  *  - 重试发生在任何建卡动作之前（本函数只调模型），所以不会重复建卡；幂等 / 去重 / 冷却都在其外层，不受影响。
  */
-async function distillWithRetry(llmClient, route, clean, neighbors, log) {
+async function distillWithRetry(llmClient, route, clean, neighbors, log, extra = {}) {
   const timeoutMs = Number(llmClient.timeoutMs) > 0 ? Number(llmClient.timeoutMs) : DEFAULT_LLM_TIMEOUT_MS
   const budgets = [DEFAULT_CAPTURE_MAX_TOKENS, ...maxTokenLadder(DEFAULT_CAPTURE_MAX_TOKENS, DISTILL_RETRY_CEILING)]
   let detailed
   let attempts = 0
   for (const maxTokens of budgets) {
     attempts++
-    detailed = await summarizeTurnDetailed(llmClient, route, clean, { existing: neighbors, maxTokens, signal: AbortSignal.timeout(timeoutMs) })
+    detailed = await summarizeTurnDetailed(llmClient, route, clean, { existing: neighbors, ...extra, maxTokens, signal: AbortSignal.timeout(timeoutMs) })
     const f = detailed.failure
     if (!f || !RETRYABLE_CATEGORIES.has(f.category)) return { detailed, attempts, outBudget: maxTokens }
     if (attempts < budgets.length) {

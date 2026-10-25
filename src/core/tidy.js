@@ -27,11 +27,18 @@ import {
   softDeleteCardSync, restoreCardSync,
 } from './vault.js'
 import { resolveDedupConfig } from './dedup-config.js'
+import { tagKey, pickCanonical, resolveMaxTags, loadTagTables, readConfigRaw, writeConfigRaw, patchTagTable, TAG_CANON_KEY } from './tags.js'
+import { planTopicGroups, planSnapshotSeries } from './topics.js'
 
+export { tagKey }
+/** 默认批次（不传 batches 时执行这些）。 */
 export const TIDY_BATCHES = ['noise', 'merge', 'tags']
+/** 可选批次：只在显式指定时执行（同主题合并 / 快照归入时间线卡），默认绝不自动合并删除。 */
+export const OPTIONAL_TIDY_BATCHES = ['topics', 'snapshots']
+export const ALL_TIDY_BATCHES = [...TIDY_BATCHES, ...OPTIONAL_TIDY_BATCHES]
 export const NOISE_CATEGORIES = ['schedule-reminder', 'timeout-notice', 'fragment', 'agent-chatter']
 const DEFAULT_NOISE_CATEGORIES = ['schedule-reminder', 'timeout-notice', 'fragment']
-const DEFAULTS = { maxTags: 4, rawMaxChars: 6000, maxDelete: 50, simBodyLimit: 8000, mergeLinesPerGroup: 15, mergedTagCap: 10 }
+const DEFAULTS = { rawMaxChars: 6000, maxDelete: 50, simBodyLimit: 8000, mergeLinesPerGroup: 15, timelineLines: 200 }
 
 // ---------------------------------------------------------------------------
 // 日志
@@ -141,8 +148,6 @@ export function classifyNoise(card, categories = DEFAULT_NOISE_CATEGORIES) {
 // 标签归一
 // ---------------------------------------------------------------------------
 
-/** 归一键：NFKC + 小写 + 去掉空白/下划线/连字符/点/中点。 */
-export const tagKey = (t) => String(t).normalize('NFKC').toLowerCase().replace(/[\s_\-·.]+/g, '')
 
 function parseTags(raw) {
   try {
@@ -152,22 +157,14 @@ function parseTags(raw) {
   return { tags: [], malformed: true }
 }
 
-/** 变体里选规范写法：次数多者胜；平手 → 小写优先 → 连字符优先于空格 → 短者 → 字典序。 */
-function pickCanonical(variants, counts) {
-  return [...variants].sort((a, b) =>
-    counts.get(b) - counts.get(a)
-    || (b === b.toLowerCase()) - (a === a.toLowerCase())
-    || (!/\s/.test(b)) - (!/\s/.test(a))
-    || a.length - b.length
-    || (a < b ? -1 : a > b ? 1 : 0))[0]
-}
-
 /**
  * 计算标签归一计划（纯函数）。
  * @param rows [{id,path,title,tags(JSON 字符串)}]
- * @param opts {synonyms:{from:to}, maxTags}
+ * @param opts {synonyms:{from:to}, canon:{tagKey:规范写法}, maxTags}
+ *   canon 是持久化的规范表（DB config tagCanon）：命中的组**一律用表里的写法**，不再按当天计数挑，
+ *   所以规范写法不会每天翻转；没命中的多变体组按计数挑一次，放进返回的 decided，apply 时写回规范表。
  */
-export function planTagNormalize(rows, { synonyms = {}, maxTags = DEFAULTS.maxTags } = {}) {
+export function planTagNormalize(rows, { synonyms = {}, canon: persisted = {}, maxTags = resolveMaxTags() } = {}) {
   const syn = new Map(Object.entries(synonyms || {}).map(([k, v]) => [tagKey(k), String(v).trim()]).filter(([, v]) => v))
   const parsed = rows.map((r) => ({ row: r, ...parseTags(r.tags) }))
   const mapped = parsed.map((p) => ({ ...p, tags: p.tags.map((t) => syn.get(tagKey(t)) ?? t) }))
@@ -176,7 +173,13 @@ export function planTagNormalize(rows, { synonyms = {}, maxTags = DEFAULTS.maxTa
   const groups = new Map()
   for (const t of counts.keys()) { const k = tagKey(t); if (!groups.has(k)) groups.set(k, []); groups.get(k).push(t) }
   const canon = new Map()
-  for (const variants of groups.values()) { const c = pickCanonical(variants, counts); for (const v of variants) canon.set(v, c) }
+  const decided = {}
+  for (const [k, variants] of groups) {
+    const fixed = persisted?.[k]
+    const c = fixed || pickCanonical(variants, counts)
+    if (!fixed && variants.length > 1) decided[k] = c
+    for (const v of variants) canon.set(v, c)
+  }
   const step1 = mapped.map((p) => ({ ...p, tags: [...new Set(p.tags.map((t) => canon.get(t) ?? t))] }))
   const finalCount = new Map()
   for (const p of step1) for (const t of p.tags) finalCount.set(t, (finalCount.get(t) || 0) + 1)
@@ -201,7 +204,7 @@ export function planTagNormalize(rows, { synonyms = {}, maxTags = DEFAULTS.maxTa
   const map = {}
   for (const [from, to] of canon) if (from !== to) map[from] = to
   for (const p of parsed) for (const t of p.tags) { const s = syn.get(tagKey(t)); if (s && s !== t) map[t] = canon.get(s) ?? s }
-  return { changes, map, distinctBefore: new Set(parsed.flatMap((p) => p.tags)).size, distinctAfter: after.size }
+  return { changes, map, decided, distinctBefore: new Set(parsed.flatMap((p) => p.tags)).size, distinctAfter: after.size }
 }
 
 // ---------------------------------------------------------------------------
@@ -249,9 +252,31 @@ export function planDuplicateGroups(cards, threshold, { limit = DEFAULTS.simBody
 const DIR_TO_KIND = Object.fromEntries(Object.entries(KIND_ROOTS).map(([k, v]) => [v.toLowerCase(), k]))
 
 function loadCards(db) {
-  return db.prepare('SELECT id, path, kind, title, tags, body FROM cards ORDER BY id').all().map((r) => ({
-    id: r.id, path: r.path, kind: r.kind, title: r.title || '', body: r.body || '', tagsRaw: r.tags, tags: parseTags(r.tags).tags,
+  return db.prepare('SELECT id, path, kind, title, tags, body, created_at FROM cards ORDER BY id').all().map((r) => ({
+    id: r.id, path: r.path, kind: r.kind, title: r.title || '', body: r.body || '', tagsRaw: r.tags, tags: parseTags(r.tags).tags, createdAt: r.created_at || null,
   }))
+}
+
+/** 标签归一要用的同义表 = DB 持久化的 tagSynonyms + 调用方临时传入的（后者优先）。 */
+function tagOptions(db, o) {
+  const t = loadTagTables(db)
+  return { synonyms: { ...t.synonyms, ...o.synonyms }, canon: t.canon, maxTags: o.maxTags }
+}
+
+/** 噪声卡路径集合 + 近重复组 + 快照序列 + 同主题组（plan 与 apply 共用同一套排除规则，保证结果一致）。 */
+function planGroups(cards, o, want) {
+  const noisePaths = new Set(cards.filter((c) => classifyNoise(c, o.noiseCategories)).map((c) => c.path))
+  const live = cards.filter((c) => !noisePaths.has(c.path))
+  const duplicates = want.has('duplicates') || want.has('topics') ? planDuplicateGroups(live, o.threshold) : []
+  const snapshots = want.has('snapshots') || want.has('topics') ? planSnapshotSeries(live, { minSeries: o.snapshotMin }) : []
+  let topics = []
+  if (want.has('topics')) {
+    const exclude = new Set()
+    for (const g of duplicates) { exclude.add(g.canonical.path); g.absorbs.forEach((a) => exclude.add(a.path)) }
+    for (const s of snapshots) { exclude.add(s.timeline.path); s.members.forEach((m) => exclude.add(m.path)) }
+    topics = planTopicGroups(live, { threshold: o.topicThreshold, exclude })
+  }
+  return { noisePaths, duplicates, snapshots, topics }
 }
 
 function resolveOptions(opts = {}) {
@@ -260,7 +285,9 @@ function resolveOptions(opts = {}) {
   const cats = Array.isArray(opts.noiseCategories) && opts.noiseCategories.length ? opts.noiseCategories.filter((c) => NOISE_CATEGORIES.includes(c)) : DEFAULT_NOISE_CATEGORIES
   return {
     threshold: num(opts.threshold, dd.threshold, 0.05, 1),
-    maxTags: Math.floor(num(opts.maxTags, DEFAULTS.maxTags, 1, 20)),
+    topicThreshold: num(opts.topicThreshold, 0.5, 0.2, 1),
+    snapshotMin: Math.floor(num(opts.snapshotMin, 3, 2, 1000)),
+    maxTags: Math.floor(num(opts.maxTags, resolveMaxTags(opts.env ?? process.env), 1, 20)),
     rawMaxChars: Math.floor(num(opts.rawMaxChars, DEFAULTS.rawMaxChars, 500, 10_000_000)),
     maxDelete: Math.floor(num(opts.maxDelete, DEFAULTS.maxDelete, 0, 100000)),
     noiseCategories: cats,
@@ -268,28 +295,36 @@ function resolveOptions(opts = {}) {
   }
 }
 
+export const PLAN_SECTIONS = ['noise', 'duplicates', 'topics', 'snapshots', 'tags', 'kind', 'secrets', 'oversize']
+/** planId 由这几类决定（apply 时按同样几类重算计划核对）。 */
+const PLAN_ID_SECTIONS = ['noise', 'duplicates', 'topics', 'snapshots', 'tags']
+
 /**
  * 生成整理计划（只读，不改库）。
- * @param opts.sections 只算其中几类：['noise','duplicates','tags','kind','secrets','oversize']，默认全部
+ * @param opts.sections 只算其中几类（PLAN_SECTIONS），默认全部
  */
 export async function tidyPlan(root, opts = {}) {
   const log = makeLogger(opts)
   const o = resolveOptions(opts)
-  const want = new Set(opts.sections ?? ['noise', 'duplicates', 'tags', 'kind', 'secrets', 'oversize'])
+  const want = new Set(opts.sections ?? PLAN_SECTIONS)
   const db = getDb(root)
   const cards = loadCards(db)
-  const plan = { generatedAt: new Date().toISOString(), options: o, totals: { cards: cards.length }, noise: [], duplicates: [], tags: { changes: [], map: {}, distinctBefore: 0, distinctAfter: 0 }, kindMisplaced: [], secrets: [], oversizeRaw: [] }
+  const plan = { generatedAt: new Date().toISOString(), options: o, totals: { cards: cards.length }, noise: [], duplicates: [], topics: [], snapshots: [], tags: { changes: [], map: {}, decided: {}, distinctBefore: 0, distinctAfter: 0 }, kindMisplaced: [], secrets: [], oversizeRaw: [] }
 
-  const noisePaths = new Set()
-  if (want.has('noise') || want.has('duplicates')) {
+  if (want.has('noise')) {
     for (const c of cards) {
       const n = classifyNoise(c, o.noiseCategories)
-      if (n) { noisePaths.add(c.path); if (want.has('noise')) plan.noise.push({ id: c.id, path: c.path, title: c.title, category: n.category, reason: n.reason }) }
+      if (n) plan.noise.push({ id: c.id, path: c.path, title: c.title, category: n.category, reason: n.reason })
     }
   }
-  if (want.has('duplicates')) plan.duplicates = planDuplicateGroups(cards.filter((c) => !noisePaths.has(c.path)), o.threshold)
+  if (want.has('duplicates') || want.has('topics') || want.has('snapshots')) {
+    const g = planGroups(cards, o, want)
+    if (want.has('duplicates')) plan.duplicates = g.duplicates
+    if (want.has('topics')) plan.topics = g.topics
+    if (want.has('snapshots')) plan.snapshots = g.snapshots
+  }
   if (want.has('tags')) {
-    plan.tags = planTagNormalize(db.prepare('SELECT id, path, title, tags FROM cards ORDER BY id').all(), { synonyms: o.synonyms, maxTags: o.maxTags })
+    plan.tags = planTagNormalize(db.prepare('SELECT id, path, title, tags FROM cards ORDER BY id').all(), tagOptions(db, o))
   }
   if (want.has('kind')) {
     for (const c of cards) {
@@ -311,8 +346,10 @@ export async function tidyPlan(root, opts = {}) {
     noise: plan.noise.map((n) => n.path),
     dup: plan.duplicates.map((g) => [g.canonical.path, g.absorbs.map((a) => a.path)]),
     tags: plan.tags.changes.map((c) => [c.path, c.new]),
+    ...(plan.topics.length ? { topics: plan.topics.map((g) => [g.canonical.path, g.members.map((m) => m.path)]) } : {}),
+    ...(plan.snapshots.length ? { snap: plan.snapshots.map((s) => [s.timeline.path, s.members.map((m) => m.path)]) } : {}),
   })).digest('hex').slice(0, 12)
-  log('INFO', `plan 完成：cards=${cards.length} 阈值=${o.threshold} 噪声=${plan.noise.length} 重复组=${plan.duplicates.length} 标签变更=${plan.tags.changes.length} kind错放=${plan.kindMisplaced.length} 密钥疑似=${plan.secrets.length}`)
+  log('INFO', `plan 完成：cards=${cards.length} 阈值=${o.threshold} 噪声=${plan.noise.length} 重复组=${plan.duplicates.length} 同主题组=${plan.topics.length} 快照序列=${plan.snapshots.length} 标签变更=${plan.tags.changes.length} kind错放=${plan.kindMisplaced.length} 密钥疑似=${plan.secrets.length}`)
   return plan
 }
 
@@ -384,14 +421,19 @@ export function selfCheck(db, root, before, expectRemoved) {
 export async function tidyApply(root, opts = {}) {
   const log = makeLogger(opts)
   const o = resolveOptions(opts)
-  const batches = Array.isArray(opts.batches) && opts.batches.length ? opts.batches : TIDY_BATCHES
-  const unknown = batches.filter((b) => !TIDY_BATCHES.includes(b))
-  if (unknown.length) return { ok: false, dryRun: true, code: 'unknown_batch', error: `未知批次：${unknown.join(',')}（可选 ${TIDY_BATCHES.join('/')}）` }
+  const requested = Array.isArray(opts.batches) && opts.batches.length ? opts.batches : TIDY_BATCHES
+  const unknown = requested.filter((b) => !ALL_TIDY_BATCHES.includes(b))
+  if (unknown.length) return { ok: false, dryRun: true, code: 'unknown_batch', error: `未知批次：${unknown.join(',')}（可选 ${ALL_TIDY_BATCHES.join('/')}）` }
+  // 固定执行顺序：噪声 → 近重复 → 快照归入时间线 → 同主题合并 → 标签（后面的批次看得到前面的结果）
+  const batches = ALL_TIDY_BATCHES.filter((b) => requested.includes(b)).sort((a, b) => BATCH_ORDER.indexOf(a) - BATCH_ORDER.indexOf(b))
   const confirm = opts.confirm === true
-  // planId 由 noise/duplicates/tags 三类共同决定，所以不论只执行哪些批次，这里都按这三类生成计划，
+  // planId 由 PLAN_ID_SECTIONS 共同决定，所以不论只执行哪些批次，这里都按这几类生成计划，
   // 才能与 memory_tidy_plan 返回的 planId 对得上。
-  const plan = await tidyPlan(root, { ...opts, sections: ['noise', 'duplicates', 'tags'], logger: () => {} })
-  const plannedDeletes = (batches.includes('noise') ? plan.noise.length : 0) + (batches.includes('merge') ? plan.duplicates.reduce((n, g) => n + g.absorbs.length, 0) : 0)
+  const plan = await tidyPlan(root, { ...opts, sections: PLAN_ID_SECTIONS, logger: () => {} })
+  const plannedDeletes = (batches.includes('noise') ? plan.noise.length : 0)
+    + (batches.includes('merge') ? plan.duplicates.reduce((n, g) => n + g.absorbs.length, 0) : 0)
+    + (batches.includes('topics') ? plan.topics.reduce((n, g) => n + g.members.length, 0) : 0)
+    + (batches.includes('snapshots') ? plan.snapshots.reduce((n, g) => n + g.members.filter((m) => m.path !== g.timeline.path).length, 0) : 0)
   const base = { plan, planId: plan.planId, plannedDeletes }
 
   if (opts.planId && opts.planId !== plan.planId) {
@@ -419,7 +461,7 @@ export async function tidyApply(root, opts = {}) {
     log('ERROR', `备份失败，未改动任何数据：${e.message}`)
     return { ok: false, dryRun: false, code: 'backup_failed', ...base, error: `备份失败，未改动任何数据：${e.message}` }
   }
-  const rollback = { version: 1, tool: 'memory-eternal-tidy', createdAt: new Date().toISOString(), vault: path.resolve(root), backup: backup.path, removed: [], merged: [], tags: [] }
+  const rollback = { version: 1, tool: 'memory-eternal-tidy', createdAt: new Date().toISOString(), vault: path.resolve(root), backup: backup.path, removed: [], merged: [], tags: [], config: [] }
   const rollbackFile = backup.path.replace(/pre-tidy-/, 'tidy-').replace(/\.db$/, '.rollback.json')
   const results = []
   let ok = true
@@ -435,19 +477,24 @@ export async function tidyApply(root, opts = {}) {
   return { ok, dryRun: false, ...base, backup, batches: results, rollbackFile: fs.existsSync(rollbackFile) ? rollbackFile : null, after }
 }
 
+const BATCH_ORDER = ['noise', 'merge', 'snapshots', 'topics', 'tags']
+
 function batchPreview(name, plan) {
   if (name === 'noise') return { removed: plan.noise.length }
   if (name === 'merge') return { groups: plan.duplicates.length, removed: plan.duplicates.reduce((n, g) => n + g.absorbs.length, 0) }
-  return { tagsChanged: plan.tags.changes.length }
+  if (name === 'topics') return { groups: plan.topics.length, removed: plan.topics.reduce((n, g) => n + g.members.length, 0) }
+  if (name === 'snapshots') return { series: plan.snapshots.length, removed: plan.snapshots.reduce((n, g) => n + g.members.filter((m) => m.path !== g.timeline.path).length, 0) }
+  return { tagsChanged: plan.tags.changes.length, canonPinned: Object.keys(plan.tags.decided || {}).length }
 }
 
 /** 一个批次 = 一个事务。基于「批次开始时的实时库状态」重算子计划，所以前一批的结果会被后一批看到。 */
 function runBatch(db, root, name, o, rollback, log) {
   const before = snapshotCounts(db)
-  const mark = { removed: rollback.removed.length, merged: rollback.merged.length, tags: rollback.tags.length }
+  const mark = { removed: rollback.removed.length, merged: rollback.merged.length, tags: rollback.tags.length, config: rollback.config.length }
   db.exec('BEGIN IMMEDIATE')
   try {
-    const counts = name === 'noise' ? batchNoise(db, o, rollback, log) : name === 'merge' ? batchMerge(db, o, rollback, log) : batchTags(db, o, rollback, log)
+    const run = { noise: batchNoise, merge: batchMerge, topics: batchTopics, snapshots: batchSnapshots, tags: batchTags }[name]
+    const counts = run(db, o, rollback, log)
     const check = selfCheck(db, root, before, counts.removed || 0)
     if (!check.ok) throw new Error('自检失败：' + check.failures.join('；'))
     db.exec('COMMIT')
@@ -455,7 +502,7 @@ function runBatch(db, root, name, o, rollback, log) {
     return { name, status: 'applied', counts, checks: check.checks }
   } catch (e) {
     try { db.exec('ROLLBACK') } catch { /* 已回滚 */ }
-    rollback.removed.length = mark.removed; rollback.merged.length = mark.merged; rollback.tags.length = mark.tags
+    rollback.removed.length = mark.removed; rollback.merged.length = mark.merged; rollback.tags.length = mark.tags; rollback.config.length = mark.config
     log('ERROR', `批次 ${name} 失败，已整批回滚：${e.message}`)
     return { name, status: 'rolled_back', counts: {}, error: String(e.message || e) }
   }
@@ -479,44 +526,117 @@ function batchNoise(db, o, rollback, log) {
   return { removed: hits.length }
 }
 
+/**
+ * 把一组卡并进保留卡：独特行进「合并补充」小节（不含疑似密钥行），标签取并集（受 maxTags 限制，保留卡自身标签优先），
+ * 被吸收卡软删进回收站。保留卡改动前的 body/summary/tags/updated_at 记进回滚文件。
+ */
+function mergeInto(db, rollback, canon, sources, { why, reason, o, linesPerGroup = DEFAULTS.mergeLinesPerGroup }) {
+  let budget = linesPerGroup
+  const tagSet = new Set(canon.tags)
+  const extra = []
+  for (const src of sources) {
+    const lines = budget > 0 ? uniqueLinesAgainst(canon.body + '\n' + extra.join('\n'), src.body, { max: budget }).filter((l) => detectSecrets(l).length === 0) : []
+    budget -= lines.length
+    extra.push(...lines)
+    src.tags.forEach((t) => tagSet.add(t))
+  }
+  const newBody = withMergeSection(canon.body, extra).trim()
+  const tags = [...tagSet].slice(0, Math.max(o.maxTags, canon.tags.length))
+  rollback.merged.push({ path: canon.path, before: db.prepare('SELECT body, summary, tags, updated_at FROM cards WHERE path = ?').get(canon.path) })
+  db.prepare('UPDATE cards SET body = ?, summary = ?, tags = ?, updated_at = ? WHERE path = ?').run(newBody, newBody.slice(0, 200), JSON.stringify(tags), new Date().toISOString(), canon.path)
+  if (!newBody.startsWith(canon.body.trim())) throw new Error(`合并后正文丢失原内容：${canon.path}`)
+  for (const src of sources) {
+    softDeleteCardSync(db, src.path, { changedBy: 'tidy', reason: reason(src), quarantineReason: `整理：并入 ${canon.path}` })
+    recordRemoved(db, rollback, src.path, `${why}:${canon.path}`)
+  }
+  return extra.length
+}
+
+function liveCards(db, o) {
+  return loadCards(db).filter((c) => !classifyNoise(c, o.noiseCategories))
+}
+
 function batchMerge(db, o, rollback, log) {
-  const cards = loadCards(db).filter((c) => !classifyNoise(c, o.noiseCategories))
+  const cards = liveCards(db, o)
   const byPath = new Map(cards.map((c) => [c.path, c]))
   const groups = planDuplicateGroups(cards, o.threshold)
   const total = groups.reduce((n, g) => n + g.absorbs.length, 0)
   if (total > o.maxDelete) throw new Error(`实时计划软删 ${total} 张，超过 maxDelete=${o.maxDelete}`)
   let removed = 0
-  const now = new Date().toISOString()
   for (const g of groups) {
     const canon = byPath.get(g.canonical.path)
-    let body = canon.body
-    let budget = DEFAULTS.mergeLinesPerGroup
-    const tagSet = new Set(canon.tags)
-    const extra = []
-    for (const a of g.absorbs) {
-      const src = byPath.get(a.path)
-      const lines = budget > 0 ? uniqueLinesAgainst(body + '\n' + extra.join('\n'), src.body, { max: budget }).filter((l) => detectSecrets(l).length === 0) : []
-      budget -= lines.length
-      extra.push(...lines)
-      src.tags.forEach((t) => tagSet.add(t))
-    }
-    const newBody = withMergeSection(body, extra).trim()
-    const tags = [...tagSet].slice(0, DEFAULTS.mergedTagCap)
-    rollback.merged.push({ path: canon.path, before: db.prepare('SELECT body, summary, tags, updated_at FROM cards WHERE path = ?').get(canon.path) })
-    db.prepare('UPDATE cards SET body = ?, summary = ?, tags = ?, updated_at = ? WHERE path = ?').run(newBody, newBody.slice(0, 200), JSON.stringify(tags), now, canon.path)
-    if (!newBody.startsWith(canon.body.trim())) throw new Error(`合并后正文丢失原内容：${canon.path}`)
-    for (const a of g.absorbs) {
-      softDeleteCardSync(db, a.path, { changedBy: 'tidy', reason: `整理：并入 ${canon.path}（相似度 ${a.sim}）`, quarantineReason: `整理：并入 ${canon.path}` })
-      recordRemoved(db, rollback, a.path, `merged-into:${canon.path}`)
-      removed++
-    }
-    log('INFO', `合并：保留 ${canon.path} ← 吸收 [${g.absorbs.map((a) => `${a.path}(${a.sim},独特${a.uniqueLines}行)`).join(', ')}]，并入独特行 ${extra.length}，阈值 ${o.threshold}`)
+    const sim = new Map(g.absorbs.map((a) => [a.path, a.sim]))
+    const n = mergeInto(db, rollback, canon, g.absorbs.map((a) => byPath.get(a.path)), { o, why: 'merged-into', reason: (src) => `整理：并入 ${canon.path}（相似度 ${sim.get(src.path)}）` })
+    removed += g.absorbs.length
+    log('INFO', `合并：保留 ${canon.path} ← 吸收 [${g.absorbs.map((a) => `${a.path}(${a.sim},独特${a.uniqueLines}行)`).join(', ')}]，并入独特行 ${n}，阈值 ${o.threshold}`)
   }
   return { groups: groups.length, removed }
 }
 
+/** 可选批次 topics：同主题组并进保留卡（与近重复合并同一套：独特行 + 软删 + 回滚文件）。 */
+function batchTopics(db, o, rollback, log) {
+  const cards = liveCards(db, o)
+  const byPath = new Map(cards.map((c) => [c.path, c]))
+  const { topics } = planGroups(cards, o, new Set(['topics']))
+  const total = topics.reduce((n, g) => n + g.members.length, 0)
+  if (total > o.maxDelete) throw new Error(`实时计划软删 ${total} 张，超过 maxDelete=${o.maxDelete}`)
+  for (const g of topics) {
+    const canon = byPath.get(g.canonical.path)
+    const score = new Map(g.members.map((m) => [m.path, m.score]))
+    const n = mergeInto(db, rollback, canon, g.members.map((m) => byPath.get(m.path)), { o, why: 'topic-merged-into', reason: (src) => `整理：同主题并入 ${canon.path}（主题得分 ${score.get(src.path)}）` })
+    log('INFO', `同主题合并：保留 ${canon.path} ← [${g.members.map((m) => `${m.path}(${m.score})`).join(', ')}]，并入独特行 ${n}`)
+  }
+  return { groups: topics.length, removed: total }
+}
+
+/**
+ * 可选批次 snapshots：周期性快照归入一张「时间线」卡。
+ * 时间线卡 = 序列里最新的一张（改标题为「主干（时间线）」）或已有的时间线卡；其余快照按时间顺序
+ * 以「### 原标题」+ 独特行的形式追加进「时间线」小节，然后软删。原卡全文仍在回收站 / 备份里，可回滚。
+ */
+function batchSnapshots(db, o, rollback, log) {
+  const cards = liveCards(db, o)
+  const byPath = new Map(cards.map((c) => [c.path, c]))
+  const series = planSnapshotSeries(cards, { minSeries: o.snapshotMin })
+  const total = series.reduce((n, g) => n + g.members.filter((m) => m.path !== g.timeline.path).length, 0)
+  if (total > o.maxDelete) throw new Error(`实时计划软删 ${total} 张，超过 maxDelete=${o.maxDelete}`)
+  for (const g of series) {
+    const keeper = byPath.get(g.timeline.path)
+    const sources = g.members.filter((m) => m.path !== keeper.path).map((m) => byPath.get(m.path))
+    const before = db.prepare('SELECT title, body, summary, tags, updated_at FROM cards WHERE path = ?').get(keeper.path)
+    let body = keeper.body.trim()
+    if (!body.includes(TIMELINE_SECTION)) body += `\n\n${TIMELINE_SECTION}\n\n### ${keeper.title}\n(当前正文即这一时点的状态)`
+    const tagSet = new Set(keeper.tags)
+    let budget = DEFAULTS.timelineLines
+    for (const src of sources) {
+      const lines = budget > 0 ? uniqueLinesAgainst(body, src.body, { max: Math.min(budget, 20) }).filter((l) => detectSecrets(l).length === 0) : []
+      budget -= lines.length
+      body += `\n\n### ${src.title}\n` + (lines.length ? lines.join('\n') : '(与时间线已有内容一致，无新增)')
+      src.tags.forEach((t) => tagSet.add(t))
+    }
+    const title = g.timeline.newTitle
+    const tags = [...tagSet].slice(0, Math.max(o.maxTags, keeper.tags.length))
+    rollback.merged.push({ path: keeper.path, before })
+    db.prepare('UPDATE cards SET title = ?, body = ?, summary = ?, tags = ?, updated_at = ? WHERE path = ?').run(title, body, body.slice(0, 200), JSON.stringify(tags), new Date().toISOString(), keeper.path)
+    if (!body.startsWith(keeper.body.trim())) throw new Error(`时间线卡正文丢失原内容：${keeper.path}`)
+    for (const src of sources) {
+      softDeleteCardSync(db, src.path, { changedBy: 'tidy', reason: `整理：快照归入时间线 ${keeper.path}`, quarantineReason: `整理：归入时间线 ${keeper.path}` })
+      recordRemoved(db, rollback, src.path, `timeline:${keeper.path}`)
+    }
+    log('INFO', `快照归入时间线：${keeper.path}「${title}」← ${sources.length} 张`)
+  }
+  return { series: series.length, removed: total }
+}
+
+export const TIMELINE_SECTION = '## 时间线（周期性快照，按时间排列）'
+
 function batchTags(db, o, rollback, log) {
-  const plan = planTagNormalize(db.prepare('SELECT id, path, title, tags FROM cards ORDER BY id').all(), { synonyms: o.synonyms, maxTags: o.maxTags })
+  const plan = planTagNormalize(db.prepare('SELECT id, path, title, tags FROM cards ORDER BY id').all(), tagOptions(db, o))
+  // 把这次按计数选出的规范写法钉进规范表：之后不再随计数翻转（改动前的值记进回滚文件）
+  if (Object.keys(plan.decided).length) {
+    rollback.config.push({ key: TAG_CANON_KEY, before: readConfigRaw(db, TAG_CANON_KEY) })
+    patchTagTable(db, TAG_CANON_KEY, plan.decided)
+  }
   const up = db.prepare('UPDATE cards SET tags = ? WHERE path = ?')
   for (const c of plan.changes) {
     const prev = db.prepare('SELECT tags FROM cards WHERE path = ?').get(c.path)
@@ -524,7 +644,7 @@ function batchTags(db, o, rollback, log) {
     up.run(JSON.stringify(c.new), c.path)
   }
   log('INFO', `标签归一：改动 ${plan.changes.length} 张卡，标签种类 ${plan.distinctBefore} → ${plan.distinctAfter}，同义映射 ${Object.keys(plan.map).length} 条`)
-  return { removed: 0, tagsChanged: plan.changes.length, distinctBefore: plan.distinctBefore, distinctAfter: plan.distinctAfter }
+  return { removed: 0, tagsChanged: plan.changes.length, canonPinned: Object.keys(plan.decided).length, distinctBefore: plan.distinctBefore, distinctAfter: plan.distinctAfter }
 }
 
 /** memory_tag_normalize：只做标签批次的 apply（同一套备份 / 自检 / 回滚）。 */
@@ -535,6 +655,8 @@ export async function tagNormalize(root, opts = {}) {
 // ---------------------------------------------------------------------------
 // rollback
 // ---------------------------------------------------------------------------
+
+const CONFIG_ROLLBACK_KEYS = ['tagCanon', 'tagSynonyms']
 
 /** 依回滚文件还原：被删卡从回收站恢复、保留卡正文/标签还原、标签变更还原。整体一个事务。 */
 export async function tidyRollback(root, file, opts = {}) {
@@ -555,7 +677,13 @@ export async function tidyRollback(root, file, opts = {}) {
       reverted++
     }
     for (const m of [...rb.merged].reverse()) {
-      db.prepare('UPDATE cards SET body = ?, summary = ?, tags = ?, updated_at = ? WHERE path = ?').run(m.before.body, m.before.summary, m.before.tags, m.before.updated_at, m.path); reverted++
+      db.prepare('UPDATE cards SET body = ?, summary = ?, tags = ?, updated_at = ? WHERE path = ?').run(m.before.body, m.before.summary, m.before.tags, m.before.updated_at, m.path)
+      if (typeof m.before.title === 'string') db.prepare('UPDATE cards SET title = ? WHERE path = ?').run(m.before.title, m.path)
+      reverted++
+    }
+    // 规范标签表 / 同义表：还原成操作前的原始值（null = 操作前没有这个键）
+    for (const c of [...(rb.config || [])].reverse()) {
+      if (CONFIG_ROLLBACK_KEYS.includes(c.key)) { writeConfigRaw(db, c.key, c.before); reverted++ }
     }
     for (const r of rb.removed) {
       const inRecycle = db.prepare("SELECT 1 FROM quarantine WHERE path = ? AND status = 'deleted'").get(r.path)
@@ -600,6 +728,12 @@ export async function tidyLint(root, opts = {}) {
     tagsSingleton: [...tagCount.values()].filter((n) => n === 1).length,
     tagVariantGroups: [...groups.values()].filter((n) => n > 1).length,
     tagsOver4: cards.filter((c) => c.tags.length > plan.options.maxTags).length,
+    tagsOverMax: cards.filter((c) => c.tags.length > plan.options.maxTags).length,
+    maxTags: plan.options.maxTags,
+    topicGroups: plan.topics.length,
+    topicMembers: plan.topics.reduce((n, g) => n + g.members.length, 0),
+    snapshotSeries: plan.snapshots.length,
+    snapshotCards: plan.snapshots.reduce((n, g) => n + g.count, 0),
     tagsMalformed: db.prepare('SELECT tags FROM cards').all().filter((r) => parseTags(r.tags).malformed).length,
     secretSuspects: plan.secrets.length,
     secrets: plan.secrets.map((s) => ({ path: s.path, types: s.types })),
@@ -632,7 +766,12 @@ export function formatTidyPlan(plan, { limit = 15 } = {}) {
   const absorbN = plan.duplicates.reduce((n, g) => n + g.absorbs.length, 0)
   L.push('', `二、近似重复：${plan.duplicates.length} 组，共 ${absorbN} 张将被吸收（保留最长，独特行并入「合并补充」，被吸收卡软删）`)
   L.push(...cap(plan.duplicates, limit, (g) => `  - 保留 ${g.canonical.path} ← ${g.absorbs.map((a) => `${a.path}(相似${a.sim}，独特${a.uniqueLines}行)`).join('、')}`))
-  L.push('', `三、标签归一：${plan.tags.changes.length} 张卡变更，标签种类 ${plan.tags.distinctBefore} → ${plan.tags.distinctAfter}`)
+  const topicN = plan.topics.reduce((n, g) => n + g.members.length, 0)
+  L.push('', `二·1、同主题组（标题 + 正文 + 标签 + 实体多信号）：${plan.topics.length} 组，共 ${topicN} 张可并入保留卡（只报告；显式执行可选批次 topics 才合并）`)
+  L.push(...cap(plan.topics, limit, (g) => `  - 保留 ${g.canonical.path} ← ${g.members.map((m) => `${m.path}(得分${m.score}，标题${m.title_sim}/正文${m.body_sim})`).join('、')}`))
+  L.push('', `二·2、周期性快照序列（同标题主干 + 时间戳）：${plan.snapshots.length} 个序列，共 ${plan.snapshots.reduce((n, g) => n + g.count, 0)} 张；建议归入时间线卡（只报告；显式执行可选批次 snapshots 才归并）`)
+  L.push(...cap(plan.snapshots, limit, (g) => `  - 「${g.timeline.newTitle}」${g.count} 张（${String(g.first || '').slice(0, 10)} ~ ${String(g.last || '').slice(0, 10)}）→ ${g.timeline.existing ? '已有时间线卡' : '时间线卡'} ${g.timeline.path}`))
+  L.push('', `三、标签归一：${plan.tags.changes.length} 张卡变更，标签种类 ${plan.tags.distinctBefore} → ${plan.tags.distinctAfter}；每卡上限 ${o.maxTags}（MEMORY_TAG_MAX）；新钉入规范表 ${Object.keys(plan.tags.decided || {}).length} 组`)
   const mapEntries = Object.entries(plan.tags.map)
   L.push(...cap(mapEntries, limit, ([a, b]) => `  - 「${a}」→「${b}」`))
   L.push('', `四、kind 与路径前缀不一致：${plan.kindMisplaced.length} 张（只报告，不自动改）`)
@@ -668,7 +807,8 @@ export function formatTidyLint(m, { limit = 10 } = {}) {
   const L = [`记忆库健康检查（只读）· ${m.total} 张卡 · integrity_check=${m.integrity}`]
   L.push(`- 噪声卡：${m.noise} 张${Object.keys(m.noiseByCategory).length ? '（' + Object.entries(m.noiseByCategory).map(([k, v]) => `${k}:${v}`).join('，') + '）' : ''}`)
   L.push(`- 近似重复：${m.duplicateGroups} 组 / 可吸收 ${m.duplicateAbsorbable} 张（阈值 ${m.threshold}）`)
-  L.push(`- 标签：${m.tagsDistinct} 种，其中仅出现 1 次 ${m.tagsSingleton} 种；大小写/空格/连字符变体组 ${m.tagVariantGroups} 个；超 4 个标签的卡 ${m.tagsOver4} 张；非法 tags ${m.tagsMalformed} 张`)
+  L.push(`- 标签：${m.tagsDistinct} 种，其中仅出现 1 次 ${m.tagsSingleton} 种；大小写/空格/连字符变体组 ${m.tagVariantGroups} 个；超 ${m.maxTags} 个标签的卡 ${m.tagsOverMax} 张；非法 tags ${m.tagsMalformed} 张`)
+  L.push(`- 同主题组：${m.topicGroups} 组 / ${m.topicMembers} 张可并入；周期性快照序列：${m.snapshotSeries} 个 / ${m.snapshotCards} 张`)
   L.push(`- 明文密钥疑似：${m.secretSuspects} 张${m.secretSuspects ? '（只列路径与类型，不含值）' : ''}`)
   L.push(...cap(m.secrets, limit, (s) => `    · ${s.path}：${s.types.join('、')}`))
   L.push(`- kind 与路径前缀不一致：${m.kindMisplaced} 张`)

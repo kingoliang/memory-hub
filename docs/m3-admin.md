@@ -26,7 +26,7 @@
 | `POST /queue/approve` / `POST /queue/reject` | `{paths[], reason?, confirm?, dryRun?}`；单条无需 confirm，多条需要。批准：进 `cards`、可被 recall；驳回：留隔离区并记 `reason`；已驳回的卡可再批准。 |
 | `GET /tags/preview?op=rename\|merge\|delete&from=&to=` | 影响卡数（含待审/回收站里的卡）+ 样例路径，不改数据。 |
 | `POST /tags/rename` / `merge` / `delete` | `{from,to}` / `{from:[…],to}` / `{tag}` + `confirm:true`（+ 可选 `expectedAffected`，与实际不符 409）。执行前 `VACUUM INTO` 备份并校验 → 单事务改标签 → 自检（沿用 tidy 的 selfCheck + 隔离区 tags 合法性 + 总数不变）→ 失败整批回滚（500 `self_check_failed`）；成功返回备份文件名与回滚文件名（`tags-*.rollback.json`）。 |
-| `POST /tidy/apply` | `{planId, confirm, batches?, maxDelete?, threshold?}`。默认 dry-run；`confirm:true` 必须带 `planId`（400 `plan_id_required`），planId 与当前库不符 409 `plan_stale`，计划软删数超 `maxDelete` 400 `max_delete_exceeded`；执行前自动备份，批后自检失败自动回滚该批（500 `self_check_failed`，响应体仍带各批次状态）；同一时刻只允许一个整理/回滚在跑。 |
+| `POST /tidy/apply` | `{planId, confirm, batches?, maxDelete?, threshold?}`。`batches` 可选 `noise` / `merge` / `tags`（默认）与 `snapshots` / `topics`（可选，只有显式列出才执行）。默认 dry-run；`confirm:true` 必须带 `planId`（400 `plan_id_required`），planId 与当前库不符 409 `plan_stale`，计划软删数超 `maxDelete` 400 `max_delete_exceeded`；执行前自动备份，批后自检失败自动回滚该批（500 `self_check_failed`，响应体仍带各批次状态）；同一时刻只允许一个整理/回滚在跑。 |
 | `GET /tidy/rollbacks` | 可用的回滚文件（`tidy-*` 与 `tags-*`）。 |
 | `POST /tidy/rollback` | `{rollbackFile, confirm:true}`：只接受 `backups/` 里符合 `^(tidy\|tags)-…\.rollback\.json$` 的文件名（不接受路径）；回滚前再备份一次；成功后文件改名 `.done`，只能用一次（再用会拿旧数据覆盖之后的新编辑）。 |
 | `POST /tokens` | `{name, scopes[], expiresAt?}`。**明文令牌只在这次响应里返回**，库里只有哈希；列表/日志/审计都没有明文。活跃重名 409。 |
