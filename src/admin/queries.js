@@ -295,7 +295,7 @@ export async function tidyPreview(root, { threshold, limit }) {
       members: g.members.map((m) => ({ path: m.path, title: red(m.title), score: m.score, titleSim: m.title_sim, bodySim: m.body_sim, tagSim: m.tag_sim, entitySim: m.entity_sim })),
     })),
     snapshots: cap(plan.snapshots).map((g) => ({
-      stem: red(g.stem), kind: g.kind, count: g.count, first: g.first, last: g.last,
+      stem: red(g.stem), kind: g.kind, day: g.day, count: g.count, first: g.first, last: g.last,
       timeline: { path: g.timeline.path, title: red(g.timeline.newTitle), existing: g.timeline.existing },
       members: g.members.slice(0, 10).map((m) => ({ path: m.path, title: red(m.title) })),
     })),

@@ -177,8 +177,9 @@ stdio（本机单 Agent，身份取环境变量 `MEMORY_HUB_AGENT`，不经网�
 
 - **规范标签表**：DB `config` 表的 `tagCanon`（归一键 → 规范写法）与 `tagSynonyms`（归一键 → 目标写法）。capture / ingest / 管理界面编辑写入时按归一键（NFKC + 小写 + 去空白/连字符/下划线/点）映射到已有规范写法；首次出现的写法被钉进规范表，之后不随计数翻转。管理界面「标签 → 重命名 / 合并」会同步改规范表与同义表，可回滚。蒸馏 prompt 附带热门已有标签供模型复用。
 - **同主题组**：`tidy plan` 用标题主干（去掉日期/时间/序号）+ 正文 + 标签 + 实体（型号/版本/驼峰名/缩写）多信号分组，只报告；可选批次 `topics` 才合并（独特行并入保留卡，其余软删，带备份与回滚文件）。
-- **周期性快照**：同标题主干 + 标题带时间戳、至少 3 张的序列在报告里给出「归入时间线卡」建议；可选批次 `snapshots` 才执行（最新一张改名为「主干（时间线）」，其余按时间追加为小节后软删，可回滚）。
-- 默认批次仍是 `noise` / `merge` / `tags`，`topics` 与 `snapshots` 只有显式指定才执行。前后对比：`node scripts/demo/organize-compare.mjs <临时目录>`。
+- **周期性快照**：`tidy plan` 用「标题前缀（剥时间戳后第一个分隔符之前，必须含非数字词）+ 日期段」认序列，并用共享实体 / 共享标签（都没有则要求正文相似度）佐证，避免把不同主题并进来。一个序列最多 `snapshotMaxPoints`（默认 40）张、且最新一张要早于 `snapshotMinAgeHours`（默认 24 小时）才出建议；一天一张时间线卡，只有一两张的稀疏日并进不带日期的段。已有「（时间线）」卡的序列直接追加（哪怕 1 张）。只报告，可选批次 `snapshots` 才执行（时间线卡改名 + 按时间追加小节后软删其余，带备份与回滚文件）。
+- **每日整理**：`scripts/tidy-daily.mjs` 的默认自动批次是 `merge,tags,snapshots`；`--max-snapshots`（默认 20）限制单次处理多少个序列，报告里保留每个序列的规模。
+- `noise` / `merge` / `tags` 是 `tidy apply` 的默认批次，`topics` 与 `snapshots` 在 MCP / 管理界面里只有显式指定才执行。前后对比：`node scripts/demo/organize-compare.mjs <临时目录>`。
 
 ## CLI
 

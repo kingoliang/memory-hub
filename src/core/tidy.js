@@ -28,7 +28,7 @@ import {
 } from './vault.js'
 import { resolveDedupConfig } from './dedup-config.js'
 import { tagKey, pickCanonical, resolveMaxTags, loadTagTables, readConfigRaw, writeConfigRaw, patchTagTable, TAG_CANON_KEY } from './tags.js'
-import { planTopicGroups, planSnapshotSeries } from './topics.js'
+import { planTopicGroups, planSnapshotSeries, SNAPSHOT_DEFAULTS } from './topics.js'
 
 export { tagKey }
 /** 默认批次（不传 batches 时执行这些）。 */
@@ -257,6 +257,16 @@ function loadCards(db) {
   }))
 }
 
+/** 快照序列的规划参数（plan 与 apply 共用，保证两边算出同一批序列）。 */
+function snapshotOptions(o) {
+  return {
+    minSeries: o.snapshotMin,
+    maxPoints: o.snapshotMaxPoints,
+    minAgeHours: o.snapshotMinAgeHours,
+    maxSeries: o.snapshotMaxSeries || undefined,
+  }
+}
+
 /** 标签归一要用的同义表 = DB 持久化的 tagSynonyms + 调用方临时传入的（后者优先）。 */
 function tagOptions(db, o) {
   const t = loadTagTables(db)
@@ -268,7 +278,7 @@ function planGroups(cards, o, want) {
   const noisePaths = new Set(cards.filter((c) => classifyNoise(c, o.noiseCategories)).map((c) => c.path))
   const live = cards.filter((c) => !noisePaths.has(c.path))
   const duplicates = want.has('duplicates') || want.has('topics') ? planDuplicateGroups(live, o.threshold) : []
-  const snapshots = want.has('snapshots') || want.has('topics') ? planSnapshotSeries(live, { minSeries: o.snapshotMin }) : []
+  const snapshots = want.has('snapshots') || want.has('topics') ? planSnapshotSeries(live, snapshotOptions(o)) : []
   let topics = []
   if (want.has('topics')) {
     const exclude = new Set()
@@ -287,6 +297,9 @@ function resolveOptions(opts = {}) {
     threshold: num(opts.threshold, dd.threshold, 0.05, 1),
     topicThreshold: num(opts.topicThreshold, 0.5, 0.2, 1),
     snapshotMin: Math.floor(num(opts.snapshotMin, 3, 2, 1000)),
+    snapshotMaxPoints: Math.floor(num(opts.snapshotMaxPoints, SNAPSHOT_DEFAULTS.maxPoints, 2, 500)),
+    snapshotMinAgeHours: num(opts.snapshotMinAgeHours, SNAPSHOT_DEFAULTS.minAgeHours, 0, 24 * 365),
+    snapshotMaxSeries: Math.floor(num(opts.snapshotMaxSeries, 0, 0, 100_000)), // 0 = 不限
     maxTags: Math.floor(num(opts.maxTags, resolveMaxTags(opts.env ?? process.env), 1, 20)),
     rawMaxChars: Math.floor(num(opts.rawMaxChars, DEFAULTS.rawMaxChars, 500, 10_000_000)),
     maxDelete: Math.floor(num(opts.maxDelete, DEFAULTS.maxDelete, 0, 100000)),
@@ -597,7 +610,7 @@ function batchTopics(db, o, rollback, log) {
 function batchSnapshots(db, o, rollback, log) {
   const cards = liveCards(db, o)
   const byPath = new Map(cards.map((c) => [c.path, c]))
-  const series = planSnapshotSeries(cards, { minSeries: o.snapshotMin })
+  const series = planSnapshotSeries(cards, snapshotOptions(o))
   const total = series.reduce((n, g) => n + g.members.filter((m) => m.path !== g.timeline.path).length, 0)
   if (total > o.maxDelete) throw new Error(`实时计划软删 ${total} 张，超过 maxDelete=${o.maxDelete}`)
   for (const g of series) {
@@ -769,7 +782,7 @@ export function formatTidyPlan(plan, { limit = 15 } = {}) {
   const topicN = plan.topics.reduce((n, g) => n + g.members.length, 0)
   L.push('', `二·1、同主题组（标题 + 正文 + 标签 + 实体多信号）：${plan.topics.length} 组，共 ${topicN} 张可并入保留卡（只报告；显式执行可选批次 topics 才合并）`)
   L.push(...cap(plan.topics, limit, (g) => `  - 保留 ${g.canonical.path} ← ${g.members.map((m) => `${m.path}(得分${m.score}，标题${m.title_sim}/正文${m.body_sim})`).join('、')}`))
-  L.push('', `二·2、周期性快照序列（同标题主干 + 时间戳）：${plan.snapshots.length} 个序列，共 ${plan.snapshots.reduce((n, g) => n + g.count, 0)} 张；建议归入时间线卡（只报告；显式执行可选批次 snapshots 才归并）`)
+  L.push('', `二·2、周期性快照序列（同标题前缀 + 日期段 + 实体/标签佐证）：${plan.snapshots.length} 个序列，共 ${plan.snapshots.reduce((n, g) => n + g.count, 0)} 张；建议归入时间线卡（只报告；显式执行可选批次 snapshots 才归并）`)
   L.push(...cap(plan.snapshots, limit, (g) => `  - 「${g.timeline.newTitle}」${g.count} 张（${String(g.first || '').slice(0, 10)} ~ ${String(g.last || '').slice(0, 10)}）→ ${g.timeline.existing ? '已有时间线卡' : '时间线卡'} ${g.timeline.path}`))
   L.push('', `三、标签归一：${plan.tags.changes.length} 张卡变更，标签种类 ${plan.tags.distinctBefore} → ${plan.tags.distinctAfter}；每卡上限 ${o.maxTags}（MEMORY_TAG_MAX）；新钉入规范表 ${Object.keys(plan.tags.decided || {}).length} 组`)
   const mapEntries = Object.entries(plan.tags.map)
