@@ -11,9 +11,11 @@
 // 判断新知识是「新建卡片」还是「追加到已有卡片」（append_to），这正是
 // boujoy 的「追加更新记录，不要堆重复卡」语义，且对 LLM 改写免疫。
 
-import { writeCard, appendUpdate, mergeIntoCard, textSimilarity, dedupCheck, bestDuplicate, listCards, queryTerms } from './vault.js'
+import { writeCard, appendUpdate, mergeIntoCard, textSimilarity, dedupCheck, bestDuplicate, queryTerms } from './vault.js'
 import { getDb, enforceAudit, tableForStatus } from './db.js'
 import { resolveDedupConfig } from './dedup-config.js'
+import { resolveMaxTags, canonicalizeTags, TAG_MAX_LEN } from './tags.js'
+import { neighborScore, extractEntities } from './topics.js'
 
 /** 默认去重阈值（与 boujoy 一致）。 */
 export const DEDUP_THRESHOLD = 0.62
@@ -210,8 +212,13 @@ export async function summarizeTurnDetailed(llm, route, conversation, opts = {})
 
   const existing = Array.isArray(opts.existing) ? opts.existing.slice(0, DEDUP_NEIGHBORS) : []
   const existingBlock = existing.length
-    ? '\n\n## 记忆库已有卡片索引（若新知识属于其中某张，必须用 append_to 追加而不是新建）\n' +
-      existing.map((e, i) => `${i + 1}. [${e.path}] ${e.title}${e.summary ? `：${e.summary.slice(0, 120)}` : ''}`).join('\n')
+    ? '\n\n## 记忆库已有卡片索引（按与本段对话的主题相关度排序；若新知识属于其中某张，必须用 append_to 追加而不是新建）\n' +
+      existing.map((e, i) => formatNeighbor(e, i)).join('\n')
+    : ''
+  const maxTags = Number.isInteger(opts.maxTags) && opts.maxTags > 0 ? opts.maxTags : resolveMaxTags(opts.env)
+  const knownTags = Array.isArray(opts.knownTags) ? opts.knownTags.filter((t) => typeof t === 'string' && t.trim()).slice(0, 60) : []
+  const tagBlock = knownTags.length
+    ? `\n\n## 已有标签（优先复用这些写法，大小写/连字符保持一致；确无合适的才新建）\n${knownTags.join('、')}`
     : ''
 
   const system = [
@@ -224,17 +231,19 @@ export async function summarizeTurnDetailed(llm, route, conversation, opts = {})
     '{"save": false} 表示不值得保存；',
     '否则输出：',
     '{"save": true, "title": "简短标题", "kind": "knowledge|project|content|prompt|business|tool|mistake", "tags": ["标签"], "body": "300-800字的压缩正文，markdown，含要点列表，首行是# 标题"}',
+    `tags 最多 ${maxTags} 个：优先复用「已有标签」里的写法，不要造同义或仅大小写不同的新标签。`,
     'kind 含义：project=项目背景/进度；knowledge=通用知识/技术方案/设计决策；content=内容素材/资料；prompt=提示词/工作流；business=业务/商业；tool=工具链/CLI/配置/环境坑；mistake=错误/反模式/踩坑/“别这么做”/debug 教训。',
     '正文要求：去掉对话口水，只留可复用的结论、参数、步骤、原因。语言与对话一致。',
     '已有卡片规则：若新知识与某张已有卡片是同一主题（同一技术、同一项目、同一决策），不要新建——输出',
     '{"append_to": "已有卡片的 path 字段原样", "update": "追加/修正的短文本（一段话）"}',
+    '同一主题的判断：标题主干相同（只差日期/时间/版本号）、讲的是同一台机器/同一个模型/同一个服务/同一个项目，都算同一主题，应 append_to。',
     '只有当已有卡片索引为空或不相关时，才新建卡片。',
   ].join('\n')
 
   const { BlockAssembler, createUserMessage } = await importLlmHelpers()
   const assembler = new BlockAssembler()
   const messages = [createUserMessage({
-    content: [{ type: 'text', text: text + existingBlock }],
+    content: [{ type: 'text', text: text + existingBlock + tagBlock }],
     source: { kind: 'plugin', plugin: 'memory-eternal' },
   })]
 
@@ -307,23 +316,41 @@ export async function summarizeTurnDetailed(llm, route, conversation, opts = {})
   return { card: parsed.card, repaired: parsed.repaired }
 }
 
+/** 邻居卡在 prompt 里的一行：路径 + 标题 + 标签 + 摘要（默认 300 字，给模型足够判断「是不是同一主题」的上下文）。 */
+export function formatNeighbor(e, i, { summaryChars = NEIGHBOR_SUMMARY_CHARS } = {}) {
+  const tags = Array.isArray(e.tags) && e.tags.length ? ` 〔${e.tags.filter((t) => t !== 'raw').slice(0, 6).join('、')}〕` : ''
+  const sum = String(e.summary || '').replace(/\s+/g, ' ').trim().slice(0, summaryChars)
+  return `${i + 1}. [${e.path}] ${e.title}${tags}${sum ? `：${sum}` : ''}`
+}
+
+/** 邻居卡在 prompt 里给多少字摘要（旧版只给 120 字，模型判断不出是不是同一张卡）。 */
+export const NEIGHBOR_SUMMARY_CHARS = 300
+
 /**
- * 语义去重近邻：按关键词重叠为候选卡排序，返回最相似的若干张。
- * 关键词 = 新卡标题/正文的 CJK 整词 + bigram 与已有卡标题/摘要的命中数。
+ * 去重近邻（多信号）：标题主干相似度 + 实体（型号/版本/驼峰名/缩写）重合 + 关键词命中，返回最相关的若干张。
+ * 旧版只数「关键词在标题/摘要里命中几次」，长对话里的高频通用词会把同主题的卡挤出前 8。
+ * 返回的卡带 summary：优先取正文前 NEIGHBOR_SUMMARY_CHARS 字（去掉首行标题）。
  */
 export async function pickNeighbors(root, card, limit = DEDUP_NEIGHBORS) {
-  const haystack = `${card.title}\n${card.body}`.toLowerCase()
-  const wanted = queryTerms(haystack)
-  const cards = await listCards(root)
+  const haystack = `${card.title || ''}\n${card.body || ''}`
+  const wanted = new Set([...queryTerms(haystack.toLowerCase())].map((t) => t.toLowerCase()).filter((t) => t.length >= 2))
+  const draft = { title: card.title || '', body: card.body || '', _ent: extractEntities(haystack) }
+  // 只看主库（approved）；直接读正文，摘要取正文前 NEIGHBOR_SUMMARY_CHARS 字（listCards 不返回正文）
+  const cards = getDb(root).prepare('SELECT path, kind, title, tags, summary, body FROM cards').all().map((r) => {
+    let tags = []
+    try { const v = JSON.parse(r.tags || '[]'); if (Array.isArray(v)) tags = v.filter((t) => typeof t === 'string') } catch { /* 非法 tags 当无标签 */ }
+    return { path: r.path, kind: r.kind, title: r.title || '', tags, summary: r.summary || '', body: r.body || '' }
+  })
   const scored = []
   for (const existing of cards) {
-    let score = 0
-    const target = `${existing.title}\n${existing.summary}`.toLowerCase()
-    for (const term of wanted) if (target.includes(term.toLowerCase())) score += 1
-    if (score > 0) scored.push({ ...existing, score })
+    const s = neighborScore(draft, existing, wanted)
+    if (s.kw > 0 || s.title > 0.2 || s.ent > 0) scored.push({ ...existing, score: s.score })
   }
-  scored.sort((a, b) => b.score - a.score)
-  return scored.slice(0, limit)
+  scored.sort((a, b) => b.score - a.score || (a.path < b.path ? -1 : 1))
+  return scored.slice(0, limit).map(({ body, ...e }) => ({
+    ...e,
+    summary: String(body || e.summary || '').replace(/^#[^\n]*\n/, '').trim().slice(0, NEIGHBOR_SUMMARY_CHARS),
+  }))
 }
 
 /**
@@ -347,6 +374,10 @@ export function makeDedupChecker(root) {
  */
 export async function captureCard(root, card, opts = {}) {
   const dd = resolveDedupConfig(opts.env ?? process.env, opts.shared)
+  // GH #5：写入前把标签归到规范写法（规范表里已有的写法永远胜出；首次出现的写法钉进规范表）。
+  if (Array.isArray(card.tags) && card.tags.length) {
+    card = { ...card, tags: canonicalizeTags(getDb(root), card.tags, { maxTags: resolveMaxTags(opts.env ?? process.env) }).tags }
+  }
   const threshold = opts.threshold ?? dd.threshold
   const bodyHit = await dedupCheck(root, card.body, threshold)
   if (bodyHit) return { ok: false, duplicate: { ...bodyHit, via: 'body' } }
@@ -643,8 +674,9 @@ export function isUsableTitle(title) {
 /** 组装最终卡片对象（标题已体检通过）。 */
 function finishCard(parsed, title, body) {
   const kind = ['project', 'knowledge', 'content', 'prompt', 'business', 'tool', 'mistake'].includes(parsed.kind) ? parsed.kind : 'knowledge'
+  // 上限与 tidy 共用 MEMORY_TAG_MAX（GH #5：以前蒸馏放 8 个、tidy 裁到 4 个，新卡第二天就被改）
   const tags = Array.isArray(parsed.tags)
-    ? parsed.tags.map((t) => String(t).trim().slice(0, 30)).filter(Boolean).slice(0, 8)
+    ? [...new Set(parsed.tags.map((t) => String(t).trim().slice(0, TAG_MAX_LEN)).filter(Boolean))].slice(0, resolveMaxTags())
     : []
   return { save: true, title, kind, tags, body }
 }

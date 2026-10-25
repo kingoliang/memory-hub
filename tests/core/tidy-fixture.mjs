@@ -57,7 +57,7 @@ export async function buildFixture() {
   // 标签变体
   ids.t1 = insertCard(db, { path: '07-Tools/t1.md', kind: 'tool', title: 'Docker 笔记一', tags: ['Docker', 'Docker-Compose'], body: cjk(300) })
   ids.t2 = insertCard(db, { path: '07-Tools/t2.md', kind: 'tool', title: 'Docker 笔记二', tags: ['docker', 'docker compose'], body: cjk(300) })
-  ids.t3 = insertCard(db, { path: '07-Tools/t3.md', kind: 'tool', title: '标签膨胀', tags: ['docker', 'a-单', 'b-单', 'c-单', 'd-单', 'e-单'], body: cjk(300) })
+  ids.t3 = insertCard(db, { path: '07-Tools/t3.md', kind: 'tool', title: '标签膨胀', tags: ['docker', 'a-单', 'b-单', 'c-单', 'd-单', 'e-单', 'f-单', 'g-单'], body: cjk(300) })
   // kind 错放：路径在 03-Knowledge 但 kind=tool
   ids.mis = insertCard(db, { path: '03-Knowledge/misplaced.md', kind: 'tool', title: '错放', tags: ['note'], body: cjk(300) })
   // 密钥疑似

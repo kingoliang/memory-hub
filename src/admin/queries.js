@@ -283,17 +283,30 @@ export async function tidyPreview(root, { threshold, limit }) {
     counts: {
       noise: plan.noise.length, duplicateGroups: plan.duplicates.length, duplicateAbsorbable: dupAbsorb,
       tagChanges: plan.tags.changes.length, kindMisplaced: plan.kindMisplaced.length, secrets: plan.secrets.length, oversizeRaw: plan.oversizeRaw.length,
+      topicGroups: plan.topics.length, topicMembers: plan.topics.reduce((n, g) => n + g.members.length, 0),
+      snapshotSeries: plan.snapshots.length, snapshotCards: plan.snapshots.reduce((n, g) => n + g.count, 0),
     },
     truncated: {
       noise: plan.noise.length > limit, duplicates: plan.duplicates.length > limit, tags: plan.tags.changes.length > limit,
       kindMisplaced: plan.kindMisplaced.length > limit, secrets: plan.secrets.length > limit, oversizeRaw: plan.oversizeRaw.length > limit,
+      topics: plan.topics.length > limit, snapshots: plan.snapshots.length > limit,
     },
     noise: cap(plan.noise).map((n) => ({ path: n.path, title: red(n.title), category: n.category, reason: n.reason })),
     duplicates: cap(plan.duplicates).map((g) => ({
       canonical: { path: g.canonical.path, title: red(g.canonical.title) },
       absorbs: g.absorbs.map((a) => ({ path: a.path, title: red(a.title), sim: a.sim, uniqueLines: a.uniqueLines })),
     })),
+    topics: cap(plan.topics).map((g) => ({
+      canonical: { path: g.canonical.path, title: red(g.canonical.title) },
+      members: g.members.map((m) => ({ path: m.path, title: red(m.title), score: m.score, titleSim: m.title_sim, bodySim: m.body_sim, tagSim: m.tag_sim, entitySim: m.entity_sim })),
+    })),
+    snapshots: cap(plan.snapshots).map((g) => ({
+      stem: red(g.stem), kind: g.kind, count: g.count, first: g.first, last: g.last,
+      timeline: { path: g.timeline.path, title: red(g.timeline.newTitle), existing: g.timeline.existing },
+      members: g.members.slice(0, 10).map((m) => ({ path: m.path, title: red(m.title) })),
+    })),
     tags: {
+      decidedSize: Object.keys(plan.tags.decided || {}).length,
       distinctBefore: plan.tags.distinctBefore, distinctAfter: plan.tags.distinctAfter,
       map: Object.fromEntries(Object.entries(plan.tags.map).slice(0, limit)),
       mapSize: Object.keys(plan.tags.map).length,

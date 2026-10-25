@@ -126,7 +126,7 @@ export const TOOL_DEFS = [
     scope: 'read',
     description:
       '只读：扫描记忆库并产出「整理计划」，不改任何数据。包含：噪声卡（定时提醒批次/超时通知/无信息碎片，仅 raw 原文卡）、' +
-      '近似重复组（保留最长卡、独特行并入）、标签归一映射、kind 与路径前缀不一致的卡、明文密钥疑似卡（只给卡路径与命中类型，绝不返回值）、超大 raw 卡。' +
+      '近似重复组（保留最长卡、独特行并入）、同主题组（标题+正文+标签+实体多信号）、周期性快照序列（建议归入时间线卡）、标签归一映射、kind 与路径前缀不一致的卡、明文密钥疑似卡（只给卡路径与命中类型，绝不返回值）、超大 raw 卡。' +
       '返回 planId，可在 memory_tidy_apply 里带上以确保执行的正是这份计划。发现问题请提醒用户，执行由用户在管理界面/CLI 完成。',
     shape: { ...tidyCommon, limit: num('每类最多列出多少项，默认 15') },
     async handler(args, ctx) {
@@ -146,7 +146,7 @@ export const TOOL_DEFS = [
     shape: {
       confirm: z.boolean().optional().describe('必须为 true 才真正执行；缺省 / false = 预演'),
       planId: z.string().max(200).optional().describe('memory_tidy_plan 返回的 planId；库在 plan 之后变化则拒绝执行'),
-      batches: z.array(z.enum(['noise', 'merge', 'tags'])).optional().describe('要执行的批次：noise / merge / tags，默认全部（按此顺序）'),
+      batches: z.array(z.enum(['noise', 'merge', 'tags', 'topics', 'snapshots'])).optional().describe('要执行的批次：noise / merge / tags 为默认（按此顺序）；topics（同主题合并）与 snapshots（快照归入时间线卡）是可选批次，只有显式列出才执行'),
       ...tidyCommon,
       maxDelete: num('单次最多软删张数的保险，默认 50；计划超限则拒绝执行'),
     },

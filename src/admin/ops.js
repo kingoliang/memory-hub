@@ -14,8 +14,9 @@ import {
   KIND_ROOTS, findCardRow, pathTaken, inTransaction, softDeleteCardSync, restoreCardSync, setCardStatusSync, deleteCard, purgeCardSync,
 } from '../core/vault.js'
 import {
-  tidyApply, tidyRollback, backupBeforeTidy, selfCheck, snapshotCounts, detectSecrets, TIDY_BATCHES,
+  tidyApply, tidyRollback, backupBeforeTidy, selfCheck, snapshotCounts, detectSecrets, ALL_TIDY_BATCHES,
 } from '../core/tidy.js'
+import { canonicalizeTags, loadTagTables, readConfigRaw, patchTagTable, tagKey, TAG_CANON_KEY, TAG_SYNONYMS_KEY } from '../core/tags.js'
 import { writeLog } from '../core/writelog.js'
 import { createToken, revokeToken, updateToken, parseScopes, TokenError } from '../auth/tokens.js'
 import { verifyPasswordAsync, getAdminPasswordHash, setAdminPassword, validatePassword, AdminAuthError } from './auth.js'
@@ -150,7 +151,8 @@ export function editCard(root, actor, input, { log }) {
     if (!Array.isArray(input.tags)) throw bad('tags 必须是字符串数组')
     const tags = [...new Set(input.tags.map((t) => cleanTag(t)))]
     if (tags.length > LIMITS.tagCount) throw bad(`标签最多 ${LIMITS.tagCount} 个`)
-    f.tags = tags
+    // GH #5：按 tagKey 归到规范写法（要改规范写法本身请用「标签 → 重命名」，它会同步更新规范表）
+    f.tags = canonicalizeTags(getDb(root), tags, { maxLen: LIMITS.tagLen }).tags
   }
   if (input.kind !== undefined) {
     if (!KINDS.includes(input.kind)) throw bad(`kind 只能是：${KINDS.join(' / ')}`)
@@ -391,6 +393,29 @@ export function previewTagOp(root, query) {
 const stampName = () => new Date().toISOString().replace(/[:.]/g, '-')
 const backupInfoOf = (b) => ({ file: path.basename(b.path), bytes: b.bytes, cards: b.cards, quarantine: b.quarantine, verified: b.verified })
 
+/**
+ * rename / merge 后同步规范表与同义表（管理员的选择就是新的规范写法，此后 tidy / 写入都按它来）：
+ *   - canon[key(to)] = to；
+ *   - 每个跨键的源标签：synonyms[key(from)] = to，并删掉 canon[key(from)]；
+ *   - 原本指向某个源标签的同义项改指向 to。
+ * 改动前的原始值记进回滚文件（rollback.config），回滚时整体还原。
+ */
+function updateTagTables(db, spec, rollback) {
+  const before = { [TAG_CANON_KEY]: readConfigRaw(db, TAG_CANON_KEY), [TAG_SYNONYMS_KEY]: readConfigRaw(db, TAG_SYNONYMS_KEY) }
+  const { synonyms } = loadTagTables(db)
+  const toKey = tagKey(spec.to)
+  const canonPatch = { [toKey]: spec.to }
+  const synPatch = {}
+  const fromKeys = new Set(spec.from.map(tagKey).filter((k) => k && k !== toKey))
+  for (const k of fromKeys) { synPatch[k] = spec.to; canonPatch[k] = null }
+  for (const [k, v] of Object.entries(synonyms)) if (fromKeys.has(tagKey(v)) || (tagKey(v) === toKey && v !== spec.to)) synPatch[k] = spec.to
+  if (synonyms[toKey]) synPatch[toKey] = null // 目标自身不能再被同义到别处
+  const c1 = patchTagTable(db, TAG_CANON_KEY, canonPatch)
+  const c2 = patchTagTable(db, TAG_SYNONYMS_KEY, synPatch)
+  if (c1) rollback.config.push({ key: TAG_CANON_KEY, before: before[TAG_CANON_KEY] })
+  if (c2) rollback.config.push({ key: TAG_SYNONYMS_KEY, before: before[TAG_SYNONYMS_KEY] })
+}
+
 export function applyTagOp(root, actor, op, input, { log }) {
   const spec = tagOpSpec(op, input)
   const confirm = reqConfirm(input?.confirm)
@@ -411,12 +436,14 @@ export function applyTagOp(root, actor, op, input, { log }) {
   }
   const before = snapshotCounts(db)
   const rollback = { version: 1, tool: 'memory-eternal-tidy', kind: 'tags', op, createdAt: new Date().toISOString(), backup: path.basename(backup.path), removed: [], merged: [], tags: [] }
+  rollback.config = []
   db.exec('BEGIN IMMEDIATE')
   try {
     for (const r of rows) {
       db.prepare(`UPDATE ${r.table} SET tags = ? WHERE path = ?`).run(JSON.stringify(r.next), r.path)
       rollback.tags.push({ path: r.path, before: r.before })
     }
+    if (spec.to) updateTagTables(db, spec, rollback)
     const check = selfCheck(db, root, before, 0)
     const failures = [...check.failures]
     const badQ = db.prepare('SELECT tags FROM quarantine').all().filter((q) => { try { const v = JSON.parse(q.tags); return !Array.isArray(v) || v.some((t) => typeof t !== 'string') } catch { return true } }).length
@@ -449,7 +476,7 @@ export async function tidyApplyAdmin(root, actor, input, { log }) {
   const confirm = reqConfirm(input?.confirm)
   let batches
   if (input?.batches !== undefined) {
-    if (!Array.isArray(input.batches) || !input.batches.length || input.batches.some((b) => !TIDY_BATCHES.includes(b))) throw bad(`batches 只能包含：${TIDY_BATCHES.join(' / ')}`)
+    if (!Array.isArray(input.batches) || !input.batches.length || input.batches.some((b) => !ALL_TIDY_BATCHES.includes(b))) throw bad(`batches 只能包含：${ALL_TIDY_BATCHES.join(' / ')}`)
     batches = input.batches
   }
   let maxDelete
@@ -476,6 +503,7 @@ export async function tidyApplyAdmin(root, actor, input, { log }) {
     const summary = res.plan ? {
       noise: res.plan.noise.length, duplicateGroups: res.plan.duplicates.length,
       duplicateAbsorbable: res.plan.duplicates.reduce((n, g) => n + g.absorbs.length, 0), tagChanges: res.plan.tags.changes.length,
+      topicGroups: res.plan.topics.length, snapshotSeries: res.plan.snapshots.length,
     } : undefined
     const view = {
       ok: res.ok, dryRun: res.dryRun, planId: res.planId, plannedDeletes: res.plannedDeletes, summary,
