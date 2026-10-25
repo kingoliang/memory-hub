@@ -138,6 +138,10 @@ export async function runTidyDaily(o, { stderr = (s) => process.stderr.write(s),
     L(`### 标签规整：${plan.tags.changes.length} 张卡将改动；标签种类 ${plan.tags.distinctBefore} → ${plan.tags.distinctAfter}`)
     for (const [k, v] of Object.entries(plan.tags.map || {}).slice(0, 20)) L(`- ${t40(k)} → ${t40(Array.isArray(v) ? v.join(',') : v)}`)
     L()
+    L(`### 可选批次（默认不执行，需显式 --batches）：同主题组 ${plan.topics.length} 组 / 快照序列 ${plan.snapshots.length} 个`)
+    for (const g of plan.topics.slice(0, 15)) L(`- 同主题：保留「${t40(g.canonical.title)}」 ← ${g.members.length} 张（如「${t40(g.members[0]?.title)}」）`)
+    for (const sn of plan.snapshots.slice(0, 10)) L(`- 快照：${t40(sn.stem)} × ${sn.count} 张（${String(sn.first).slice(0, 10)} ~ ${String(sn.last).slice(0, 10)}）`)
+    L()
     if (apply) {
       L('### 应用结果')
       if (!applied) L('- 无')
