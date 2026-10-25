@@ -240,7 +240,7 @@ test('exposeTidyApply=true：需同时具备 tidy:apply scope 才出现；调用
   }, { env: { MEMORY_HUB_MCP_EXPOSE_TIDY_APPLY: '1' } })
 })
 
-test('基线兼容：v0.10.8 基线的 4 个原有工具名 / 必填参数 / 属性不变，另含 4 个整理工具（共 8 个，全权限 + 开关开）', async () => {
+test('基线兼容：v0.10.8 基线的 4 个原有工具名 / 必填参数 / 属性不变，另含 memory_read 与 4 个整理工具（共 9 个，全权限 + 开关开）', async () => {
   const baseline = JSON.parse(fs.readFileSync(path.join(here, 'fixtures/mcp-tools-baseline-v0.10.8.json'), 'utf8'))
   const baseTools = Array.isArray(baseline) ? baseline : baseline.tools
   await withHub(async (h) => {
@@ -248,7 +248,7 @@ test('基线兼容：v0.10.8 基线的 4 个原有工具名 / 必填参数 / 属
     const tools = (await rpc(h.url, tok, 'tools/list')).body.result.tools
     // 注：PLAN 第 7 节写作"基线 8 个工具"，实际 v0.10.8 基线 fixture 只有 4 个，另 4 个整理工具来自 fork（tidy）
     assert.equal(baseTools.length, 4)
-    const extra = ['memory_tidy_plan', 'memory_tidy_apply', 'memory_lint', 'memory_tag_normalize']
+    const extra = ['memory_read', 'memory_tidy_plan', 'memory_tidy_apply', 'memory_lint', 'memory_tag_normalize']
     assert.deepEqual(tools.map((t) => t.name).sort(), [...baseTools.map((t) => t.name), ...extra].sort())
     for (const bt of baseTools) {
       const t = tools.find((x) => x.name === bt.name)

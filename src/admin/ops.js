@@ -11,7 +11,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { getDb } from '../core/db.js'
 import {
-  KIND_ROOTS, findCardRow, pathTaken, inTransaction, softDeleteCardSync, restoreCardSync, setCardStatusSync, deleteCard, purgeCardSync,
+  KIND_ROOTS, findCardRow, pathTaken, inTransaction, softDeleteCardSync, restoreCardSync, setCardStatusSync, deleteCard, purgeCardSync, makeSummary,
 } from '../core/vault.js'
 import {
   tidyApply, tidyRollback, backupBeforeTidy, selfCheck, snapshotCounts, detectSecrets, TIDY_BATCHES,
@@ -116,7 +116,7 @@ function applyEdit(root, actor, log, p, expectedUpdatedAt, fields, action) {
       for (let i = 2; pathTaken(db, newPath); i++) newPath = `${KIND_ROOTS[next.kind]}/${base}-${i}.md`
     }
     db.prepare(`UPDATE ${found.table} SET path = ?, title = ?, body = ?, summary = ?, tags = ?, kind = ?, updated_at = ? WHERE path = ?`)
-      .run(newPath, next.title, next.body, next.body.trim().slice(0, 200), JSON.stringify(next.tags), next.kind, now, p)
+      .run(newPath, next.title, next.body, makeSummary(next.body, next.title), JSON.stringify(next.tags), next.kind, now, p)
     if (newPath !== p) {
       db.prepare('UPDATE card_revisions SET card_path = ? WHERE card_path = ?').run(newPath, p)
       db.prepare('UPDATE feedback SET card_path = ? WHERE card_path = ?').run(newPath, p)

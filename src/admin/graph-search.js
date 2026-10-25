@@ -1,5 +1,5 @@
 // memory-hub · 图谱「蜘蛛搜索」后端：
-//   POST /admin/api/graph/search     召回命中卡（复用 memory_recall 的 vault.search，不依赖 LLM）
+//   POST /admin/api/graph/search     召回命中卡（与 memory_recall 共用 vault.searchCards 的 BM25 打分，不依赖 LLM）
 //   POST /admin/api/graph/summarize  把命中卡交给 LLM 汇总（复用蒸馏用的 OpenAI 兼容适配器 llm-openai.js）
 //
 // 安全要点：
@@ -10,7 +10,7 @@
 //   - LLM 未配置 / 超时 / 失败 → 结构化错误（503/504/502），响应与日志里不含密钥 / 端点 URL。
 
 import { getDb } from '../core/db.js'
-import { search, truncateAtBoundary } from '../core/vault.js'
+import { searchCards, truncateAtBoundary } from '../core/vault.js'
 import { redactSecrets } from '../core/tidy.js'
 import { maxTokenLadder } from '../core/capture.js'
 import { HttpError } from './errors.js'
@@ -141,7 +141,8 @@ function parseModelOutput(text, paths) {
   return t ? { summary: truncateAtBoundary(t, 1500), points: [] } : null
 }
 
-const snippetOf = (h) => redactSecrets(String(h.summary || h.excerpt || '').replace(/\s+/g, ' ').trim().slice(0, SNIPPET_MAX)).text
+// 片段 = 命中词附近的上下文（与 memory_recall 同一实现），再遮蔽疑似密钥
+const snippetOf = (h) => redactSecrets(String(h.snippet || h.summary || '').replace(/\s+/g, ' ').trim()).text.slice(0, SNIPPET_MAX + 10)
 
 /**
  * @param {{config:object, log:object, llm:object|null}} deps
@@ -167,7 +168,7 @@ export function createGraphSearch({ config, log, llm }) {
     const g = gate(searchLimiter, session)
     const t0 = Date.now()
     try {
-      const raw = await search(root, q, { limit, minScore: 2 })
+      const { total, hits: raw } = await searchCards(root, q, { limit, strict: true, snippetChars: SNIPPET_MAX })
       // 只留主库里 approved 且未删除的卡（与图谱节点集一致）
       const db = getDb(root)
       const ok = new Set()
@@ -179,8 +180,8 @@ export function createGraphSearch({ config, log, llm }) {
         path: h.path, title: redactSecrets(h.title).text, kind: h.kind, tags: h.tags, snippet: snippetOf(h), score: h.score, rank: i + 1,
       }))
       const ms = Date.now() - t0
-      log.info('图谱蜘蛛搜索', { actor: actorId(actor), hits: hits.length, limit, qLen: q.length, qHead: q.slice(0, 20), ms })
-      return { hits, limit, ms }
+      log.info('图谱蜘蛛搜索', { actor: actorId(actor), hits: hits.length, total, limit, qLen: q.length, qHead: q.slice(0, 20), ms })
+      return { hits, total, limit, ms }
     } finally { g.release() }
   }
 

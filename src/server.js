@@ -10,7 +10,7 @@ import { createMcpHandler } from '@modelcontextprotocol/server'
 import { toNodeHandler } from '@modelcontextprotocol/node'
 import { validateBind } from './config.js'
 import { getDb, backupDb, DB_FILENAME } from './core/db.js'
-import { purgeExpired, RECYCLE_RETENTION_DAYS } from './core/vault.js'
+import { purgeExpired, RECYCLE_RETENTION_DAYS, backfillSummaries } from './core/vault.js'
 import { createAdminHandler } from './admin/handler.js'
 import { hasAdminPassword, cleanupSessions } from './admin/auth.js'
 import { writeLog } from './core/writelog.js'
@@ -91,10 +91,21 @@ async function readBody(req, max) {
  * @param {{logger?: object, scheduler?: boolean, codeRoot?: string}} [opts] codeRoot：REVISION 文件所在目录（默认本代码树根；测试用）
  * @returns {Promise<{port:number, host:string, close: () => Promise<void>, server: http.Server}>}
  */
+/** 启动迁移：summary 规则升级后回填一次（幂等，版本一致时零成本）；失败只记日志，不阻止启动。 */
+export function runSummaryBackfill(root, log) {
+  try {
+    const r = backfillSummaries(root)
+    if (!r.skipped) log.info('summary 回填完成', { scanned: r.scanned, updated: r.updated })
+  } catch (e) {
+    log.warn('summary 回填失败（不影响服务）', { error: String(e?.message || e).slice(0, 200) })
+  }
+}
+
 export async function startServer(config, { logger = getLogger(), scheduler = true, codeRoot } = {}) {
   validateBind(config)
   getDb(config.dbRoot) // 打开并迁移；失败直接抛出，不带病启动
   const log = logger
+  runSummaryBackfill(config.dbRoot, log)
   const llm = llmFromConfig(config)
   const limiter = new FailureLimiter()
   const base = config.basePath

@@ -9,7 +9,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { getDb, checkMainStoreInvariant, DB_FILENAME } from '../core/db.js'
-import { queryTerms, TITLE_COLLATOR, RECYCLE_RETENTION_DAYS } from '../core/vault.js'
+import { TITLE_COLLATOR, RECYCLE_RETENTION_DAYS, scoreCorpus, docsFromRows } from '../core/vault.js'
 import { tidyPlan, tidyLint, detectSecrets, redactSecrets, tagKey } from '../core/tidy.js'
 import { OUTCOMES, ACTOR_TYPES } from '../core/writelog.js'
 
@@ -75,7 +75,7 @@ export function listCards(root, f) {
     if (f.agent === UNSIGNED) where.push("COALESCE(submitted_by,'') = ''")
     else if (f.agent) { where.push('submitted_by = ?'); args.push(f.agent) }
     if (f.source) { where.push('source = ?'); args.push(f.source) }
-    const cols = `path, kind, title, tags, status, source, submitted_by, created_at, updated_at, deleted_at, LENGTH(body) AS body_chars${needBody ? ', body' : ''}`
+    const cols = `id, path, kind, title, tags, status, source, submitted_by, created_at, updated_at, deleted_at, LENGTH(body) AS body_chars${needBody ? ', body' : ''}`
     rows.push(...db.prepare(`SELECT ${cols} FROM ${st.table}${where.length ? ' WHERE ' + where.join(' AND ') : ''}`).all(...args))
   }
 
@@ -87,17 +87,11 @@ export function listCards(root, f) {
   if (f.updatedTo != null) items = items.filter((x) => x.updated <= f.updatedTo)
 
   if (needBody) {
-    // 与 memory_recall（vault.search）同一套打分：整串命中 +3，每个查询词（整词 + 中文二元组）命中 +1；haystack = path + title + body
-    const ql = q.toLowerCase()
-    const terms = [...queryTerms(q)].map((t) => t.toLowerCase())
-    const scored = []
-    for (const x of items) {
-      const hay = `${x.r.path}\n${x.r.title}\n${x.r.body}`.toLowerCase()
-      let score = hay.includes(ql) ? 3 : 0
-      for (const t of terms) if (hay.includes(t)) score += 1
-      if (score > 0) scored.push({ ...x, score })
-    }
-    items = scored
+    // 与 memory_recall（vault.searchCards）同一套 BM25 打分（宽松模式：命中任一检索词即列出）；
+    // 文档集 = 本次所选存储里 SQL 过滤后的卡（含追加的更新记录）
+    const corpus = docsFromRows(db, rows)
+    const byPath = new Map(scoreCorpus(corpus, q).map((s) => [corpus.docs[s.i].path, s.score]))
+    items = items.filter((x) => byPath.has(x.r.path)).map((x) => ({ ...x, score: byPath.get(x.r.path) }))
   }
 
   const dir = f.order === 'asc' ? 1 : -1

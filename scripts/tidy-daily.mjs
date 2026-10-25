@@ -9,7 +9,7 @@
 //   --report-dir DIR    报告目录，缺省 <home>/tidy-reports
 //   --threshold N       近重复合并阈值，缺省 0.85（TIDY_THRESHOLD）
 //   --max-delete N      单次最多软删张数，缺省 10（TIDY_MAX_DELETE）
-//   --batches a,b       自动应用的批次，缺省 merge,tags（TIDY_AUTO_BATCHES）；noise 永远只进报告
+//   --batches a,b       自动应用的批次，缺省 merge,tags（TIDY_AUTO_BATCHES）；可选 merge/tags/topics/snapshots，noise 永远只进报告
 //   --help
 // 退出码：0 正常；1 整理失败/应用失败；2 参数错误。
 //
@@ -63,7 +63,8 @@ export async function runTidyDaily(o, { stderr = (s) => process.stderr.write(s),
   const THRESHOLD = o.threshold
   const MAX_DELETE = o.maxDelete
   const AUTO = o.batches
-  for (const b of AUTO) if (!T.TIDY_BATCHES.includes(b) || b === 'noise') { stderr(`不允许自动批次：${b}（noise 只进报告）\n`); return 2 }
+  const allowed = T.ALL_TIDY_BATCHES || T.TIDY_BATCHES // topics / snapshots 属可选批次，显式传入才跑
+  for (const b of AUTO) if (!allowed.includes(b) || b === 'noise') { stderr(`不允许自动批次：${b}（可选 ${allowed.filter((x) => x !== 'noise').join('/')}；noise 只进报告）\n`); return 2 }
   const day = now.toISOString().slice(0, 10)
   const reportDir = o.reportDir ? path.resolve(o.reportDir) : path.join(root, 'tidy-reports')
   fs.mkdirSync(reportDir, { recursive: true, mode: 0o700 })

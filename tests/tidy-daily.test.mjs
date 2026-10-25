@@ -32,7 +32,11 @@ test('缺数据目录 / 含 noise 的自动批次 → 退出码 2，且不动任
   assert.equal(await runTidyDaily(parseArgs([], {}), io), 2)
   const { root } = await buildFixture()
   assert.equal(await runTidyDaily(parseArgs(['--home', root, '--batches', 'merge,noise'], {}), io), 2)
+  assert.equal(await runTidyDaily(parseArgs(['--home', root, '--batches', 'bogus'], {}), io), 2)
   assert.equal(fs.existsSync(path.join(root, 'tidy-reports')), false)
+  // 可选批次（topics / snapshots）由 tidy 侧决定：有 ALL_TIDY_BATCHES 就该接受
+  const tidy = await import('../src/core/tidy.js')
+  if (tidy.ALL_TIDY_BATCHES) assert.equal(await runTidyDaily(parseArgs(['--home', root, '--batches', 'tags,topics,snapshots'], {}), io), 0)
 })
 
 test('dry-run：库不变、不备份，写出报告（含"只进报告"各节）', async () => {
