@@ -14,36 +14,51 @@
 | type | 判定 | weight |
 |---|---|---|
 | `link` | 正文 `[[x]]`（解析顺序：`<kind目录>/x.md` → `03-Knowledge/x.md` → `x.md` → 标题 → 文件名） | 3 |
-| `tag` | 共享标签，每卡按共享数取 Top-6（候选 ≤6 全连）；附 `tags`（共享标签，≤5） | 共享标签数 |
+| `tag` | 共享标签，每卡按共享数取 Top-6（见下「标签边如何选边」）；附 `tags`（共享标签，≤5） | 共享标签数 |
 | `similar` | 正文前 4000 字 bigram Jaccard ≥ 0.42，每卡至多 1 条，跨 kind 须共享标签；附 `sim` | 2 |
 
 与原版差异：标签边 type 统一为 `tag`（共享标签放 `tags` 字段）；wikilink 解析单次命中（原版可能因标题回退多加一条）；相似度只取正文前 4000 字；标题经 `redactSecrets` 遮蔽。
 
+### 标签边如何选边（稀有标签优先 + 热门标签窗口采样 + 精确复核权重）
+
+语义不变：每卡最多 6 条 tag 边，边权 = 真实共享标签数，同一对卡只保留最大权重。变的是「找候选」的方式：
+
+1. 建 `tag → posting`（posting 是卡片在 `cards` 里的下标，按 `updated_at DESC, path` 顺序，天然稳定），丢掉只有 1 张卡的标签。
+2. 每卡把自己的标签按 DF（有多少张卡带这个标签）**升序**排——稀有标签优先，信息量大且便宜——最多看 `TAG_MAX_TAGS_PER_CARD=24` 个。
+3. 累积候选：DF ≤ `TAG_COLD_DF=512` 的稀有标签**全量精确扫描**；DF 更大的热门标签只取该卡在 posting 里位置之后 `TAG_HOT_WINDOW=64` 个同标签卡（单向窗口：相邻卡的窗口高度重叠，双向取会让同一对卡被双方反复采到并互相覆盖，实测 tag 边数反而少三成）。
+4. 用「小顶堆/插入式部分选择」从候选里取权重最高的 6 个（同权重按下标升序，确定性）。
+5. 对这 6 个候选**重算精确权重**（两卡标签集合求交的大小）再写 `pairBest`，所以边权始终是真值，只有「谁是 Top-6」在热门标签上是近似的。
+
+为什么这么做：原实现每张卡遍历它所有标签的全部同标签卡，热门标签（如 `release`、`batch-0`）下就是 O(n²)——1 万卡冷建图 4.8 秒。现在每卡的候选数被 24 个标签 ×（稀有标签 DF 上限 / 热门标签 64 窗口）钉死，建图变成 O(n·有界)；实测 1 万卡冷建图 5402ms → 562ms（`graphQuery` 全量不截断，脚本 `tests/e2e/graph-perf-edges.mjs`，在基线分支上跑同一脚本取改动前数据）；tag 边 59951 条 vs 改动前 59041 条（101%，验收线 ≥80%），孤立点 0（验收线 ≤5%）。候选累积用 `Int32Array` 权重 + 版本戳 + 复用 `touched`，不建 `Map`、不整体 `sort`。全部预算常量固定、无随机，同一份数据只有增删改卡才会变（指纹缓存同理）。
+
 性能：全量建图结果按"指纹"（卡数/最大 updated_at/Σid/Σ标签长/Σ标题长/Σ正文长/audit_log 与 card_updates 水位）缓存在进程内，指纹变即失效；过滤/limit/focus 都在缓存上做。不落盘。
-规模实测（合成数据、7 种 kind、带标签/正文/wikilink，非生产库，脚本 `tests/e2e/graph-perf-server.mjs` + `graph-perf-api.mjs` + `graph-perf-e2e.mjs`）：1500 卡冷建图 193ms / 命中缓存 20ms；2000 卡冷建图 323ms / 命中缓存 24ms；2000 卡默认视图进入页面 → canvas 首帧 267ms、单帧绘制均值 1.44ms。因此「自动上限」保持在 2000（= `GRAPH_MAX_LIMIT`），日常 1475 卡规模默认视图零截断。
+规模实测（合成数据、7 种 kind、带标签/正文/wikilink，非生产库，脚本 `tests/e2e/graph-perf-server.mjs` + `graph-perf-api.mjs` + `graph-perf-e2e.mjs`）：1500 卡冷建图 193ms / 命中缓存 20ms；2000 卡冷建图 323ms / 命中缓存 24ms；2000 卡默认视图进入页面 → canvas 首帧 267ms、单帧绘制均值 1.44ms。5000 卡冷建图 339ms / 命中缓存 52–63ms；10000 卡冷建图 579ms / 命中缓存 67–79ms（约 6000 张时默认视图开始出现截断）；5000 卡默认视图进入页面 → canvas 首帧 663ms、单帧绘制均值 3.8ms。因此「自动上限」定在 5000：日常 1475 卡规模默认视图零截断，规模再大的库也能在一秒内出图，超出时截断提示降为 info 级并可用过滤缩小范围。
 
 ## API
 `GET {base}/admin/api/graph`，只读、需管理员会话（未登录 401；Agent 令牌 401；POST 等 405）。`MEMORY_HUB_ADMIN_READONLY=1` 下可访问。
 
 | 参数 | 说明 |
 |---|---|
-| `kind` | 只要该 kind 的卡 |
 | `tag` | 逗号分隔，卡须同时具备全部标签 |
+| `kind` | 只要该 kind 的卡（单值） |
+| `kinds` | 逗号分隔的多个 kind（最多 7 个），与 `kind` 同时给按并集；供前端在图例上多选 |
 | `types` | `link,tag,similar` 子集 |
 | `min_weight` | 1–20，默认 1 |
 | `focus` | 卡片 **path**（本管理 API 以 path 为键，不暴露数字 id）；返回焦点 + `depth`（1–3，默认 1）跳邻域；不在图中（不存在/已删/隔离）→ 404 |
 | `hide_isolated` | `1` 去掉无边节点 |
-| `limit` | 不带 = 自动上限（= 最大上限 2000，即默认显示全部节点）；显式 1–2000（超出钳到 2000）；超限按加权度数（边权和）降序截断（焦点必留），`truncated:true`。`stats.limitAuto` = 是否未带 `limit`（走自动上限），前端据此区分“超自动上限”与“手动压小上限”两种提示 |
+| `limit` | 不带 = 自动上限（= 最大上限 5000，即默认显示全部节点）；显式 1–5000（超出钳到 5000）；超限按加权度数（边权和）降序截断（焦点必留），`truncated:true`。`stats.limitAuto` = 是否未带 `limit`（走自动上限），前端据此区分“超自动上限”与“手动压小上限”两种提示 |
 | `status` | 仅接受 `approved`（图只含主库），其它值 400 |
 
-处理顺序：kind/tag 选点 → types/min_weight 选边 → focus 邻域 → hide_isolated → limit 截断。
+处理顺序：kind/kinds/tag 选点 → types/min_weight 选边 → focus 邻域 → hide_isolated → limit 截断。
 
 响应：`{ nodes:[{id,title,kind,tags,status,createdAt,updatedAt,degree}], edges:[{source,target,type,weight,tags?,sim?}], truncated, stats:{totalCards,matchedNodes,nodes,edges,isolated,byKind,byType,limit,limitAuto,focus,cached,buildMs} }`。`degree` = 返回边里的出现次数。**不含正文/摘要**；点击节点后前端才请求现有 `GET /admin/api/card?path=` 取摘要。
 
 ## 前端
-`web/js/views/graph.js`（视图）+ `web/js/graph-core.js`（纯函数：过滤/搜索/力导向/视图变换/命中测试，单测）。零依赖、canvas、自写力导向（网格近邻斥力，2000 节点仍流畅：实测单帧绘制 ≈1.4ms），无构建、无外网、遵守现有 CSP 与 DOM 助手约束。
-交互：滚轮缩放（以光标为锚）、拖空白平移、拖节点、悬停提示与邻居高亮、点击→右侧面板（kind/标签/时间/度数/正文摘要/相邻卡片/「打开卡片详情」/「以此为中心展开」邻域模式 `#/graph?focus=`）；搜索高亮（标题/标签/kind/path）；kind 图例点选过滤；标签下拉；最小权重滑块；边类型开关；隐藏孤立点；最多节点数（默认「全部节点（自动）」，不写进 URL；手动可选 200/500/800/1500/2000）；适应/重新布局；键盘 `+ - 0 Esc`。颜色按 kind（簇色），大小按度数。
-截断提示是信息级（`notice('info')`）：只有卡数超过自动上限、或用户手动压小了上限才出现；默认视图没有任何截断提示。
+`web/js/views/graph.js`（视图）+ `web/js/graph-core.js`（纯函数：过滤/搜索/力导向/视图变换/命中测试，单测）。零依赖、canvas、自写力导向（网格近邻斥力，5000 节点仍流畅：实测单帧绘制均值 3.8ms），无构建、无外网、遵守现有 CSP 与 DOM 助手约束。
+交互：滚轮缩放（以光标为锚）、拖空白平移、拖节点、悬停提示与邻居高亮、点击→右侧面板（kind/标签/时间/度数/正文摘要/相邻卡片/「打开卡片详情」/「以此为中心展开」邻域模式 `#/graph?focus=`）；搜索高亮（标题/标签/kind/path）；kind 图例点选过滤（可多选，发 `kinds=`）；标签下拉；最小权重滑块；边类型开关；隐藏孤立点；最多节点数（默认「全部节点（自动）」，不写进 URL；手动可选 200/500/800/1500/2000/3000/5000）；适应/重新布局；键盘 `+ - 0 Esc`。颜色按 kind（簇色），大小按度数。
+截断提示是信息级（`notice('info')`）：只有卡数超过自动上限、或用户手动压小了上限才出现；默认视图（未超上限）没有任何截断提示。
+
+**截断时过滤回服务器**：被 `limit` 截断藏掉的卡在前端数据里根本不存在，光靠本地过滤是筛不回来的。所以一旦 `data.truncated` 为真（或发生过一次服务器过滤），标签 / 图例类型 / 边类型 / 最小权重 / 隐藏孤立点的变化都改成重新 `GET /admin/api/graph`（带上当前全部条件；权重滑块这类连续输入 150ms 防抖，递增请求序号丢弃过期响应），成功后替换数据并刷新截断提示、图例计数、页头计数、标签选项、节点列表与布局；此模式下 `filterGraph` 只做原样透传（服务器已选过点 / 边），不会二次筛掉结果。标签选项此时改从 `GET /admin/api/tags?limit=500` 取，被藏掉的标签也能选到；未截断时仍是本地过滤 + 本地标签选项，不联网。
 URL：`#/graph?focus=&tag=&kind=&limit=`。
 
 ### 暗色霓虹簇云风格
@@ -79,7 +94,7 @@ LLM：复用蒸馏的 OpenAI 兼容适配器（`MEMORY_LLM_*`，同一超时配�
 框选/合并/删除（管理台图谱只读）、右键菜单、导出、全屏、"时间模式"、视口剔除 LOD（改为标签预算 + 隐藏孤立点/最小权重/limit 降噪）、多库聚合、磁盘缓存。
 
 ## 测试
-`tests/admin/graph.test.mjs`（API：鉴权/结构/不泄露/过滤/limit/自动上限/focus/边类型/只读/规模）、`tests/admin/graph-core.test.mjs`（纯函数）。规模 / 首帧性能实测脚本见上（`tests/e2e/graph-perf-*.mjs`）。截图 `docs/screenshots/m4/`（合成数据，非真实数据；`07` 默认视图带截断警告（改动前，800 上限），`08`/`09` 1500/2000 卡默认视图无提示（改动后），`10` 手动上限 200 时的信息级提示，`11` 2100 卡（超自动上限）时的信息级自动截断提示）。
+`tests/admin/graph.test.mjs`（API：鉴权/结构/不泄露/过滤（含 `kinds` 多值并集）/limit 与截断/自动上限 5000/focus/边类型/只读/规模）、`tests/admin/graph-core.test.mjs`（纯函数）。规模 / 首帧性能实测脚本见上（`tests/e2e/graph-perf-*.mjs`）。截图 `docs/screenshots/m4/`（合成数据，非真实数据；`07` 默认视图带截断警告（改动前，800 上限），`08`/`09` 1500/2000 卡默认视图无提示，`10` 手动上限 200 时的信息级提示，`11` 2100 卡（超自动上限）时的信息级自动截断提示，`12`/`13` 6000 卡截断后用被藏标签回服务器筛出结果，`14`/`15` 5000 卡默认视图无提示与手动上限 200 的信息级提示）。截断过滤的浏览器验证脚本：`tests/e2e/graph-truncation-filter-e2e.mjs`（配 `graph-truncation-server.mjs`，断言被藏标签能选到、筛出后计数与画布一致、清空后回到全量）。
 
 ## 部署
 改了 `src/admin/{graph,graph-search,handler}.js`、`src/config.js`、`src/server.js` 与 `web/`：**需重启 hub**；**无 schema 变更**、无新依赖、无新配置。
