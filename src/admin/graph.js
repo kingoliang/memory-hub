@@ -11,7 +11,7 @@ import { minhashSignature, lshCandidates } from '../core/minhash.js'
 import { redactSecrets } from '../core/tidy.js'
 
 export const EDGE_TYPES = ['link', 'tag', 'similar']
-export const GRAPH_MAX_LIMIT = 2000
+export const GRAPH_MAX_LIMIT = 5000
 /** 「自动上限」：请求不带 limit 时用它，默认等于 GRAPH_MAX_LIMIT（= 全部节点，除非撑不住）。 */
 export const GRAPH_AUTO_LIMIT = GRAPH_MAX_LIMIT
 /** 边权重：显式 [[链接]] 最强；正文相似次之；标签边 = 共享标签个数。 */
@@ -20,6 +20,11 @@ export const WEIGHT_SIMILAR = 2
 
 // 与上游 vault.graph() 同值的建图参数
 const TAG_TOPK = 6
+/** 标签边选边的预算参数（见 buildTagEdges）：稀有标签全量精确、热门标签只取窗口、单卡最多看这么多个标签。 */
+const TAG_COLD_DF = 512
+const TAG_HOT_WINDOW = 64
+const TAG_MAX_TAGS_PER_CARD = 24
+const TAG_EDGE_TAGS = 5
 const SIM_THRESHOLD = 0.42
 const DF_CAP = 24
 const RARE_CAP = 120
@@ -96,29 +101,8 @@ function buildFull(db) {
     }
   })
 
-  // ---- ② 共享标签：按共享标签数取 Top-K（避免同标签全连接爆炸）----
-  const tagIndex = new Map()
-  for (const c of cards) for (const t of c.tags) {
-    const arr = tagIndex.get(t)
-    if (arr) arr.push(c.id); else tagIndex.set(t, [c.id])
-  }
-  const pairBest = new Map()
-  for (const card of cards) {
-    const weights = new Map()
-    for (const tag of card.tags) for (const other of tagIndex.get(tag) || []) if (other !== card.id) weights.set(other, (weights.get(other) || 0) + 1)
-    const ranked = [...weights.entries()].sort((x, y) => y[1] - x[1])
-    for (const [other, w] of weights.size <= TAG_TOPK ? ranked : ranked.slice(0, TAG_TOPK)) {
-      const [x, y] = card.id < other ? [card.id, other] : [other, card.id]
-      const key = `${x}\u0000${y}`
-      if ((pairBest.get(key) || 0) >= w) continue
-      pairBest.set(key, w)
-    }
-  }
-  for (const [key, w] of pairBest) {
-    const [x, y] = key.split('\u0000')
-    const yt = new Set(byPath.get(y).tags)
-    addEdge(x, y, 'tag', w, { tags: byPath.get(x).tags.filter((t) => yt.has(t)).slice(0, 5) })
-  }
+  // ---- ② 共享标签：按共享标签数取每卡 Top-K ----
+  buildTagEdges(cards, addEdge)
 
   // ---- ③ 正文相似（Jaccard(bigram) ≥ 0.42，每卡至多 1 条；稀有 gram 倒排 + MinHash/LSH 取候选，再精确求交）----
   const hashes = new Map()
@@ -174,6 +158,104 @@ function buildFull(db) {
   return { cards, edges, buildMs: Date.now() - t0 }
 }
 
+/** posting 里第一个 ≥ 目标值的下标（posting 下标升序）。 */
+function lowerBound(arr, target) {
+  let lo = 0
+  let hi = arr.length
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1
+    if (arr[mid] < target) lo = mid + 1; else hi = mid
+  }
+  return lo
+}
+
+/**
+ * ② 共享标签选边：语义与「每卡按共享标签数取 Top-K、同一对卡只留最大权重」一致，但把 O(n²) 的累积换成预算化 + 精确复核。
+ *
+ * 热门标签（DF > TAG_COLD_DF）下「每卡×全部同标签卡」是平方级的，所以对热门标签只取该卡在 posting 里位置之后的 TAG_HOT_WINDOW
+ * 个同标签卡做候选（posting 按 cards 顺序 = `updated_at DESC, path`，位置相近 = 最近更新相近，是合理的近似）。只朝一个方向是因为
+ * 相邻卡的窗口高度重叠：双向取会让同一对卡被双方反复采到、互相覆盖，实测 tag 边数反而少三成；朝后取时每张卡贡献的边不重复，
+ * 覆盖数与全量扫描相当。稀有标签（DF ≤ TAG_COLD_DF）仍然全量精确扫描；单卡按 DF 升序最多只看 TAG_MAX_TAGS_PER_CARD 个标签（稀有优先）。采样得到的候选再重算精确权重（两卡标签集合
+ * 求交大小），所以边权始终是真值，只有「谁是 Top-K」在热门标签上是近似的。同一份数据只有增删改卡才会变（无随机）。
+ *
+ * 候选累积用 Int32Array 权重 + 版本戳 + 复用 touched，避免每卡建 Map / 整体 sort。
+ */
+function buildTagEdges(cards, addEdge) {
+  const n = cards.length
+  if (!n) return
+  // posting：标签 → 卡片在 cards 里的下标（按 cards 顺序追加，天然稳定）
+  const postings = new Map()
+  for (let i = 0; i < n; i++) for (const t of cards[i].tags) {
+    const arr = postings.get(t)
+    if (arr) arr.push(i); else postings.set(t, [i])
+  }
+  const df = new Map()
+  for (const [t, arr] of postings) { if (arr.length > 1) df.set(t, arr.length); else postings.delete(t) } // 独自标签无同标签卡
+
+  const tagSet = cards.map((c) => new Set(c.tags))
+  const weights = new Int32Array(n)
+  const stamp = new Int32Array(n)
+  let ver = 0
+  const bestI = new Int32Array(TAG_TOPK)
+  const bestW = new Int32Array(TAG_TOPK)
+  const pairBest = new Map() // `小path\u0000大path` → { w, i, j }
+
+  for (let i = 0; i < n; i++) {
+    const mine = cards[i].tags
+    if (!mine.length) continue
+    const tags = [...new Set(mine)].filter((t) => df.has(t))
+      .sort((a, b) => df.get(a) - df.get(b) || (a < b ? -1 : 1)) // 稀有优先；同 DF 按标签名保证确定性
+      .slice(0, TAG_MAX_TAGS_PER_CARD)
+    if (!tags.length) continue
+    ver++
+    const touched = []
+    const bump = (j) => { if (stamp[j] !== ver) { stamp[j] = ver; weights[j] = 0; touched.push(j) } weights[j]++ }
+    for (const tag of tags) {
+      const posting = postings.get(tag)
+      const d = posting.length
+      if (d <= TAG_COLD_DF) {
+        for (let k = 0; k < d; k++) { const j = posting[k]; if (j !== i) bump(j) }
+      } else {
+        const lo = lowerBound(posting, i) + 1 // 只朝后取窗口：相邻卡的窗口高度重叠，双向取会让同一对卡被反复采到并互相覆盖
+        const to = Math.min(d, lo + TAG_HOT_WINDOW)
+        for (let k = lo; k < to; k++) bump(posting[k])
+      }
+    }
+    if (!touched.length) continue
+    // 部分选择：取权重最高的 TAG_TOPK 个（同权重按下标升序，保证确定性），只维护一个小数组
+    let bn = 0
+    for (const j of touched) {
+      const w = weights[j]
+      let pos = Math.min(bn, TAG_TOPK)
+      while (pos > 0 && (bestW[pos - 1] < w || (bestW[pos - 1] === w && bestI[pos - 1] > j))) {
+        if (pos < TAG_TOPK) { bestW[pos] = bestW[pos - 1]; bestI[pos] = bestI[pos - 1] }
+        pos--
+      }
+      if (pos < TAG_TOPK) { bestW[pos] = w; bestI[pos] = j; if (bn < TAG_TOPK) bn++ }
+    }
+    // 精确复核：采样权重只用于选候选，写边前重算真实共享标签数
+    for (let k = 0; k < bn; k++) {
+      const j = bestI[k]
+      const A = tagSet[i]
+      const B = tagSet[j]
+      const [small, big] = A.size <= B.size ? [A, B] : [B, A]
+      let w = 0
+      for (const t of small) if (big.has(t)) w++
+      if (!w) continue
+      const key = i < j ? `${cards[i].id}\u0000${cards[j].id}` : `${cards[j].id}\u0000${cards[i].id}`
+      const cur = pairBest.get(key)
+      if (cur && cur.w >= w) continue
+      pairBest.set(key, { w, i, j })
+    }
+  }
+
+  for (const [key, { w, i, j }] of pairBest) {
+    const [x, y] = key.split('\u0000')
+    const yt = tagSet[j]
+    addEdge(x, y, 'tag', w, { tags: cards[i].tags.filter((t) => yt.has(t)).slice(0, TAG_EDGE_TAGS) })
+  }
+}
+
 const cache = new Map() // root -> { fp, full }
 
 function getFull(root) {
@@ -192,8 +274,9 @@ export class GraphNotFound extends Error {
 }
 
 /**
- * @param {object} o { tags?:string[], kind?:string, types?:string[], minWeight?:number, focus?:string, depth?:number, hideIsolated?:boolean, limit?:number }
- * 处理顺序：kind/tag 选点 → 按类型/权重选边 → focus 邻域 → 去孤立点 → 按加权度数截断到 limit。
+ * @param {object} o { tags?:string[], kind?:string, kinds?:string[], types?:string[], minWeight?:number, focus?:string, depth?:number, hideIsolated?:boolean, limit?:number }
+ * 处理顺序：kind/kinds/tag 选点 → 按类型/权重选边 → focus 邻域 → 去孤立点 → 按加权度数截断到 limit。
+ * kind（单值）与 kinds（多值）都传就取并集。
  * 不带 limit（= 自动上限 GRAPH_AUTO_LIMIT）时 stats.limitAuto = true，前端据此区分“卡片太多自动截断”和“用户选了更小的上限”。
  */
 export function graphQuery(root, o = {}) {
@@ -203,6 +286,8 @@ export function graphQuery(root, o = {}) {
   const minWeight = o.minWeight ?? 1
   const types = o.types?.length ? new Set(o.types) : null
   const tags = o.tags || []
+  const kindSet = new Set([...(o.kind ? [o.kind] : []), ...(o.kinds || [])])
+  const kinds = kindSet.size ? kindSet : null
 
   let focusCard = null
   if (o.focus) {
@@ -210,7 +295,7 @@ export function graphQuery(root, o = {}) {
     if (!focusCard) throw new GraphNotFound('焦点卡片不在知识图谱中（不存在、已删除或在隔离区）')
   }
 
-  const keep = (c) => (!o.kind || c.kind === o.kind) && tags.every((t) => c.tags.includes(t))
+  const keep = (c) => (!kinds || kinds.has(c.kind)) && tags.every((t) => c.tags.includes(t))
   let ids = new Set(full.cards.filter((c) => keep(c) || c === focusCard).map((c) => c.id))
   let edges = full.edges.filter((e) => ids.has(e.source) && ids.has(e.target) && e.weight >= minWeight && (!types || types.has(e.type)))
 

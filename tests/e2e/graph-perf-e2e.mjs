@@ -10,7 +10,7 @@ const OUT = process.env.OUT
 const RUNS = Number(process.env.RUNS || 3) // 页面加载计时重复次数（取中位数）
 const SETTLE_MS = Number(process.env.SETTLE_MS || 5000)
 const SAMPLE_MS = Number(process.env.SAMPLE_MS || 5000)
-const EXPECT_TRUNC = process.env.EXPECT_TRUNC === '1' // 卡数超过自动上限（>2000）时设为 1
+const EXPECT_TRUNC = process.env.EXPECT_TRUNC === '1' // 卡数超过自动上限（>5000）时设为 1
 if (!PW || !OUT) { console.error('需要环境变量 ADMIN_PW 与 OUT'); process.exit(2) }
 fs.mkdirSync(OUT, { recursive: true })
 const require = createRequire((process.env.PW_ROOT || '.') + '/package.json')
