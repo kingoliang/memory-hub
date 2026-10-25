@@ -47,6 +47,56 @@ export function timelineTitle(title) {
   return base + TIMELINE_SUFFIX
 }
 
+// ---------------------------------------------------------------------------
+// 快照系列前缀 + 日期段（GH #11）
+//
+// 旧实现要求「剥时间戳后的整条标题主干」全等，而真实班次快照标题的尾巴每次都不同，生产库上恒 0 命中。
+// 改为取前缀（第一个分隔符之前）+ 证据 + 日期分段：前缀是系列身份，日期是时间线卡的分段单位。
+// ---------------------------------------------------------------------------
+
+/** 系列前缀的分隔符（取最早出现的一个；全角冒号已由 NFKC 归一成半角）。 */
+const PREFIX_DELIMS = [':', '：', '—', '|', '-']
+const EDGE_RE = /^[\s\-—_:：,，.。·|/]+|[\s\-—_:：,，.。·|/]+$/g
+/** 前缀至少要有一个「非数字词」（2 字以上的字母/汉字），否则纯日期 / 序号就能把全库并成一组。 */
+const WORD_RE = /[^\d\s\p{P}\p{S}]{2,}/u
+
+/**
+ * 快照系列前缀：先剥时间戳，再取第一个分隔符之前的部分。
+ * 不合格（空，或剥完只剩日期 / 标点 / 单个字符）返回 ''，该卡就不进快照批次。
+ */
+export function snapshotPrefix(title) {
+  const s = stripStamps(title)
+  let cut = -1
+  for (const d of PREFIX_DELIMS) {
+    const i = s.indexOf(d)
+    if (i >= 0 && (cut < 0 || i < cut)) cut = i
+  }
+  const head = (cut < 0 ? s : s.slice(0, cut)).replace(EDGE_RE, '').trim()
+  return head && WORD_RE.test(head) ? head : ''
+}
+
+const pad2 = (x) => String(x).padStart(2, '0')
+
+/**
+ * 快照日期段：标题里的 YYYY-MM-DD / YYYYMMDD / MM-DD 归一成 `YYYY-MM-DD` / `MM-DD`；没有日期返回 ''。
+ * 取标题里最早出现的日期（真实快照标题的时间戳在最前面）。
+ */
+export function snapshotDay(title) {
+  const s = String(title || '').normalize('NFKC')
+  let m = s.match(/(\d{4})[-/.年](\d{1,2})[-/.月](\d{1,2})/)
+  if (m) return `${m[1]}-${pad2(m[2])}-${pad2(m[3])}`
+  m = s.match(/(?:^|\D)(\d{4})(\d{2})(\d{2})(?!\d)/)
+  if (m) return `${m[1]}-${m[2]}-${m[3]}`
+  m = s.match(/(?:^|\D)(\d{1,2})[/-](\d{1,2})(?!\d)/)
+  if (m && Number(m[1]) >= 1 && Number(m[1]) <= 12 && Number(m[2]) >= 1 && Number(m[2]) <= 31) return `${pad2(m[1])}-${pad2(m[2])}`
+  return ''
+}
+
+/** 时间线卡标题：前缀 +（日期段）+ 「（时间线）」；一天一张，日期进标题才能幂等。 */
+export function snapshotTimelineTitle(prefix, day) {
+  return `${prefix}${day ? ' ' + day : ''}${TIMELINE_SUFFIX}`
+}
+
 const ENTITY_RE = /[A-Za-z][A-Za-z0-9+_.-]*\d[A-Za-z0-9+_.-]*|\d+[A-Za-z][A-Za-z0-9+_.-]*|[A-Z][a-z]+[A-Z][A-Za-z0-9]*|\b[A-Z]{2,}[A-Z0-9]*\b/g
 const ENTITY_STOP = new Set(['md', 'api', 'url', 'json', 'http', 'https', 'todo', 'ok', 'id', 'ui', 'ai', 'llm', 'cli'])
 
@@ -74,6 +124,13 @@ export const TOPIC_DEFAULTS = Object.freeze({
   bodyLimit: 4000,
   minSeries: 3, // 快照序列至少几张
   maxGroup: 50, // 单组上限（防止链式把整库并成一组）
+})
+
+/** 快照序列专用默认值（GH #11）。 */
+export const SNAPSHOT_DEFAULTS = Object.freeze({
+  maxPoints: 40, // 单序列上限，超出的旧卡留在原处不并入
+  minAgeHours: 24, // 序列里最新一张至少这么旧才出建议（避免改写进行中的当天序列）
+  bodyCorroborate: 0.15, // 既无共享实体也无共享标签时，正文相似度至少这么高才算同一系列
 })
 
 function prep(c, o) {
@@ -110,41 +167,153 @@ export function topicSimilarity(a, b, opts = {}) {
 
 const round2 = (x) => Math.round(x * 100) / 100
 
+/** 快照证据信号：标签（去 raw）、实体（标题 + 正文前 800 字）、正文 bigram。 */
+function snapshotFacts(c, o) {
+  return {
+    tags: new Set((c.tags || []).filter((t) => t !== 'raw').map(tagKey).filter(Boolean)),
+    ent: extractEntities(`${c.title}\n${String(c.body || '').slice(0, 800)}`),
+    body: bigramHashSet(String(c.body || '').slice(0, o.bodyLimit)),
+  }
+}
+
+function overlapHits(a, b) { for (const x of a) if (b.has(x)) return true; return false }
+
+/** 证据强度：共享标签比共享实体更有说服力（只用于在同一桶里挑最像的组）。 */
+function evidenceScore(a, b) {
+  let n = 0
+  for (const x of a.tags) if (b.tags.has(x)) n += 3
+  for (const x of a.ent) if (b.ent.has(x)) n += 2
+  return n
+}
+
+/** 是否有证据：共享实体或共享标签；两者都没有则要求正文相似度 ≥ bodyCorroborate。 */
+function corroborates(a, b, o) {
+  if (overlapHits(a.tags, b.tags) || overlapHits(a.ent, b.ent)) return true
+  return jaccardSets(a.body, b.body) >= o.bodyCorroborate
+}
+
+const snapshotTime = (c) => {
+  const ms = Date.parse(String(c.updatedAt || c.createdAt || ''))
+  return Number.isFinite(ms) ? ms : null
+}
+
 /**
- * 周期性快照序列：同 kind + 同标题主干 + 标题带时间戳，且至少 minSeries 张。
- * @param cards [{id,path,kind,title,body,tags,updatedAt?}]
- * @returns [{stem, kind, count, first, last, members:[{id,path,title}]}]（按张数降序、主干字典序）
+ * 周期性快照序列（GH #11）：同 kind + 同系列前缀 + 同日期段，且要证据佐证。
+ *
+ * 分组不再是「整条标题主干全等」，因为真实快照标题的尾巴每次都不同：
+ *   1. 前缀 = 剥掉时间戳后第一个分隔符之前的部分（必须含非数字词）；
+ *   2. 同前缀内还要共享实体 / 共享标签（两者都空则要求正文相似度 ≥ 0.15）才算同一系列；
+ *   3. 系列内再按日期（YYYY-MM-DD / MM-DD / YYYYMMDD）分段：一天一张时间线卡，只有 1 张的稀疏日归入不带日期的段（免得一天一张的日常快照被拆成每张一卡）；无日期退化成单段；
+ *   4. 单序列最多 maxPoints 张（超出的旧卡留在原处），且最新一张要早于 minAgeHours 才出建议；
+ *   5. 已有「（时间线）」卡的序列直接追加（哪怕只有 1 张新卡），保持幂等 + 可回滚。
+ *
+ * @param cards [{id,path,kind,title,body,tags,createdAt?,updatedAt?}]
+ * @param opts {minSeries, maxPoints, minAgeHours, bodyCorroborate, maxSeries, now}
+ * @returns [{stem, kind, day, count, first, last, timeline, members:[{id,path,title,createdAt}]}]
+ *          按张数降序、前缀与日期字典序；`maxSeries` 只截取最前面这么多个序列。
  */
 export function planSnapshotSeries(cards, opts = {}) {
-  const o = { ...TOPIC_DEFAULTS, ...opts }
-  const byStem = new Map()
-  const timelines = new Map()
+  const o = { ...TOPIC_DEFAULTS, ...SNAPSHOT_DEFAULTS, ...opts }
+  const nowMs = o.now == null ? Date.now() : new Date(o.now).getTime()
+  const maxPoints = Math.max(1, Math.floor(Number(o.maxPoints) || SNAPSHOT_DEFAULTS.maxPoints))
+  const minAgeMs = Math.max(0, Number(o.minAgeHours) || 0) * 3_600_000
+  const maxSeries = Number(o.maxSeries) > 0 ? Math.floor(Number(o.maxSeries)) : Infinity
+
+  // 时间线卡按 (kind, 前缀) 归位，快照卡按 (kind, 前缀, 日期) 归桶
+  const timelines = new Map() // `${kind}\0${prefix}` -> [{card, day, used}]
+  const groups = new Map() // `${kind}\0${prefix}` -> Map(day -> cards[])
   for (const c of cards) {
-    const timeline = isTimelineTitle(c.title)
-    if (!timeline && !hasTimestamp(c.title)) continue
-    const stem = titleStem(c.title)
-    if (stem.replace(/\s/g, '').length < 2) continue
-    const k = `${c.kind}\u0000${stem}`
-    if (timeline) { const t = timelines.get(k); if (!t || c.id < t.id) timelines.set(k, c); continue }
-    if (!byStem.has(k)) byStem.set(k, [])
-    byStem.get(k).push(c)
+    if (isTimelineTitle(c.title)) {
+      const prefix = snapshotPrefix(c.title)
+      if (!prefix) continue
+      const k = `${c.kind}\u0000${prefix}`
+      if (!timelines.has(k)) timelines.set(k, [])
+      timelines.get(k).push({ card: c, day: snapshotDay(c.title), used: false })
+      continue
+    }
+    if (!hasTimestamp(c.title)) continue
+    const prefix = snapshotPrefix(c.title)
+    if (!prefix) continue
+    const k = `${c.kind}\u0000${prefix}`
+    const day = snapshotDay(c.title)
+    if (!groups.has(k)) groups.set(k, new Map())
+    const byDay = groups.get(k)
+    if (!byDay.has(day)) byDay.set(day, [])
+    byDay.get(day).push(c)
   }
+
   const out = []
-  for (const [k, members] of byStem) {
-    const timeline = timelines.get(k) || null
-    // 已有时间线卡：哪怕只有 1 张新快照也归进去；还没有：至少 minSeries 张才建议聚合
-    if (members.length < (timeline ? 1 : o.minSeries)) continue
-    const [kind, stem] = k.split('\u0000')
-    members.sort((a, b) => String(a.createdAt || '').localeCompare(String(b.createdAt || '')) || a.id - b.id)
-    const keeper = timeline || members[members.length - 1]
-    out.push({
-      stem, kind, count: members.length,
-      first: members[0].createdAt || null, last: members[members.length - 1].createdAt || null,
-      timeline: { id: keeper.id, path: keeper.path, title: keeper.title, existing: !!timeline, newTitle: timeline ? keeper.title : timelineTitle(keeper.title) },
-      members: members.map((m) => ({ id: m.id, path: m.path, title: m.title, createdAt: m.createdAt || null })),
-    })
+  for (const key of [...groups.keys()].sort()) {
+    const [kind, prefix] = key.split('\u0000')
+    const byDay = groups.get(key)
+    const slots = timelines.get(key) || []
+    // 同一天有 minSeries 张以上、或已经有当天时间线卡的日期才单独成段；其余稀疏日归入不带日期的段
+    const days = [...byDay.keys()]
+      .filter((d) => d && (byDay.get(d).length >= Math.max(2, o.minSeries) || slots.some((s) => !s.used && s.day === d)))
+      .sort()
+    const sparse = []
+    for (const d of [...byDay.keys()].sort()) if (!days.includes(d)) sparse.push(...byDay.get(d))
+    const buckets = new Map(days.map((d) => [d, byDay.get(d)]))
+    if (sparse.length) buckets.set('', [...(buckets.get('') || []), ...sparse])
+    // 稀疏段最后处理：它只能接最近一张已有时间线卡，不能抢走别的日期的专属卡
+    const order = [...buckets.keys()].sort((a, b) => (a === '' ? 1 : b === '' ? -1 : a < b ? -1 : 1))
+
+    for (const day of order) {
+      const members = buckets.get(day)
+        .sort((a, b) => String(a.createdAt || '').localeCompare(String(b.createdAt || '')) || a.id - b.id)
+      // 先找同一天的时间线卡，再退到没有日期的时间线卡；稀疏段则接到最近一张（都没用过才算）
+      const free = slots.filter((s) => !s.used).sort((a, b) => a.card.id - b.card.id)
+      const slot = day
+        ? free.find((s) => s.day === day) || free.find((s) => !s.day) || null
+        : free.find((s) => !s.day) || free.filter((s) => s.day).sort((a, b) => b.day.localeCompare(a.day))[0] || null
+
+      const clusters = []
+      if (slot) {
+        // 已有时间线卡：照旧直接追加，不再要求证据，也不再卡 minSeries
+        clusters.push({ timeline: slot.card, members })
+      } else {
+        const seeds = []
+        for (const c of members) {
+          const f = snapshotFacts(c, o)
+          let best = null; let bestScore = -1
+          for (const cl of seeds) {
+            if (!corroborates(cl.facts, f, o)) continue
+            const s = evidenceScore(cl.facts, f)
+            if (s > bestScore) { best = cl; bestScore = s }
+          }
+          if (!best) { best = { facts: f, members: [] }; seeds.push(best) }
+          best.members.push(c)
+        }
+        clusters.push(...seeds)
+      }
+
+      for (const cl of clusters) {
+        // 超上限：留在时间线上的取最新的 maxPoints 张，更旧的留在原处不并入
+        const keep = cl.members.length > maxPoints ? cl.members.slice(cl.members.length - maxPoints) : cl.members
+        const need = cl.timeline ? 1 : o.minSeries
+        if (keep.length < need) continue
+        const newest = keep[keep.length - 1]
+        const newestMs = snapshotTime(newest)
+        // 还在进行中（最新一张不到 minAgeHours）：先不动，免得每轮都改写同一天的时间线卡
+        if (newestMs !== null && minAgeMs > 0 && nowMs - newestMs < minAgeMs) continue
+        if (cl.timeline) slot.used = true
+        const keeper = cl.timeline || newest
+        out.push({
+          stem: prefix, kind, day, count: keep.length,
+          first: keep[0].createdAt || null, last: newest.createdAt || null,
+          timeline: {
+            id: keeper.id, path: keeper.path, title: keeper.title, existing: !!cl.timeline,
+            newTitle: cl.timeline ? keeper.title : snapshotTimelineTitle(prefix, day),
+          },
+          members: keep.map((m) => ({ id: m.id, path: m.path, title: m.title, createdAt: m.createdAt || null })),
+        })
+      }
+    }
   }
-  return out.sort((a, b) => b.count - a.count || (a.stem < b.stem ? -1 : a.stem > b.stem ? 1 : 0))
+  const sorted = out.sort((a, b) => b.count - a.count
+    || (a.stem < b.stem ? -1 : a.stem > b.stem ? 1 : 0)
+    || (a.day < b.day ? -1 : a.day > b.day ? 1 : 0))
+  return Number.isFinite(maxSeries) ? sorted.slice(0, maxSeries) : sorted
 }
 
 /**
