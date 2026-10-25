@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 // 召回对账（PLAN 6.3.2）：
-//  (i)  旧实现 search()（tests/fixtures/legacy 逐字副本）vs 新实现 search()：同一份旧库快照的两份拷贝，逐项比较 (path, score, 顺序)；
+//  (i)  旧实现 search()（tests/fixtures/legacy 逐字副本）vs 新实现 search()：同一份旧库快照的两份拷贝。
+//       打分已换成 BM25（GH #3），分数与顺序有意不同；这里检查宽松模式下新命中 ⊇ 旧命中（换打分不丢召回），
+//       并统计「前 5 条全部同分」的查询数（旧打分的典型失效）在新旧实现下各有多少；
 //  (ii) 可选：线上旧 MCP 服务 vs 新服务的 memory_recall 文本输出（含路径与顺序；MCP 输出不含分数）。旧服务读的是"活库"，
 //       快照之后的新写入会造成差异——脚本会把差异路径标出"是否创建/更新于快照之后"。
 // 输出只含计数、查询序号和类别，不打印查询词、标题或正文。令牌只从文件读，不打印。
@@ -49,19 +51,26 @@ const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'memory-hub-parity-'))
 const dOld = path.join(tmp, 'old'), dNew = path.join(tmp, 'new')
 fs.mkdirSync(dOld); fs.mkdirSync(dNew)
 for (const d of [dOld, dNew]) fs.copyFileSync(snapshot, path.join(d, 'memory-eternal.db'))
-let diffsI = 0, hitsTotal = 0, nonEmpty = 0
+let lost = 0, hitsTotal = 0, nonEmpty = 0, tiedOld = 0, tiedNew = 0
+const allTied = (hits) => hits.length >= 3 && new Set(hits.map((h) => h.score)).size === 1
 try {
   for (const [i, { q, cat }] of qs.entries()) {
-    for (const opts of [{ limit: 5, minScore: 2 }, { limit: 30 }]) {
-      const o = await legacyVault.search(dOld, q, opts).catch((e) => ({ err: String(e.message) }))
-      const n = await newVault.search(dNew, q, opts).catch((e) => ({ err: String(e.message) }))
-      const same = JSON.stringify(o) === JSON.stringify(n)
-      if (Array.isArray(n)) { hitsTotal += n.length; if (n.length) nonEmpty++ }
-      if (!same) { diffsI++; console.log(`  (i) 差异：查询#${i} [${cat}] opts=${JSON.stringify(opts)}`) }
-    }
+    const o = await legacyVault.search(dOld, q, { limit: 1e9 }).catch(() => [])
+    const n = await newVault.search(dNew, q, { limit: 1e9 }).catch(() => [])
+    hitsTotal += n.length
+    if (n.length) nonEmpty++
+    const np = new Set(n.map((h) => h.path))
+    const missing = o.filter((h) => !np.has(h.path)).length
+    if (missing) { lost++; console.log(`  (i) 新实现丢了旧命中：查询#${i} [${cat}] ${missing} 张`) }
+    const o5 = await legacyVault.search(dOld, q, { limit: 5, minScore: 2 }).catch(() => [])
+    const n5 = await newVault.search(dNew, q, { limit: 5, strict: true }).catch(() => [])
+    if (allTied(o5)) tiedOld++
+    if (allTied(n5)) tiedNew++
   }
 } finally { legacyDb.closeAllDb(); newDb.closeAllDb(); fs.rmSync(tmp, { recursive: true, force: true }) }
-console.log(`[recall-parity] (i) 旧 search() vs 新 search()：${qs.length * 2} 组（每条查询 2 组参数），(path,score,顺序) 差异 ${diffsI}；有命中的组 ${nonEmpty}，命中总数 ${hitsTotal}`)
+console.log(`[recall-parity] (i) 旧 search() vs 新 search()：${qs.length} 条查询，新实现丢失旧命中的查询 ${lost}；有命中的查询 ${nonEmpty}，命中总数 ${hitsTotal}`)
+console.log(`[recall-parity] (i) 前 5 条全部同分的查询：旧打分 ${tiedOld}，新打分 ${tiedNew}`)
+if (lost) process.exitCode = 1
 
 // ── (ii) 线上旧 MCP 服务 vs 新服务（HTTP，memory_recall 文本）──
 const newUrl = arg('new-url'), oldUrl = arg('old-url')

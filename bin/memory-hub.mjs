@@ -9,6 +9,7 @@
 //   memory-hub migrate verify --source <旧库/快照> --target <新库> [--allow-target-extra] [--json]    对账（PLAN 6.3.2），FAIL 退出码 1
 //   memory-hub migrate reverse --from <新库> --target <旧库> [--execute] [--prune-purged] [--export f.json]   反向增量（默认 dry-run）
 //   memory-hub backup now
+//   memory-hub summaries backfill [--force]  按当前规则重算所有卡的 summary（幂等；服务启动时也会自动跑一次）
 //   memory-hub admin set-password            设置/更换管理界面口令：从 stdin 读取（终端里交互输入不回显；管道则读第一行），绝不经命令行参数、不打印
 
 import { loadConfig, validateBind, ConfigError } from '../src/config.js'
@@ -74,6 +75,7 @@ function usage() {
   memory-hub migrate verify --source <旧库或快照(目录或.db)> --target <新库> [--allow-target-extra] [--json]
   memory-hub migrate reverse --from <新库> --target <旧库> [--execute] [--prune-purged] [--export <文件.json>]
   memory-hub backup now
+  memory-hub summaries backfill [--force]
   memory-hub admin set-password          （口令从 stdin 读取；终端交互输入两次，不回显）
 环境变量：MEMORY_HUB_HOME MEMORY_HUB_DB MEMORY_HUB_HOST MEMORY_HUB_PORT MEMORY_HUB_BASE_PATH MEMORY_HUB_ALLOW_REMOTE
   MEMORY_HUB_ALLOWED_ORIGINS MEMORY_HUB_ALLOWED_HOSTS MEMORY_HUB_TRUST_PROXY MEMORY_HUB_MCP_EXPOSE_TIDY_APPLY MEMORY_HUB_AGENT
@@ -173,6 +175,14 @@ async function main() {
       return r.ok ? 0 : 1
     }
     usage(); return 1
+  }
+
+  if (cmd === 'summaries' && sub === 'backfill') {
+    const { backfillSummaries } = await import('../src/core/vault.js')
+    const r = backfillSummaries(config.dbRoot, { force: flag('force') })
+    log.info('summary 回填', r)
+    process.stdout.write(r.skipped ? 'summary 已是最新规则，无需回填（--force 可强制重算）。\n' : `已扫描 ${r.scanned} 张卡，更新 ${r.updated} 张的 summary。\n`)
+    return 0
   }
 
   if (cmd === 'backup' && sub === 'now') {

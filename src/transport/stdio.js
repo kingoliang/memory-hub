@@ -6,6 +6,7 @@ import { serveStdio } from '@modelcontextprotocol/server/stdio'
 import { buildMcpServer, llmFromConfig } from './mcp-server.js'
 import { getDb } from '../core/db.js'
 import { validateName } from '../auth/tokens.js'
+import { runSummaryBackfill } from '../server.js'
 
 /**
  * @param {object} config loadConfig 的结果
@@ -13,6 +14,7 @@ import { validateName } from '../auth/tokens.js'
  */
 export function runStdio(config, { log, env = process.env }) {
   getDb(config.dbRoot) // 提前打开/迁移，失败就在启动时报
+  runSummaryBackfill(config.dbRoot, log)
   const agent = String(env.MEMORY_HUB_AGENT || '').trim()
   if (agent) validateName(agent) // 非法名字直接抛，避免写进 submitted_by
   const scopes = ['read', 'write', ...(config.exposeTidyApply ? ['tidy:apply'] : [])]

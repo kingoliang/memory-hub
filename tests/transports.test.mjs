@@ -51,6 +51,9 @@ test('stdio 与 HTTP 下 recall / stats / audit_list 输出逐字一致，且格
         ['memory_recall', { query: '缓存', limit: 1 }],
         ['memory_recall', { query: '完全不存在的词xyz' }],
         ['memory_recall', { query: '   ' }],
+        ['memory_recall', { query: '数据库选型', detail: 'full' }],
+        ['memory_read', { paths: ['03-Knowledge/数据库选型决策.md', '03-Knowledge/待审的卡.md', 'x/none.md'] }],
+        ['memory_read', { paths: ['03-Knowledge/数据库选型决策.md'], offset: 5, maxChars: 200 }],
         ['memory_stats', {}],
         ['memory_audit_list', {}],
         ['memory_audit_list', { status: 'all', limit: 1 }],
@@ -63,7 +66,8 @@ test('stdio 与 HTTP 下 recall / stats / audit_list 输出逐字一致，且格
       }
       // 与原版 mcp.js 的输出格式一致（见 memory-eternal-fork/lib/mcp.js callTool）
       const recall = text(await stdio.callTool({ name: 'memory_recall', arguments: { query: '数据库选型' } }))
-      assert.match(recall, /^从记忆核心检索到 1 条相关卡片：\n\n### 1\. 数据库选型决策\n路径：03-Knowledge\/数据库选型决策\.md\n/)
+      assert.match(recall, /^从记忆核心检索到 1 条相关卡片（共命中 1 张）：\n\n### 1\. 数据库选型决策\n路径：03-Knowledge\/数据库选型决策\.md\n更新：\d{4}-\d\d-\d\d · 全文 \d+ 字\n片段：.*SQLite/)
+      assert.match(recall, /memory_read/)
       assert.equal(text(await stdio.callTool({ name: 'memory_recall', arguments: { query: '完全不存在的词xyz' } })), '记忆库中没有与「完全不存在的词xyz」相关的内容。')
       assert.equal(text(await stdio.callTool({ name: 'memory_recall', arguments: { query: '  ' } })), '（未提供检索词）')
       const stats = JSON.parse(text(await stdio.callTool({ name: 'memory_stats', arguments: {} })))

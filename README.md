@@ -108,7 +108,8 @@ stdio（本机单 Agent，身份取环境变量 `MEMORY_HUB_AGENT`，不经网�
 
 | 工具 | 所需 scope | 说明 |
 |---|---|---|
-| `memory_recall` | `read` | 按关键词检索相关知识卡，返回标题 / 路径 / 摘要 |
+| `memory_recall` | `read` | 按关键词检索相关知识卡（BM25 相关度排序），返回标题 / 路径 / 命中词附近的片段与总命中数；`detail: "full"` 在字数预算内直接附全文 |
+| `memory_read` | `read` | 按路径读整张卡：正文 + 标签 + 更新时间 + 追加的更新记录；可一次读多张，超长卡用 `offset` / `maxChars` 分段；只读已批准卡 |
 | `memory_capture` | `write` | 沉淀一条自包含知识（一次一个主题，上限 64K 字符） |
 | `memory_stats` | `read` | 库概览：总数、分类分布、近期新增 |
 | `memory_audit_list` | `read` | 列出待审 / 已驳回卡片（只读，不改变状态） |
@@ -117,9 +118,11 @@ stdio（本机单 Agent，身份取环境变量 `MEMORY_HUB_AGENT`，不经网�
 | `memory_lint` | `read` | 结构 / 标签 / 疑似密钥检查 |
 | `memory_tag_normalize` | `tidy:apply` | 标签归一（同上，默认隐藏） |
 
-服务还会在 `initialize` / `server/discover` 返回一段 instructions，告诉模型何时 recall、何时 capture、不要存密钥。可用配置文件的 `instructions` 字段覆盖。
+服务还会在 `initialize` / `server/discover` 返回一段 instructions，告诉模型何时 recall、recall 之后用 memory_read 读全文、何时 capture、不要存密钥。可用配置文件的 `instructions` 字段覆盖。
 
-工具名、参数与输出格式与上游 v0.10.8 基线一致，便于平滑迁移。
+原有工具的名字与参数与上游 v0.10.8 基线兼容（只增不减）；`memory_recall` 的输出在原格式上增加了总命中数、片段与 memory_read 提示。
+
+检索打分是 BM25 风格（词频饱和 + IDF + 长度归一 + 标题/标签加权 + 查询词覆盖率），中文按整词 + 字符 bigram 匹配，不依赖分词库；每个库有一份按卡片变更自动失效的内存索引。summary 规则升级后服务启动时会自动回填，也可手动运行 `memory-hub summaries backfill`。
 
 ## HTTP 接口
 

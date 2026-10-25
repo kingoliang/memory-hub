@@ -5,6 +5,11 @@
 
 import { getDb, enforceAudit, nextCardId, MAIN_STATUS, QUARANTINE_STATUSES, tableForStatus } from './db.js'
 import { minhashSignature, lshCandidates } from './minhash.js'
+import { makeSummary, snippetAround, SUMMARY_VERSION } from './text.js'
+import { mainIndex, scoreCorpus } from './search-index.js'
+
+export { makeSummary, stripMarkdown, snippetAround } from './text.js'
+export { invalidateIndex } from './search-index.js'
 
 /** 主题目录根。 */
 export const KIND_ROOTS = {
@@ -48,7 +53,7 @@ export function parseCard(text) {
     const h = /^#\s+(.+)$/m.exec(body)
     meta.title = h ? h[1].trim() : body.trim().split(/\r?\n/)[0].slice(0, 60)
   }
-  const summary = body.trim().slice(0, 200)
+  const summary = makeSummary(body, meta.title)
   return { meta, body: body.trim(), summary }
 }
 
@@ -623,7 +628,7 @@ export async function writeCard(root, { kind, title, tags = [], body, source = '
     }
 
     const now = new Date().toISOString()
-    const summary = body.trim().slice(0, 200)
+    const summary = makeSummary(body, title)
     const id = nextCardId(db) // 跨两张表唯一的 id，由 card_sequence 单一发号器分配
     if (targetTable === 'cards') {
       db.prepare(`
@@ -777,7 +782,7 @@ export async function mergeIntoCard(root, rel, text, { max = 15, sectionCap = 60
 }
 
 function mergeIntoCardTx(db, rel, text, { max, sectionCap }) {
-  const row = db.prepare('SELECT id, body FROM cards WHERE path = ?').get(rel)
+  const row = db.prepare('SELECT id, title, body FROM cards WHERE path = ?').get(rel)
   if (!row) throw new Error('卡片不在主库: ' + rel)
   const now = new Date().toISOString()
   const sectionIdx = row.body.indexOf(MERGE_SECTION_TITLE)
@@ -789,7 +794,7 @@ function mergeIntoCardTx(db, rel, text, { max, sectionCap }) {
     return { ok: true, path: rel, merged: 0, updated: now, capped: room === 0 }
   }
   const body = withMergeSection(row.body, lines).trim()
-  db.prepare('UPDATE cards SET body = ?, summary = ?, updated_at = ? WHERE id = ?').run(body, body.slice(0, 200), now, row.id)
+  db.prepare('UPDATE cards SET body = ?, summary = ?, updated_at = ? WHERE id = ?').run(body, makeSummary(body, row.title), now, row.id)
   return { ok: true, path: rel, merged: lines.length, updated: now }
 }
 
@@ -822,47 +827,128 @@ export async function mergeCards(root, paths) {
   return { ok: true, path: r.path, merged: rows.length }
 }
 
-/** 检索：整词/中文 bigram 命中。 */
-export async function search(root, query, { limit = 30, minScore = 0, semantic = false } = {}) {
-  const q = String(query || '').trim()
-  if (!q) return []
-  const db = getDb(root)
-  // 两套存储后这里**不再需要状态条件**：主库物理上只含 approved。
-  const rows = db.prepare('SELECT * FROM cards ORDER BY updated_at DESC').all()
-  const wanted = queryTerms(q)
-  const out = []
-  for (const row of rows) {
-    const card = rowToCard(row)
-    const haystack = `${card.path}\n${card.title}\n${row.body}`.toLowerCase()
-    let score = 0
-    if (haystack.includes(q.toLowerCase())) score = 3
-    for (const term of wanted) {
-      if (haystack.includes(term.toLowerCase())) score += 1
-    }
-    if (semantic) score += Math.round(textSimilarity(q, `${card.title} ${card.summary}`) * 6)
-    if (score > 0 && score >= minScore) {
-      out.push({ ...card, score, excerpt: row.body.trim().slice(0, 300) })
-    }
-  }
-
-  // 反馈反哺排序
+/** 反馈 → 每个 path 的乘子（有用 +25%/次、无关 -25%/次，下限 0.25）。查询与反馈词有重叠才计。 */
+async function feedbackBoosts(root, q, wanted) {
   const fb = await readFeedback(root)
   const ql = q.toLowerCase()
-  const fbByPath = {}
+  const byPath = new Map()
   for (const f of fb) {
     if (!f.path) continue
     const fq = String(f.query || '').toLowerCase()
     const overlap = fq && (fq === ql || ql.includes(fq) || fq.includes(ql) || [...queryTerms(f.query)].some((term) => wanted.has(term)))
     if (!overlap) continue
-    const rec = fbByPath[f.path] = fbByPath[f.path] || { useful: 0, irr: 0 }
-    if (f.useful) rec.useful += 1; else rec.irr += 1
+    byPath.set(f.path, (byPath.get(f.path) || 0) + (f.useful ? 1 : -1))
   }
-  for (const hit of out) {
-    const rec = fbByPath[hit.path]
-    if (rec) hit.score += rec.useful * 2 - rec.irr * 2
+  return byPath
+}
+
+/** 片段用的检索词顺序：整句 > 稀有词（文档频率低）> 常见词。 */
+function snippetTerms(q, matched, df) {
+  const ql = q.toLowerCase()
+  return [ql, ...[...matched].filter((t) => t !== ql).sort((a, b) => (df(a) - df(b)) || (b.length - a.length))]
+}
+
+/**
+ * 检索主库（BM25 风格，见 search-index.js）。返回 { total, hits }：total = 命中总数（limit 之前）。
+ * 每个 hit = 卡片摘要字段 + score + snippet（命中词附近、已剥离 Markdown）+ excerpt（同规则、更长）+ bodyChars。
+ *
+ * @param opts.strict   召回模式：要求覆盖足够多的查询词（memory_recall / 蜘蛛搜索用）
+ * @param opts.minScore 分数下限（新分数刻度）
+ * @param opts.semantic 额外加上标题 + 摘要与查询的 bigram 相似度
+ */
+export async function searchCards(root, query, { limit = 30, minScore = 0, semantic = false, strict = false, snippetChars = 160, excerptChars = 300 } = {}) {
+  const q = String(query || '').trim()
+  if (!q) return { total: 0, hits: [] }
+  const { corpus, rows } = mainIndex(root)
+  const wanted = queryTerms(q)
+  const fb = await feedbackBoosts(root, q, wanted)
+  const boost = fb.size ? (i) => { const n = fb.get(rows[i].path) || 0; return n ? Math.max(0.25, 1 + 0.25 * n) : 1 } : null
+  let scored = scoreCorpus(corpus, q, { strict, boost })
+  if (semantic) {
+    for (const s of scored) s.score = Math.round((s.score + textSimilarity(q, `${rows[s.i].title} ${rows[s.i].summary}`) * 2) * 1000) / 1000
+    scored.sort((a, b) => b.score - a.score)
   }
-  out.sort((a, b) => b.score - a.score || b.mtime - a.mtime)
-  return out.slice(0, limit)
+  if (minScore > 0) scored = scored.filter((s) => s.score >= minScore)
+  // 同分：更新时间新的在前（rows 已按 updated_at 倒序，比较下标即可），再按 path 稳定
+  scored.sort((a, b) => b.score - a.score || a.i - b.i)
+  const total = scored.length
+  const top = scored.slice(0, Math.max(0, limit))
+  if (!top.length) return { total, hits: [] }
+  const db = getDb(root)
+  const paths = top.map((s) => rows[s.i].path)
+  const bodies = new Map(db.prepare(`SELECT path, body FROM cards WHERE path IN (${paths.map(() => '?').join(',')})`).all(...paths).map((r) => [r.path, r.body]))
+  const dfCache = new Map()
+  const df = (t) => { if (!dfCache.has(t)) dfCache.set(t, corpus.postings.get(t)?.length ?? 0); return dfCache.get(t) }
+  const hits = top.map((s) => {
+    const row = rows[s.i]
+    const body = bodies.get(row.path) ?? ''
+    const terms = snippetTerms(q, s.matched, df)
+    return {
+      ...rowToCard(row),
+      score: s.score,
+      snippet: snippetAround(body, terms, { max: snippetChars, title: row.title }),
+      excerpt: snippetAround(body, terms, { max: excerptChars, title: row.title }),
+      bodyChars: row.bodyChars,
+    }
+  })
+  return { total, hits }
+}
+
+/** 检索（兼容接口）：只返回 hits 数组。 */
+export async function search(root, query, opts = {}) {
+  return (await searchCards(root, query, opts)).hits
+}
+
+/** 给管理界面用：对任意行集合按同一套 BM25 打分（rows 需含 path/title/tags/body；approved 行直接复用主库索引统计）。 */
+export { scoreCorpus, docsFromRows } from './search-index.js'
+
+export const MEMORY_READ_MAX_CHARS = 20000
+
+/**
+ * Agent 读整张卡（memory_read 用）：**只读主库**（approved）。
+ * 返回 { path, title, kind, tags, created, updated, body, updates:[{at, content}], totalChars }，不在主库 → 抛 CARD_NOT_FOUND / CARD_NOT_APPROVED（不泄露隔离区正文）。
+ */
+export function readApprovedCard(root, rel) {
+  const db = getDb(root)
+  const row = db.prepare('SELECT * FROM cards WHERE path = ?').get(rel)
+  if (!row) {
+    const inQ = db.prepare('SELECT 1 FROM quarantine WHERE path = ?').get(rel)
+    const err = new Error(inQ ? `卡片未通过审核或已删除，不能读取：${rel}` : `卡片不存在：${rel}`)
+    err.code = inQ ? 'CARD_NOT_APPROVED' : 'CARD_NOT_FOUND'
+    throw err
+  }
+  const updates = db.prepare('SELECT content, created_at FROM card_updates WHERE card_id = ? ORDER BY created_at ASC').all(row.id)
+    .map((u) => ({ at: u.created_at, content: u.content }))
+  return {
+    path: row.path, title: row.title, kind: row.kind, tags: JSON.parse(row.tags || '[]'),
+    created: row.created_at, updated: row.updated_at, body: String(row.body || ''), updates,
+  }
+}
+
+/**
+ * 回填 summary（幂等）：把主库与隔离区里 summary 与当前规则不一致的卡重算一遍。
+ * 只改 summary 列，不动 updated_at / 正文。config 里记 summaryVersion，版本一致时直接跳过（启动时零成本）。
+ * @returns {{ updated:number, scanned:number, skipped:boolean }}
+ */
+export function backfillSummaries(root, { force = false } = {}) {
+  const db = getDb(root)
+  const key = 'summaryVersion'
+  const cur = db.prepare('SELECT value FROM config WHERE key = ?').get(key)?.value
+  if (!force && String(cur) === String(SUMMARY_VERSION)) return { updated: 0, scanned: 0, skipped: true }
+  let updated = 0
+  let scanned = 0
+  inTransaction(db, () => {
+    for (const table of ['cards', 'quarantine']) {
+      const up = db.prepare(`UPDATE ${table} SET summary = ? WHERE id = ?`)
+      for (const r of db.prepare(`SELECT id, title, body, summary FROM ${table}`).all()) {
+        scanned++
+        const s = makeSummary(r.body, r.title)
+        if (s !== (r.summary || '')) { up.run(s, r.id); updated++ }
+      }
+    }
+    db.prepare("INSERT INTO config (key, value, updated_at) VALUES (?, ?, datetime('now')) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at").run(key, String(SUMMARY_VERSION))
+  })
+  return { updated, scanned, skipped: false }
 }
 
 /** 用量趋势：最近 N 天每天新增卡片数。 */
