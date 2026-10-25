@@ -33,7 +33,7 @@
 | `min_weight` | 1–20，默认 1 |
 | `focus` | 卡片 **path**（本管理 API 以 path 为键，不暴露数字 id）；返回焦点 + `depth`（1–3，默认 1）跳邻域；不在图中（不存在/已删/隔离）→ 404 |
 | `hide_isolated` | `1` 去掉无边节点 |
-| `limit` | 不带 = 自动上限（= 最大上限 2000，即默认显示全部节点）；显式 1–2000（超出钳到 2000）；超限按加权度数（边权和）降序截断（焦点必留），`truncated:true`，此时 `stats.limitAuto:true` |
+| `limit` | 不带 = 自动上限（= 最大上限 2000，即默认显示全部节点）；显式 1–2000（超出钳到 2000）；超限按加权度数（边权和）降序截断（焦点必留），`truncated:true`。`stats.limitAuto` = 是否未带 `limit`（走自动上限），前端据此区分“超自动上限”与“手动压小上限”两种提示 |
 | `status` | 仅接受 `approved`（图只含主库），其它值 400 |
 
 处理顺序：kind/tag 选点 → types/min_weight 选边 → focus 邻域 → hide_isolated → limit 截断。
