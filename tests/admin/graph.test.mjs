@@ -2,6 +2,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { withAdminHub, FAKE_SK } from './admin-helpers.mjs'
+import { GRAPH_AUTO_LIMIT, GRAPH_MAX_LIMIT } from '../../src/admin/graph.js'
 import { writeCard, deleteCard } from '../../src/core/vault.js'
 import { getDb } from '../../src/core/db.js'
 
@@ -115,7 +116,62 @@ test('limit / truncated：按加权度数保留，边只留两端都在的；超
     assert.ok(r.json.edges.every((e) => ids.has(e.source) && ids.has(e.target)))
     const full = await c.get(G)
     assert.equal(full.json.truncated, false)
-    assert.equal((await c.get(`${G}?limit=999999`)).json.stats.limit, 2000)
+    assert.equal((await c.get(`${G}?limit=999999`)).json.stats.limit, 5000)
+    // 带 limit 仍然按 limit 截断（含远低于总卡数的值）
+    const small = await c.get(`${G}?limit=3`)
+    assert.equal(small.json.nodes.length, 3)
+    assert.equal(small.json.truncated, true)
+    assert.equal(small.json.stats.limit, 3)
+  })
+})
+
+test('自动上限：不带 limit 时用 GRAPH_AUTO_LIMIT（=5000），不截断且 stats.limitAuto=true', async () => {
+  assert.equal(GRAPH_MAX_LIMIT, 5000)
+  await withAdminHub(async (h) => {
+    const c = await logged(h)
+    const r = await c.get(G)
+    assert.equal(r.status, 200, r.text)
+    assert.equal(r.json.truncated, false)
+    assert.equal(r.json.stats.limitAuto, true)
+    assert.equal(r.json.stats.limit, 5000)
+    assert.equal(r.json.stats.limit, GRAPH_AUTO_LIMIT)
+    // 空 limit 参数等价于不带
+    const blank = await c.get(`${G}?limit=`)
+    assert.equal(blank.json.stats.limitAuto, true)
+    assert.equal(blank.json.stats.limit, GRAPH_AUTO_LIMIT)
+  })
+})
+
+test('显式 limit：仍然截断且 stats.limitAuto=false；自动上限就是最大上限', async () => {
+  assert.equal(GRAPH_AUTO_LIMIT, GRAPH_MAX_LIMIT)
+  await withAdminHub(async (h) => {
+    const c = await logged(h)
+    const r = await c.get(`${G}?limit=5`)
+    assert.equal(r.json.truncated, true)
+    assert.equal(r.json.stats.limitAuto, false)
+    assert.equal(r.json.stats.limit, 5)
+    assert.equal(r.json.nodes.length, 5)
+    const max = await c.get(`${G}?limit=${GRAPH_MAX_LIMIT}`)
+    assert.equal(max.json.truncated, false)
+    assert.equal(max.json.stats.limitAuto, false)
+  })
+})
+
+test('kinds：多值并集；与 kind 同时给也取并集；超过 7 个 400', async () => {
+  await withAdminHub(async (h) => {
+    const c = await logged(h)
+    const r = await c.get(`${G}?kinds=mistake,tool`)
+    assert.equal(r.status, 200, r.text)
+    assert.deepEqual([...new Set(r.json.nodes.map((n) => n.kind))].sort(), ['mistake', 'tool'])
+    const one = await c.get(`${G}?kinds=mistake`)
+    assert.ok(one.json.nodes.length === 3 && one.json.nodes.every((n) => n.kind === 'mistake'))
+    const both = await c.get(`${G}?kind=mistake&kinds=project`)
+    assert.deepEqual([...new Set(both.json.nodes.map((n) => n.kind))].sort(), ['mistake', 'project'])
+    const dup = await c.get(`${G}?kinds=mistake,mistake,,`)
+    assert.ok(dup.json.nodes.length === 3 && dup.json.nodes.every((n) => n.kind === 'mistake'))
+    const withTag = await c.get(`${G}?kinds=mistake,project&tag=alpha`)
+    assert.ok(withTag.json.nodes.every((n) => ['mistake', 'project'].includes(n.kind) && n.tags.includes('alpha')))
+    assert.equal((await c.get(`${G}?kinds=${['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'].join(',')}`)).status, 400)
   })
 })
 
@@ -138,6 +194,38 @@ test('focus：邻域 = 焦点 + depth 跳邻居；未知/隔离/已删 → 404',
     assert.equal((await c.get(`${G}?focus=${encodeURIComponent('nope/none.md')}`)).status, 404)
     const q = getDb(h.home).prepare('SELECT path FROM quarantine LIMIT 1').get().path
     assert.equal((await c.get(`${G}?focus=${encodeURIComponent(q)}`)).status, 404)
+  })
+})
+
+test('标签边：每卡最多 6 条、边权 = 真实共享标签数、同一对卡只留最大权重', async () => {
+  await withAdminHub(async (h) => {
+    const hubTags = Array.from({ length: 8 }, (_, i) => `t${i + 1}`)
+    const hub = await writeCard(h.home, { kind: 'knowledge', title: '标签枢纽卡', tags: hubTags, body: '枢纽卡正文 abc。', status: 'approved' }, { dedup: false })
+    assert.ok(hub.ok)
+    const partners = []
+    for (let i = 1; i <= 8; i++) {
+      // 第 i 个伙伴与枢纽共享 i 个标签（i 越大权重越高）
+      const r = await writeCard(h.home, { kind: 'knowledge', title: `标签伙伴 ${i}`, tags: ['common', ...hubTags.slice(0, i)], body: `伙伴卡正文 ${i} xyz。`, status: 'approved' }, { dedup: false })
+      assert.ok(r.ok)
+      partners.push(r.path)
+    }
+    const c = await logged(h)
+    const full = (await c.get(G)).json
+    const tagsOf = new Map(full.nodes.map((n) => [n.id, new Set(n.tags)]))
+    const mine = full.edges.filter((e) => e.type === 'tag' && (e.source === hub.path || e.target === hub.path))
+    assert.equal(mine.length, 6, '每卡最多 6 条 tag 边')
+    const weights = mine.map((e) => e.weight).sort((a, b) => b - a)
+    assert.deepEqual(weights, [8, 7, 6, 5, 4, 3], '边权 = 真实共享标签数（common + 交集）')
+    const pairKeys = new Set()
+    for (const e of full.edges.filter((e) => e.type === 'tag')) {
+      const k = [e.source, e.target].sort().join('\u0000')
+      assert.ok(!pairKeys.has(k), '同一对卡不应出现两条 tag 边')
+      pairKeys.add(k)
+      assert.equal(e.tags.length, Math.min(e.weight, 5), '附带的共享标签 ≤5')
+      for (const t of e.tags) assert.ok(tagsOf.get(e.source).has(t) && tagsOf.get(e.target).has(t), '附带标签必须是两卡真正共享的')
+    }
+    // 8 个伙伴各自都只有 common + t 前缀，阈值是 3 的那张伙伴也应通过自己的 Top-6 拿到边
+    assert.ok(partners.some((p) => mine.some((e) => e.source === p || e.target === p)))
   })
 })
 

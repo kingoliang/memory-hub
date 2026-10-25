@@ -175,18 +175,23 @@ export function createAdminHandler({ config, log, llm = null }) {
       enumParam(u, 'status', ['approved'], 'approved') // 图只含主库（approved）卡；隔离区/回收站不入图
       const types = strParam(u, 'types', 100).split(',').map((t) => t.trim()).filter(Boolean)
       for (const t of types) if (!G.EDGE_TYPES.includes(t)) throw new HttpError(400, 'bad_request', `types 只能是：${G.EDGE_TYPES.join(' / ')}`)
+      // kinds：逗号分隔，最多 7 个（= 全部 kind）；与 kind 同时存在时取并集
+      const kinds = [...new Set(strParam(u, 'kinds', 500).split(',').map((t) => t.trim()).filter(Boolean))]
+      if (kinds.length > 7) throw new HttpError(400, 'bad_request', 'kinds 最多 7 个')
       const hi = P(u).get('hide_isolated')
       if (hi !== null && !['', '0', '1'].includes(hi)) throw new HttpError(400, 'bad_request', 'hide_isolated 只能是 0 或 1')
       try {
         return G.graphQuery(root, {
           kind: strParam(u, 'kind', 50),
+          kinds,
           tags: strParam(u, 'tag', 500).split(',').map((t) => t.trim()).filter(Boolean),
           types,
           minWeight: intParam(u, 'min_weight', { def: 1, min: 1, max: 20 }),
           focus: strParam(u, 'focus', 500),
           depth: intParam(u, 'depth', { def: 1, min: 1, max: 3 }),
           hideIsolated: hi === '1',
-          limit: intParam(u, 'limit', { def: G.GRAPH_DEFAULT_LIMIT, min: 1, max: G.GRAPH_MAX_LIMIT, clamp: true }),
+          // 不带 limit = 自动上限（全部节点，除非超过 GRAPH_AUTO_LIMIT）；显式 limit 1~GRAPH_MAX_LIMIT，超出钳到上限
+          limit: intParam(u, 'limit', { min: 1, max: G.GRAPH_MAX_LIMIT, clamp: true }),
         })
       } catch (e) {
         if (e instanceof G.GraphNotFound) throw new HttpError(404, 'not_found', e.message)

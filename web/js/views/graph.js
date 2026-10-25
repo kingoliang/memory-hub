@@ -17,8 +17,10 @@ import {
   createLayout, LAYOUT_DONE, fitView, screenToWorld, zoomAt, hitTest, topLabelIds, clampZoom, filterGraph,
 } from '../graph-core.js'
 
-const LIMITS = [200, 500, 800, 1500, 2000]
-const DEFAULT_LIMIT = 800
+const LIMITS = ['auto', 200, 500, 800, 1500, 2000, 3000, 5000]
+const DEFAULT_LIMIT = 'auto'
+/** 规范化 limit：URL 里只认 'auto' 或 LIMITS 里的数字，其余回落到自动（= 不带参数）。 */
+const normLimit = (raw) => { const n = Number(raw); return LIMITS.includes(n) ? n : DEFAULT_LIMIT }
 const KIND_ORDER = ['project', 'knowledge', 'content', 'prompt', 'business', 'tool', 'mistake']
 /** 簇主题色（霓虹：青 / 紫 / 黄 / 品红 / 橙 / 薄荷 / 红）。画布恒为深色，与全站主题无关。 */
 const NEON = { project: '#2ee6ff', knowledge: '#b47bff', content: '#ffd23f', prompt: '#ff4fd8', business: '#ff8a2b', tool: '#3dffb0', mistake: '#ff4d5e', other: '#8b93a7' }
@@ -166,16 +168,21 @@ function recomputeClusters(L) {
 export default async function render(ctx) {
   const p = ctx.params
   const focus = p.get('focus') || ''
-  const limit = LIMITS.includes(Number(p.get('limit'))) ? Number(p.get('limit')) : DEFAULT_LIMIT
+  const limit = normLimit(p.get('limit'))
   const st = { tag: p.get('tag') || '', kind: p.get('kind') || '', minWeight: 1, hideIsolated: false, types: new Set(['link', 'tag', 'similar']), kinds: null, search: '' }
+  if (st.kind) st.kinds = new Set([st.kind])
   let data
   try {
-    data = await get('graph', { focus, limit, depth: focus ? 2 : undefined })
+    data = await get('graph', { focus, kinds: st.kind || undefined, tag: st.tag || undefined, limit: limit === DEFAULT_LIMIT ? undefined : limit, depth: focus ? 2 : undefined })
   } catch (e) {
     if (e.status === 404 && focus) { ctx.go('#/graph'); return h('div') }
     throw e
   }
   ctx.setTitle('知识图谱')
+  // 截断状态下隐藏的卡得靠服务器重新取；一旦发生过一次服务器过滤，本页后续过滤都走服务器（否则清空条件会只剩子集）
+  let serverMode = !!data.truncated
+  let fetchSeq = 0
+  let fetchTimer = 0
   const nav = (patch) => {
     const q = new URLSearchParams()
     const next = { focus, limit: limit === DEFAULT_LIMIT ? '' : limit, ...patch }
@@ -258,7 +265,8 @@ export default async function render(ctx) {
   // ---------- 过滤 / 重建布局 ----------
   function rebuild({ keepPositions = true, refit = false } = {}) {
     const prev = keepPositions && L ? new Map(L.nodes.map((n) => [n.id, { x: n.x, y: n.y }])) : null
-    shown = filterGraph(data, { kinds: st.kinds, tag: st.tag, minWeight: st.minWeight, types: st.types, hideIsolated: st.hideIsolated })
+    // 服务器模式：选点 / 选边 / 去孤立点已由服务器做过，这里只按返回结果重建布局（再筛一遍会把它又筛没）
+    shown = filterGraph(data, serverMode ? {} : { kinds: st.kinds, tag: st.tag, minWeight: st.minWeight, types: st.types, hideIsolated: st.hideIsolated })
     adj = adjacency(shown.edges)
     maxDeg = Math.max(1, ...shown.nodes.map((n) => n.degree))
     const sorted = shown.nodes.map((n) => n.degree).sort((a, b) => b - a)
@@ -300,6 +308,42 @@ export default async function render(ctx) {
   function updateMatches() {
     matches = searchMatches(shown.nodes, st.search, kindLabel)
     dirty = true
+  }
+
+  // ---------- 服务器端过滤（仅截断时） ----------
+  const filterParams = () => {
+    const params = { focus: focus || undefined, limit: limit === DEFAULT_LIMIT ? undefined : limit, depth: focus ? 2 : undefined }
+    if (st.tag) params.tag = st.tag
+    if (st.kinds) params.kinds = [...st.kinds].join(',')
+    params.types = [...st.types].join(',')
+    params.min_weight = st.minWeight
+    params.hide_isolated = st.hideIsolated ? 1 : 0
+    return params
+  }
+  /** 让服务器按当前条件重新取图：被 limit 截断藏掉的卡也能被标签 / 类型筛回来。过期响应按递增序号丢弃。 */
+  async function fetchFilters() {
+    const my = ++fetchSeq
+    let next
+    try { next = await get('graph', filterParams()) } catch (e) {
+      if (my !== fetchSeq) return
+      if (e.status === 404 && focus) { ctx.go('#/graph'); return }
+      return
+    }
+    if (my !== fetchSeq) return
+    data = next
+    for (const k of Object.keys(data.stats.byKind)) kindUniverse.add(k)
+    if (data.truncated) serverMode = true
+    cutNotice()
+    drawLegend()
+    fillTagOpts()
+    rebuild()
+  }
+  /** 过滤条件变化：服务器模式走服务器（输入类加 150ms 防抖），否则本地过滤快路径（不联网）。 */
+  function applyFilters({ debounce = false } = {}) {
+    if (!serverMode) { rebuild(); return }
+    clearTimeout(fetchTimer)
+    if (debounce) fetchTimer = setTimeout(fetchFilters, 150)
+    else fetchFilters()
   }
 
   // ---------- 相机 ----------
@@ -874,7 +918,10 @@ export default async function render(ctx) {
 
   // ---------- 工具栏 ----------
   // 主行：搜索 / 标签 / 节点上限 / 视图选项（折叠）。缩放等画布操作浮在画布右上角。
-  const kindsPresent = KIND_ORDER.filter((k) => data.stats.byKind[k]).concat(Object.keys(data.stats.byKind).filter((k) => !KIND_ORDER.includes(k)))
+  // 图例的类型全集：初次加载 / 每次服务器过滤时只见已知类型，所以只增不减（取消勾选后还能点回来）
+  const kindUniverse = new Set(Object.keys(data.stats.byKind))
+  if (serverMode) for (const k of KIND_ORDER) kindUniverse.add(k)
+  const legendKinds = () => KIND_ORDER.filter((k) => kindUniverse.has(k)).concat([...kindUniverse].filter((k) => !KIND_ORDER.includes(k)))
   const search = h('input', { id: 'graph-search-input', type: 'search', placeholder: '搜索标题 / 标签 / 类型；回车 = 蜘蛛搜索', 'aria-label': '搜索节点（输入即过滤高亮；回车或点「蜘蛛搜索」让蜘蛛按内容检索并 AI 汇总）', autocomplete: 'off',
     on: {
       input: (e) => { st.search = e.target.value; updateMatches(); if (matches?.size === 1) { const id = [...matches][0]; centerOn(id) } kick() },
@@ -887,24 +934,31 @@ export default async function render(ctx) {
     dirty = true; kick()
   }
   const spiderBtn = h('button', { type: 'button', class: 'graph-spider-btn', title: '让蜘蛛去图谱里找相关卡片（回车），并由 AI 汇总', on: { click: () => runSpider() } }, '蜘蛛搜索')
-  const tagOpts = tagCounts(data.nodes)
-  const tagSel = h('select', { 'aria-label': '按标签过滤', on: { change: (e) => { st.tag = e.target.value; rebuild() } } }, [
-    h('option', { value: '' }, '全部标签'),
-    ...tagOpts.map((t) => h('option', { value: t.tag, selected: t.tag === st.tag }, `${t.tag}（${t.n}）`)),
-  ])
-  if (st.tag && !tagOpts.some((t) => t.tag === st.tag)) tagSel.append(h('option', { value: st.tag, selected: true }, st.tag))
+  const tagSel = h('select', { 'aria-label': '按标签过滤', on: { change: (e) => { st.tag = e.target.value; applyFilters() } } }, [h('option', { value: '' }, '全部标签')])
+  /** 标签下拉选项：截断时从服务器全量标签统计取（被藏掉的标签也能选到），未截断时仍从当前数据取。 */
+  async function fillTagOpts() {
+    let opts = null
+    if (serverMode) {
+      try { opts = (await get('tags', { limit: 500 })).items.map((t) => ({ tag: t.tag, n: t.count })) } catch { /* 退回本地标签 */ }
+    }
+    opts ||= tagCounts(data.nodes)
+    tagSel.textContent = ''
+    tagSel.append(h('option', { value: '' }, '全部标签'))
+    for (const t of opts) tagSel.append(h('option', { value: t.tag, selected: t.tag === st.tag }, `${t.tag}（${t.n}）`))
+    if (st.tag && !opts.some((t) => t.tag === st.tag)) tagSel.append(h('option', { value: st.tag, selected: true }, st.tag))
+  }
   const weightLbl = h('output', { class: 'graph-weight' }, '1')
-  const weight = h('input', { type: 'range', min: '1', max: '4', step: '1', value: '1', 'aria-label': '最小边权重', on: { input: (e) => { st.minWeight = Number(e.target.value); weightLbl.textContent = String(st.minWeight); rebuild() } } })
-  const isoBox = h('input', { type: 'checkbox', 'aria-label': '隐藏孤立点', on: { change: (e) => { st.hideIsolated = e.target.checked; rebuild() } } })
-  const typeBox = (t) => h('label', { class: 'check' }, [h('input', { type: 'checkbox', checked: true, 'aria-label': EDGE_LABEL[t], on: { change: (e) => { if (e.target.checked) st.types.add(t); else st.types.delete(t); rebuild() } } }), h('span', null, EDGE_LABEL[t])])
-  const limitSel = h('select', { 'aria-label': '最多节点数', on: { change: (e) => nav({ limit: Number(e.target.value) === DEFAULT_LIMIT ? '' : e.target.value }) } },
-    LIMITS.map((n) => h('option', { value: String(n), selected: n === limit }, `最多 ${n} 节点`)))
+  const weight = h('input', { type: 'range', min: '1', max: '4', step: '1', value: '1', 'aria-label': '最小边权重', on: { input: (e) => { st.minWeight = Number(e.target.value); weightLbl.textContent = String(st.minWeight); applyFilters({ debounce: true }) } } })
+  const isoBox = h('input', { type: 'checkbox', 'aria-label': '隐藏孤立点', on: { change: (e) => { st.hideIsolated = e.target.checked; applyFilters() } } })
+  const typeBox = (t) => h('label', { class: 'check' }, [h('input', { type: 'checkbox', checked: true, 'aria-label': EDGE_LABEL[t], on: { change: (e) => { if (e.target.checked) st.types.add(t); else st.types.delete(t); applyFilters() } } }), h('span', null, EDGE_LABEL[t])])
+  const limitSel = h('select', { 'aria-label': '最多节点数', on: { change: (e) => nav({ limit: e.target.value === DEFAULT_LIMIT ? '' : e.target.value }) } },
+    LIMITS.map((n) => h('option', { value: String(n), selected: n === limit }, n === DEFAULT_LIMIT ? '全部节点（自动）' : `最多 ${n} 节点`)))
   const zbtn = (label, fn, ic) => h('button', { type: 'button', class: 'graph-zbtn', title: label, 'aria-label': label, on: { click: fn } }, icon(ic))
 
   // 图例：kind 色块，点击切换显示该 kind（再点恢复）
   function drawLegend() {
     legendEl.textContent = ''
-    for (const k of kindsPresent) {
+    for (const k of legendKinds()) {
       const on = !st.kinds || st.kinds.has(k)
       legendEl.append(h('button', { type: 'button', class: 'graph-lg' + (on ? '' : ' off'), 'aria-pressed': on ? 'true' : 'false', title: '点击仅显示/取消该类型',
         on: { click: () => {
@@ -912,8 +966,8 @@ export default async function render(ctx) {
           else if (st.kinds.has(k) && st.kinds.size === 1) st.kinds = null
           else if (st.kinds.has(k)) st.kinds.delete(k)
           else st.kinds.add(k)
-          drawLegend(); rebuild()
-        } } }, [h('i', { class: 'gdot', css: { background: neon(k) } }), `${kindLabel(k)} ${data.stats.byKind[k]}`]))
+          drawLegend(); applyFilters()
+        } } }, [h('i', { class: 'gdot', css: { background: neon(k) } }), `${kindLabel(k)} ${data.stats.byKind[k] || 0}`]))
     }
     legendEl.append(
       h('span', { class: 'graph-lg-sep' }),
@@ -922,7 +976,7 @@ export default async function render(ctx) {
     )
   }
   drawLegend()
-  if (st.kind) st.kinds = new Set([st.kind])
+  fillTagOpts()
 
   const toolbar = h('div', { class: 'graph-toolbar' }, [
     h('div', { class: 'search-box graph-search' }, [h('label', { class: 'sp-label', for: 'graph-search-input' }, '搜索'), icon('search'), search]),
@@ -971,11 +1025,23 @@ export default async function render(ctx) {
     if (shown.nodes.length > top.length) nodeListEl.append(h('p', { class: 'sub' }, `仅列出关联数最高的 ${top.length} 个，共 ${fmtNum(shown.nodes.length)} 个；可用搜索或过滤缩小范围。`))
   }
 
+  // 截断提示降为 info：默认视图（自动上限 + 卡数没超）根本不出提示，只有超上限或用户手动压小上限才出现。
+  // 挂在固定容器上，服务器过滤（count 变了）后可重复调用重刷。
+  const cutEl = h('div', { class: 'graph-cut' })
+  function cutNotice() {
+    cutEl.textContent = ''
+    if (!data.truncated) return
+    cutEl.append(data.stats.limitAuto
+      ? notice('info', `卡片数超过 ${fmtNum(data.stats.limit)}，仅显示关联度最高的 ${fmtNum(data.stats.nodes)} 个`, '可用标签 / 类型 / 最小权重缩小范围，或调低“最多节点数”只看重点。')
+      : notice('info', '已按所选上限显示', `已按所选上限显示关联度最高的 ${fmtNum(data.stats.nodes)} 个（共匹配 ${fmtNum(data.stats.matchedNodes)} 个）。可调高“最多节点数”，或用标签/类型/最小权重缩小范围。`))
+  }
+  cutNotice()
+
   const head = pageHead('06', 'Graph', '知识图谱', `主库 ${fmtNum(data.stats.totalCards)} 张卡 · 边 = [[链接]] / 共享标签 Top-6 / 正文相似（≥0.42）· 只读`, [countEl, focus ? h('button', { type: 'button', class: 'btn btn-sm', on: { click: () => nav({ focus: '' }) } }, '返回全图') : null])
 
   const root = h('div', { class: 'page graph-page' }, [
     head,
-    data.truncated ? notice('warn', '节点过多，已按关联度截断', `匹配 ${fmtNum(data.stats.matchedNodes)} 个节点，仅显示关联度最高的 ${fmtNum(data.stats.nodes)} 个。可调高“最多节点数”，或用标签/类型/最小权重缩小范围。`) : null,
+    cutEl,
     panel(null, [toolbar, legendEl], { cls: 'panel-filters graph-controls' }),
     data.nodes.length === 0 ? empty('主库里还没有卡片', '图谱只展示已批准的卡片；沉淀并批准几张卡后这里会出现关系网络', h('a', { class: 'btn', href: '#/queue' }, '去待审队列'), 'graph') : h('div', { class: 'graph-layout' }, [stage, side]),
     data.nodes.length ? h('details', { class: 'fold graph-fold' }, [h('summary', null, [h('span', { class: 'fold-title' }, '节点列表（键盘 / 读屏替代入口）'), h('span', { class: 'sub' }, '按关联数排序，回车选中并定位')]), h('div', { class: 'fold-body' }, nodeListEl)]) : null,
