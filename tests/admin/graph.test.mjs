@@ -253,6 +253,130 @@ test('边类型：[[wikilink]] 与 正文相似 都能被识别（link 权重 3�
   })
 })
 
+test('聚合视图（mode=clusters）：只出簇节点、簇间边聚合、小簇并入「其他」、不受 limit 截断', async () => {
+  await withAdminHub(async (h) => {
+    const c = await logged(h)
+    const cards = (await c.get(G)).json
+    const r = await c.get(`${G}?mode=clusters`)
+    assert.equal(r.status, 200, r.text)
+    const { nodes, edges, stats, truncated } = r.json
+    assert.equal(stats.mode, 'clusters')
+    assert.equal(stats.clusterBy, 'kind')
+    assert.equal(truncated, false, '聚合视图永不截断')
+    assert.equal(stats.limit, null)
+    assert.equal(stats.limitAuto, true)
+    assert.equal(stats.clusters, nodes.length)
+    assert.ok(stats.aggregateMs >= 0)
+    // 簇数：种子里 project / knowledge / mistake 各 ≥3 张，tool / content 各 1 张 → 并入「其他」
+    assert.deepEqual(nodes.map((n) => n.id).sort(), ['cluster:kind:knowledge', 'cluster:kind:mistake', 'cluster:kind:project', 'cluster:other'])
+    for (const n of nodes) {
+      assert.deepEqual(Object.keys(n).sort(), ['count', 'degree', 'id', 'kind', 'label', 'sampleCards', 'sampleTitles', 'tag', 'type'])
+      assert.equal(n.type, 'cluster')
+      assert.ok(n.count >= 1)
+      assert.ok(n.sampleTitles.length <= 5 && n.sampleTitles.every((t) => typeof t === 'string'))
+      assert.ok(n.sampleCards.length <= 50)
+      assert.ok(n.sampleCards.every((s) => typeof s.id === 'string' && typeof s.title === 'string'))
+      if (n.id !== 'cluster:other') assert.ok(n.count >= 3, '小簇应并入其他')
+    }
+    const other = nodes.find((n) => n.id === 'cluster:other')
+    assert.equal(other.label, '其他')
+    assert.equal(other.count, 2, 'tool 1 张 + content 1 张')
+    // 计数自洽：每张卡恰好归入一个簇
+    assert.equal(nodes.reduce((a, n) => a + n.count, 0), cards.nodes.length)
+    assert.equal(stats.matchedNodes, cards.nodes.length)
+    // 样卡都来自主库，且只带白名单字段
+    const cardIds = new Set(cards.nodes.map((n) => n.id))
+    for (const n of nodes) for (const s of n.sampleCards) { assert.ok(cardIds.has(s.id)); assert.deepEqual(Object.keys(s).sort(), ['id', 'kind', 'title']) }
+    // 聚合边：同一对簇只一条、端点都在节点里、weight = byType 之和、byType 保留三类计数
+    const pairKeys = new Set()
+    for (const e of edges) {
+      const k = [e.source, e.target].sort().join('\u0000')
+      assert.ok(!pairKeys.has(k), '同一对簇只应有一条边')
+      pairKeys.add(k)
+      assert.notEqual(e.source, e.target)
+      assert.deepEqual(Object.keys(e.byType).sort(), ['link', 'similar', 'tag'])
+      assert.equal(e.weight, e.byType.link + e.byType.tag + e.byType.similar)
+      assert.ok(e.weight >= 1)
+      assert.ok(['link', 'tag', 'similar'].includes(e.type))
+    }
+    // degree = 聚合边权重之和
+    const deg = new Map()
+    for (const e of edges) { deg.set(e.source, (deg.get(e.source) || 0) + e.weight); deg.set(e.target, (deg.get(e.target) || 0) + e.weight) }
+    for (const n of nodes) assert.equal(n.degree, deg.get(n.id) || 0)
+    // mode=clusters 时 limit 被忽略；重复请求命中缓存
+    const limited = (await c.get(`${G}?mode=clusters&limit=2`)).json
+    assert.equal(limited.nodes.length, nodes.length)
+    assert.equal(limited.truncated, false)
+    assert.equal((await c.get(`${G}?mode=clusters`)).json.stats.cached, true)
+    // 兼容：不传 mode 仍是卡片视图
+    assert.equal(cards.stats.mode, 'cards')
+  })
+})
+
+test('聚合视图 cluster_by=tag：按每张卡最稀有的标签归簇，无标签/小簇进「其他」', async () => {
+  await withAdminHub(async (h) => {
+    const c = await logged(h)
+    const cards = (await c.get(G)).json
+    const r = await c.get(`${G}?mode=clusters&cluster_by=tag`)
+    assert.equal(r.status, 200, r.text)
+    const { nodes, stats } = r.json
+    assert.equal(stats.clusterBy, 'tag')
+    const tagOf = new Map(cards.nodes.map((n) => [n.id, n.tags]))
+    const df = new Map()
+    for (const t of tagOf.values()) for (const x of t) df.set(x, (df.get(x) || 0) + 1)
+    for (const n of nodes) {
+      if (n.id === 'cluster:other') { assert.equal(n.tag, null); continue }
+      assert.equal(n.id, `cluster:tag:${n.tag}`)
+      for (const s of n.sampleCards) {
+        assert.ok(tagOf.get(s.id).includes(n.tag), '样卡必须带该簇标签')
+        // 归簇用的就是该卡最稀有的标签
+        const rarest = Math.min(...tagOf.get(s.id).map((x) => df.get(x)))
+        assert.equal(df.get(n.tag), rarest)
+      }
+    }
+    assert.ok(nodes.some((n) => n.tag === 'legacy'), 'legacy 有 3 张，应成簇')
+    assert.deepEqual(nodes.filter((n) => n.id === 'cluster:other').length, 1)
+  })
+})
+
+test('聚合视图：过滤参数照常生效（kinds / tag / types / hide_isolated）、focus 只看邻簇', async () => {
+  await withAdminHub(async (h) => {
+    const c = await logged(h)
+    const k = (await c.get(`${G}?mode=clusters&kinds=mistake`)).json
+    assert.deepEqual(k.nodes.map((n) => n.id), ['cluster:kind:mistake'])
+    assert.equal(k.nodes[0].count, 3)
+    const t = (await c.get(`${G}?mode=clusters&tag=alpha`)).json
+    assert.deepEqual(t.nodes.map((n) => n.id), ['cluster:kind:project'])
+    assert.equal(t.nodes[0].count, 12)
+    const ty = (await c.get(`${G}?mode=clusters&types=link`)).json
+    assert.ok(ty.edges.every((e) => e.byType.tag === 0 && e.byType.similar === 0))
+    const hi = (await c.get(`${G}?mode=clusters&hide_isolated=1`)).json
+    assert.ok(hi.nodes.every((n) => n.degree > 0 || n.id === 'cluster:other'), '去孤立点时只保留「其他」')
+    assert.ok(hi.edges.every((e) => hi.nodes.some((n) => n.id === e.source) && hi.nodes.some((n) => n.id === e.target)))
+    // focus：只留焦点簇 + 一跳邻簇，且焦点卡所在簇必在
+    const cards = (await c.get(G)).json
+    const focus = cards.nodes.find((n) => n.degree > 0).id
+    const allClusters = (await c.get(`${G}?mode=clusters`)).json
+    const ownId = allClusters.nodes.find((n) => n.sampleCards.some((s) => s.id === focus) || n.id === `cluster:kind:${cards.nodes.find((x) => x.id === focus).kind}`).id
+    const f = (await c.get(`${G}?mode=clusters&focus=${encodeURIComponent(focus)}`)).json
+    assert.ok(f.nodes.some((n) => n.id === ownId), '焦点所在簇必在')
+    assert.ok(f.nodes.length <= allClusters.nodes.length)
+    assert.equal((await c.get(`${G}?mode=clusters&focus=${encodeURIComponent('nope/none.md')}`)).status, 404)
+  })
+})
+
+test('非法 mode / cluster_by → 400', async () => {
+  await withAdminHub(async (h) => {
+    const c = await logged(h)
+    for (const bad of ['mode=foo', 'cluster_by=foo', 'mode=clusters&cluster_by=foo']) {
+      assert.equal((await c.get(`${G}?${bad}`)).status, 400, bad)
+    }
+    // 空值等同不传（与其它参数一致）
+    assert.equal((await c.get(`${G}?mode=&cluster_by=`)).status, 200)
+    assert.equal((await c.get(`${G}?mode=clusters&cluster_by=kind`)).status, 200)
+  })
+})
+
 test('只读模式（MEMORY_HUB_ADMIN_READONLY=1）下图谱仍可访问', async () => {
   await withAdminHub(async (h) => {
     const c = await logged(h)

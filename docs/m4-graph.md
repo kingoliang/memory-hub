@@ -17,6 +17,8 @@
 | `tag` | 共享标签，每卡按共享数取 Top-6（见下「标签边如何选边」）；附 `tags`（共享标签，≤5） | 共享标签数 |
 | `similar` | 正文前 4000 字 bigram Jaccard ≥ 0.42，每卡至多 1 条，跨 kind 须共享标签；附 `sim` | 2 |
 
+bigram 集合的计算用与 `vault.bigramHashSet` 数值等价（同清洗正则、同 FNV-1a 哈希，逐 gram 结果一致）但不做每 gram 的 `slice` 的实现（`bigramHashesFast`），2 万卡时快一些；语义不变。
+
 与原版差异：标签边 type 统一为 `tag`（共享标签放 `tags` 字段）；wikilink 解析单次命中（原版可能因标题回退多加一条）；相似度只取正文前 4000 字；标题经 `redactSecrets` 遮蔽。
 
 ### 标签边如何选边（稀有标签优先 + 热门标签窗口采样 + 精确复核权重）
@@ -32,7 +34,11 @@
 为什么这么做：原实现每张卡遍历它所有标签的全部同标签卡，热门标签（如 `release`、`batch-0`）下就是 O(n²)——1 万卡冷建图 4.8 秒。现在每卡的候选数被 24 个标签 ×（稀有标签 DF 上限 / 热门标签 64 窗口）钉死，建图变成 O(n·有界)；实测 1 万卡冷建图 5402ms → 562ms（`graphQuery` 全量不截断，脚本 `tests/e2e/graph-perf-edges.mjs`，在基线分支上跑同一脚本取改动前数据）；tag 边 59951 条 vs 改动前 59041 条（101%，验收线 ≥80%），孤立点 0（验收线 ≤5%）。候选累积用 `Int32Array` 权重 + 版本戳 + 复用 `touched`，不建 `Map`、不整体 `sort`。全部预算常量固定、无随机，同一份数据只有增删改卡才会变（指纹缓存同理）。
 
 性能：全量建图结果按"指纹"（卡数/最大 updated_at/Σid/Σ标签长/Σ标题长/Σ正文长/audit_log 与 card_updates 水位）缓存在进程内，指纹变即失效；过滤/limit/focus 都在缓存上做。不落盘。
-规模实测（合成数据、7 种 kind、带标签/正文/wikilink，非生产库，脚本 `tests/e2e/graph-perf-server.mjs` + `graph-perf-api.mjs` + `graph-perf-e2e.mjs`）：1500 卡冷建图 193ms / 命中缓存 20ms；2000 卡冷建图 323ms / 命中缓存 24ms；2000 卡默认视图进入页面 → canvas 首帧 267ms、单帧绘制均值 1.44ms。5000 卡冷建图 339ms / 命中缓存 52–63ms；10000 卡冷建图 579ms / 命中缓存 67–79ms（约 6000 张时默认视图开始出现截断）；5000 卡默认视图进入页面 → canvas 首帧 663ms、单帧绘制均值 3.8ms。因此「自动上限」定在 5000：日常 1475 卡规模默认视图零截断，规模再大的库也能在一秒内出图，超出时截断提示降为 info 级并可用过滤缩小范围。
+规模实测（合成数据、7 种 kind、带标签/正文/wikilink，非生产库，脚本 `tests/e2e/graph-perf-server.mjs` + `graph-perf-api.mjs` + `graph-perf-e2e.mjs`，`MODE=clusters` 打聚合视图；`MH_GRAPH_DEBUG=1` 时 `buildFull` 会打印分阶段耗时）：1500 卡冷建图 193ms / 命中缓存 20ms；2000 卡冷建图 323ms / 命中缓存 24ms；2000 卡默认视图进入页面 → canvas 首帧 267ms、单帧绘制均值 1.44ms。5000 卡冷建图 339ms / 命中缓存 52–63ms；10000 卡冷建图 579ms / 命中缓存 67–79ms（约 6000 张时默认视图开始出现截断）；5000 卡默认视图进入页面 → canvas 首帧 663ms、单帧绘制均值 3.8ms。因此「自动上限」定在 5000：日常 1475 卡规模默认视图零截断，规模再大的库也能在一秒内出图，超出时截断提示降为 info 级并可用过滤缩小范围。
+
+聚合视图（`mode=clusters`）实测（同一套合成脚本，`MODE=clusters`；簇数只为验证上限，不代表真实库形状）：5000 卡 → 7 个簇，API 冷请求 310ms（其中建图 290、聚合 12）、命中缓存 5ms，进入页面 → canvas 首帧 67ms、单帧绘制均值 0.36ms；20000 卡 → 7 个簇、21 条簇间边，API 冷请求 987–1018ms（建图 921–934、**聚合 41–49ms**）、命中缓存 12–15ms，首帧 63–72ms、单帧绘制均值 0.26–0.41ms，默认视图无截断提示（`truncated:false`、簇数 7 ≤ 60）。
+对照：2000 卡的**卡片**视图冷请求 165ms / 命中缓存 22–27ms、首帧 300ms、单帧绘制均值 1.45ms。即聚合视图在 2.5 倍的卡数下仍比 2000 卡的卡片视图快 4 倍以上（首帧）/ 4 倍（单帧）。
+冷请求里的绝大部分是图谱本身的全量建图（与是否聚合无关：20000 卡卡片视图冷请求 1051ms），聚合部分只有 41–49ms；warm 请求把成本压到 12–15ms，所以「默认视图不受规模影响」成立的前提是进程内缓存已建立。20k 冷请求 987ms 仍未达到计划里的 400ms 目标——那是建图成本（SQL 读取 20000 张卡 ≈ 200ms + 标签边 ≈ 250ms + 正文 bigram ≈ 300ms + 链接 ≈ 90ms），要再压需要动 A 的建图路径（分片/延迟建边），超出本任务范围。
 
 ## API
 `GET {base}/admin/api/graph`，只读、需管理员会话（未登录 401；Agent 令牌 401；POST 等 405）。`MEMORY_HUB_ADMIN_READONLY=1` 下可访问。
@@ -46,12 +52,30 @@
 | `min_weight` | 1–20，默认 1 |
 | `focus` | 卡片 **path**（本管理 API 以 path 为键，不暴露数字 id）；返回焦点 + `depth`（1–3，默认 1）跳邻域；不在图中（不存在/已删/隔离）→ 404 |
 | `hide_isolated` | `1` 去掉无边节点 |
+| `mode` | `cards`（默认，逐张画卡）/ `clusters`（聚合视图：只出簇与簇间聚合边）。其它值 400。`clusters` 时 `limit` 被忽略、`truncated` 恒为 false |
+| `cluster_by` | 仅 `mode=clusters` 有意义：`kind`（默认，按类型归簇）/ `tag`（按每张卡**最稀有**的主标签归簇，无标签进「其他」）。其它值 400 |
 | `limit` | 不带 = 自动上限（= 最大上限 5000，即默认显示全部节点）；显式 1–5000（超出钳到 5000）；超限按加权度数（边权和）降序截断（焦点必留），`truncated:true`。`stats.limitAuto` = 是否未带 `limit`（走自动上限），前端据此区分“超自动上限”与“手动压小上限”两种提示 |
 | `status` | 仅接受 `approved`（图只含主库），其它值 400 |
 
 处理顺序：kind/kinds/tag 选点 → types/min_weight 选边 → focus 邻域 → hide_isolated → limit 截断。
 
-响应：`{ nodes:[{id,title,kind,tags,status,createdAt,updatedAt,degree}], edges:[{source,target,type,weight,tags?,sim?}], truncated, stats:{totalCards,matchedNodes,nodes,edges,isolated,byKind,byType,limit,limitAuto,focus,cached,buildMs} }`。`degree` = 返回边里的出现次数。**不含正文/摘要**；点击节点后前端才请求现有 `GET /admin/api/card?path=` 取摘要。
+响应：`{ nodes:[{id,title,kind,tags,status,createdAt,updatedAt,degree}], edges:[{source,target,type,weight,tags?,sim?}], truncated, stats:{totalCards,matchedNodes,nodes,edges,isolated,byKind,byType,limit,limitAuto,focus,cached,buildMs,mode,clusterBy} }`。`degree` = 返回边里的出现次数。**不含正文/摘要**；点击节点后前端才请求现有 `GET /admin/api/card?path=` 取摘要。
+
+`mode=clusters` 的响应换成簇结构：`nodes:[{id:'cluster:kind:project'|'cluster:tag:xxx'|'cluster:other', type:'cluster', kind, tag, label, count, sampleTitles(≤5), sampleCards(≤50 个 {id,title,kind}), degree}]`、`edges:[{source,target,type（主导类型）,weight（聚合的原始边数）,byType:{link,tag,similar}}]`、`truncated:false`、`stats.mode='clusters'`、`stats.clusterBy`、`stats.clusters`、`stats.aggregateMs`、`stats.limit=null`、`stats.limitAuto=true`。`stats.byKind` 仍是**卡片**计数（不是簇数），`stats.byType` 是被聚合的原始边计数。kind/tag/types/min_weight/hide_isolated 照常生效（先选卡再聚合）；focus 只看焦点所在簇 + 一跳邻簇。
+
+## 聚合视图（默认视图；方案 B）
+默认视图**不逐张画卡，而是画簇**：一个簇 = 一个类型（`cluster_by=kind`）或一张卡最稀有的主标签（`cluster_by=tag`），簇内显示卡数。5 万张卡也只有几十个节点，默认视图因此与库规模脱钩，**不再受 5000 上限影响**（`mode=clusters` 不做 limit 截断，也不出截断提示）。
+
+- **归簇**：每张卡恰好归一个簇；按标签归簇时取该卡 DF 最低（最稀有）的标签，无标签的卡进「其他」；卡数 < `CLUSTER_MIN_COUNT=3` 的簇也并入「其他」（阈值是常量，防长尾标签把默认视图撑满）。
+- **簇间边**：原始边跨簇聚合，同一对簇只出一条，`weight` = 聚合的原始边数，`byType` 保留三类计数；`type` 只是主导类型（前端按它上色）。簇内边在簇视图里不画。
+- **展开**：点簇 → 右侧面板列出簇内卡片（按关联数，最多 50 条，点卡片直接跳卡片视图邻域）；再点同一个簇、点簇名、点面板「展开这一簇」或在簇列表里回车 → 切到卡片视图并带上 `kind=`（类型簇）或 `tag=`（标签簇）过滤，走的是 A 的服务端过滤路径。
+- **默认规则**：主库卡数 ≥ 3000 时默认聚合，否则默认卡片；首帧用一次便宜的聚合请求探规模后决定，自动选择不写进 URL，**只有用户手动切换**才写 `mode=cards|clusters`。卡片视图里同一个「聚合视图 / 卡片视图」开关就是回聚合视图的入口。
+- **搜索**：聚合视图里搜索仍搜全库卡片（`POST /admin/api/graph/search`），回车命中后直接跳卡片视图并 `focus` 第一张命中的卡；输入时也会顺带高亮命中的簇名。
+- **蜘蛛**：装饰游走在簇节点上照常；蜘蛛搜索按钮/回车在聚合视图里先切到卡片视图再跑巡游（`?mode=cards&q=…&spider=1`）。
+- **a11y**：簇同样是画布外的列表入口（「簇列表」，按卡数排序，回车展开），图例在聚合视图下就是簇列表（点击展开），簇节点在画布上可点、有 tooltip（簇名 / 卡数 / 关联数）。
+- **缓存**：聚合底图（卡 → 簇 + 簇间边计数）与 `full` 一起按同一个指纹缓存，指纹变才重算（`stats.cached`、`stats.aggregateMs`）；单次聚合在 2 万卡上约 41–49ms。
+
+完整卡片视图仍是原有的暗色霓虹簇云图，只在卡数少的库或从簇展开后使用。
 
 ## 前端
 `web/js/views/graph.js`（视图）+ `web/js/graph-core.js`（纯函数：过滤/搜索/力导向/视图变换/命中测试，单测）。零依赖、canvas、自写力导向（网格近邻斥力，5000 节点仍流畅：实测单帧绘制均值 3.8ms），无构建、无外网、遵守现有 CSP 与 DOM 助手约束。
@@ -59,7 +83,7 @@
 截断提示是信息级（`notice('info')`）：只有卡数超过自动上限、或用户手动压小了上限才出现；默认视图（未超上限）没有任何截断提示。
 
 **截断时过滤回服务器**：被 `limit` 截断藏掉的卡在前端数据里根本不存在，光靠本地过滤是筛不回来的。所以一旦 `data.truncated` 为真（或发生过一次服务器过滤），标签 / 图例类型 / 边类型 / 最小权重 / 隐藏孤立点的变化都改成重新 `GET /admin/api/graph`（带上当前全部条件；权重滑块这类连续输入 150ms 防抖，递增请求序号丢弃过期响应），成功后替换数据并刷新截断提示、图例计数、页头计数、标签选项、节点列表与布局；此模式下 `filterGraph` 只做原样透传（服务器已选过点 / 边），不会二次筛掉结果。标签选项此时改从 `GET /admin/api/tags?limit=500` 取，被藏掉的标签也能选到；未截断时仍是本地过滤 + 本地标签选项，不联网。
-URL：`#/graph?focus=&tag=&kind=&limit=`。
+URL：`#/graph?mode=&cluster_by=&focus=&tag=&kind=&limit=&q=`（`mode` / `q` 见「聚合视图」一节；`limit` 只在卡片视图生效）。
 
 ### 暗色霓虹簇云风格
 画布恒为近纯黑（`web/graph.css` 覆盖 `.graph-stage`，浅色主题下也保持深色；画布外页头/面板/工具栏仍跟随全站主题）。
@@ -94,7 +118,7 @@ LLM：复用蒸馏的 OpenAI 兼容适配器（`MEMORY_LLM_*`，同一超时配�
 框选/合并/删除（管理台图谱只读）、右键菜单、导出、全屏、"时间模式"、视口剔除 LOD（改为标签预算 + 隐藏孤立点/最小权重/limit 降噪）、多库聚合、磁盘缓存。
 
 ## 测试
-`tests/admin/graph.test.mjs`（API：鉴权/结构/不泄露/过滤（含 `kinds` 多值并集）/limit 与截断/自动上限 5000/focus/边类型/只读/规模）、`tests/admin/graph-core.test.mjs`（纯函数）。规模 / 首帧性能实测脚本见上（`tests/e2e/graph-perf-*.mjs`）。截图 `docs/screenshots/m4/`（合成数据，非真实数据；`07` 默认视图带截断警告（改动前，800 上限），`08`/`09` 1500/2000 卡默认视图无提示，`10` 手动上限 200 时的信息级提示，`11` 2100 卡（超自动上限）时的信息级自动截断提示，`12`/`13` 6000 卡截断后用被藏标签回服务器筛出结果，`14`/`15` 5000 卡默认视图无提示与手动上限 200 的信息级提示）。截断过滤的浏览器验证脚本：`tests/e2e/graph-truncation-filter-e2e.mjs`（配 `graph-truncation-server.mjs`，断言被藏标签能选到、筛出后计数与画布一致、清空后回到全量）。
+`tests/admin/graph.test.mjs`（API：鉴权/结构/不泄露/过滤（含 `kinds` 多值并集）/limit 与截断/自动上限 5000/focus/边类型/只读/规模/聚合视图（结构、簇数、小簇合并、边聚合、`cluster_by=tag`、非法参数 400、limit 被忽略））、`tests/admin/graph-core.test.mjs`（纯函数）。规模 / 首帧性能实测脚本见上（`tests/e2e/graph-perf-*.mjs`）。截图 `docs/screenshots/m4/`（合成数据，非真实数据；`07` 默认视图带截断警告（改动前，800 上限），`08`/`09` 1500/2000 卡默认视图无提示，`10` 手动上限 200 时的信息级提示，`11` 2100 卡（超自动上限）时的信息级自动截断提示，`12`/`13` 6000 卡截断后用被藏标签回服务器筛出结果，`14`/`15` 5000 卡默认视图无提示与手动上限 200 的信息级提示，`16`/`17`/`18` 20000 卡聚合视图默认帧 / 点簇后的簇内卡片面板 / 展开后的卡片视图，`19` 5000 卡按主题标签聚合，`20` 聚合视图里搜索回车跳到卡片视图并聚焦命中卡）。聚合视图的浏览器验证脚本：`tests/e2e/graph-cluster-e2e.mjs`（配 `graph-perf-server.mjs`，断言默认落在聚合视图、簇数 ≤ 60、无截断提示、首帧与帧耗时、点簇 → 面板 → 展开 → 回聚合、搜索跳转）。截断过滤的浏览器验证脚本：`tests/e2e/graph-truncation-filter-e2e.mjs`（配 `graph-truncation-server.mjs`，断言被藏标签能选到、筛出后计数与画布一致、清空后回到全量）。
 
 ## 部署
 改了 `src/admin/{graph,graph-search,handler}.js`、`src/config.js`、`src/server.js` 与 `web/`：**需重启 hub**；**无 schema 变更**、无新依赖、无新配置。

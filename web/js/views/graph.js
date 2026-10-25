@@ -1,11 +1,12 @@
 // 知识图谱（M4，只读）：暗色霓虹簇云风格的 canvas 力导向图。
-// 簇 = 卡片 kind（= 主库顶级目录）；每簇一个霓虹主题色，簇内细密半透明纤维线，簇间留白；节点为细小的点，枢纽带发光。
+// 两种视图：聚合（默认：节点 = kind / 主标签的簇，带卡数，点簇才展开成卡片）与卡片（逐张画卡）。
+// 卡片视图里簇 = 卡片 kind（= 主库顶级目录），簇内细密半透明纤维线，簇间留白；节点为细小的点，枢纽带发光。
 // 数据来自 GET /admin/api/graph（不含正文）；点击节点后才请求现有卡片详情接口取摘要。
 // 交互：点节点 → 向邻居辐射点状虚线 + 邻居小矩形标签、其余变暗；点簇名/簇 → 相机缓动飞到该簇、其余变暗；点空白恢复。
-// URL 哈希参数：focus=<card path> 邻域模式、tag、kind、limit。
+// URL 哈希参数：mode=cards|clusters、cluster_by=kind|tag、focus=<card path> 邻域模式、tag、kind、limit。
 
 import { h } from '../dom.js'
-import { get } from '../api.js'
+import { get, post } from '../api.js'
 import { createSpider } from '../graph-spider.js'
 import { createSpiderSearch } from '../graph-spider-ui.js'
 import { visibleBox, viewToCam, camToView, followStep, fitPoints, boxCenter } from '../graph-camera.js'
@@ -18,6 +19,14 @@ import {
 } from '../graph-core.js'
 
 const LIMITS = ['auto', 200, 500, 800, 1500, 2000, 3000, 5000]
+/** 与后端 GRAPH_AUTO_LIMIT 一致；聚合视图不截断，只用于文案。 */
+const GRAPH_AUTO_LIMIT = 5000
+/** 视图模式：聚合（默认，随卡数自动）/ 卡片。 */
+const MODES = ['clusters', 'cards']
+/** 主库卡数 ≥ 该值时默认聚合视图（卡数再多也不靠 limit 截断）。 */
+const CLUSTER_DEFAULT_THRESHOLD = 3000
+/** 按标签聚合时簇的配色（各簇轮转使用，与 kind 霓虹色同一套）。 */
+const TAG_COLORS = ['#2ee6ff', '#b47bff', '#ffd23f', '#ff4fd8', '#ff8a2b', '#3dffb0', '#ff4d5e']
 const DEFAULT_LIMIT = 'auto'
 /** 规范化 limit：URL 里只认 'auto' 或 LIMITS 里的数字，其余回落到自动（= 不带参数）。 */
 const normLimit = (raw) => { const n = Number(raw); return LIMITS.includes(n) ? n : DEFAULT_LIMIT }
@@ -50,12 +59,17 @@ function glowSprite(color, size = 64) {
 
 // ---------------------------------------------------------------------------
 // 簇布局：簇中心确定性打包（互不重叠 + 留白），簇内力导向（网格近邻斥力 + 弹簧 + 向簇心的引力）。O(n·k)，几千节点可跑。
+// 分组键默认 node.kind；聚合视图里每个簇节点自带 group（= 簇 id）与 color / label，一簇一个分组。
 // ---------------------------------------------------------------------------
 function buildClusters(nodes) {
   const by = new Map()
-  nodes.forEach((n, i) => { const k = n.kind || 'other'; if (!by.has(k)) by.set(k, []); by.get(k).push(i) })
+  nodes.forEach((n, i) => { const k = n.group || n.kind || 'other'; if (!by.has(k)) by.set(k, []); by.get(k).push(i) })
   const rank = (k) => { const i = KIND_ORDER.indexOf(k); return i < 0 ? 99 : i }
-  const cls = [...by.entries()].map(([key, idxs]) => ({ key, idxs, n: idxs.length, color: neon(key), tint: mixWhite(neon(key), 0.72), R: 13 * Math.sqrt(idxs.length) + 30, cx: 0, cy: 0, r: 40, hx: 0, hy: 0, dim: 1 }))
+  const cls = [...by.entries()].map(([key, idxs]) => {
+    const first = nodes[idxs[0]]
+    const color = first.color || neon(key)
+    return { key, idxs, n: idxs.length, color, tint: mixWhite(color, 0.72), label: first.label || kindLabel(key), R: 13 * Math.sqrt(idxs.length) + 30, cx: 0, cy: 0, r: 40, hx: 0, hy: 0, dim: 1 }
+  })
     .sort((a, b) => b.n - a.n || rank(a.key) - rank(b.key))
   const placed = []
   cls.forEach((c, ci) => {
@@ -169,29 +183,41 @@ export default async function render(ctx) {
   const p = ctx.params
   const focus = p.get('focus') || ''
   const limit = normLimit(p.get('limit'))
-  const st = { tag: p.get('tag') || '', kind: p.get('kind') || '', minWeight: 1, hideIsolated: false, types: new Set(['link', 'tag', 'similar']), kinds: null, search: '' }
+  const st = { tag: p.get('tag') || '', kind: p.get('kind') || '', minWeight: 1, hideIsolated: false, types: new Set(['link', 'tag', 'similar']), kinds: null, search: '', mode: MODES.includes(p.get('mode')) ? p.get('mode') : '', clusterBy: p.get('cluster_by') === 'tag' ? 'tag' : 'kind' }
   if (st.kind) st.kinds = new Set([st.kind])
+  const query = (extra = {}) => ({ focus, kinds: st.kind || undefined, tag: st.tag || undefined, limit: limit === DEFAULT_LIMIT ? undefined : limit, depth: focus ? 2 : undefined, ...extra })
   let data
   try {
-    data = await get('graph', { focus, kinds: st.kind || undefined, tag: st.tag || undefined, limit: limit === DEFAULT_LIMIT ? undefined : limit, depth: focus ? 2 : undefined })
+    if (st.mode) {
+      data = await get('graph', query({ mode: st.mode, cluster_by: st.mode === 'clusters' ? st.clusterBy : undefined }))
+    } else {
+      // 未指定模式：先用聚合视图探一下主库规模（聚合子图便宜），卡数大的库默认就落在聚合视图
+      const probe = await get('graph', query({ mode: 'clusters' }))
+      st.mode = probe.stats.totalCards >= CLUSTER_DEFAULT_THRESHOLD ? 'clusters' : 'cards'
+      data = st.mode === 'clusters' ? probe : await get('graph', query())
+    }
   } catch (e) {
     if (e.status === 404 && focus) { ctx.go('#/graph'); return h('div') }
     throw e
   }
-  ctx.setTitle('知识图谱')
-  // 截断状态下隐藏的卡得靠服务器重新取；一旦发生过一次服务器过滤，本页后续过滤都走服务器（否则清空条件会只剩子集）
-  let serverMode = !!data.truncated
+  const clusterMode = st.mode === 'clusters'
+  ctx.setTitle(clusterMode ? '知识图谱 · 聚合视图' : '知识图谱')
+  // 截断状态下隐藏的卡得靠服务器重新取；一旦发生过一次服务器过滤，本页后续过滤都走服务器（否则清空条件会只剩子集）。
+  // 聚合视图永远走服务器：簇的计数、簇间边都必须在全库上重算。
+  let serverMode = clusterMode || !!data.truncated
   let fetchSeq = 0
   let fetchTimer = 0
   const nav = (patch) => {
     const q = new URLSearchParams()
-    const next = { focus, limit: limit === DEFAULT_LIMIT ? '' : limit, ...patch }
+    const next = { mode: st.mode, cluster_by: clusterMode && st.clusterBy === 'tag' ? 'tag' : '', tag: st.tag, kind: st.kind, focus, limit: limit === DEFAULT_LIMIT ? '' : limit, q: st.search, ...patch }
     for (const [k, v] of Object.entries(next)) if (v) q.set(k, String(v))
     ctx.go('#/graph' + (q.toString() ? '?' + q : ''))
   }
 
   // ---------- 状态 ----------
-  const canvas = h('canvas', { class: 'graph-canvas', role: 'img', 'aria-label': `知识图谱画布（${fmtNum(data.stats.nodes)} 个节点，按类型分簇；点击节点或簇名聚焦；键盘：+ 放大，- 缩小，0 适应窗口，Esc 取消选中；也可用下方节点列表）`, tabindex: '0' })
+  const canvas = h('canvas', { class: 'graph-canvas', role: 'img', 'aria-label': clusterMode
+    ? `知识图谱聚合视图（${fmtNum(data.stats.clusters)} 个簇，覆盖 ${fmtNum(data.stats.matchedNodes)} 张卡）；点簇看簇内卡片，回车或按钮「展开这一簇」进卡片视图；下方簇列表可用键盘操作`
+    : `知识图谱画布（${fmtNum(data.stats.nodes)} 个节点，按类型分簇；点击节点或簇名聚焦；键盘：+ 放大，- 缩小，0 适应窗口，Esc 取消选中；也可用下方节点列表）`, tabindex: '0' })
   const tip = h('div', { class: 'graph-tip', hidden: true, role: 'tooltip' })
   const stage = h('div', { class: 'graph-stage' }, [canvas, tip])
   const side = h('aside', { class: 'graph-side', 'aria-live': 'polite' })
@@ -204,6 +230,7 @@ export default async function render(ctx) {
   let adj = new Map()
   let maxDeg = 1
   let hubDeg = 3
+  let maxCount = 1 // 聚合视图：最大簇的卡数（半径归一）
   let matches = null
   let selected = ''
   let focusCluster = '' // 被聚焦的簇 key
@@ -263,10 +290,22 @@ export default async function render(ctx) {
   let lastDraw = 0
 
   // ---------- 过滤 / 重建布局 ----------
+  /** 聚合视图的服务器簇节点 → 渲染节点：补 group（一簇一组）、color、label、title；样卡不动。 */
+  function decorateClusters(nodes) {
+    let max = 1
+    for (const n of nodes) if (n.count > max) max = n.count
+    const out = nodes.map((n, i) => {
+      const label = n.tag ? `# ${n.tag}` : n.id === 'cluster:other' ? '其他' : kindLabel(n.kind)
+      return { ...n, tags: [], group: n.id, label, title: label, color: n.tag ? TAG_COLORS[i % TAG_COLORS.length] : neon(n.kind) }
+    })
+    return { nodes: out, max }
+  }
   function rebuild({ keepPositions = true, refit = false } = {}) {
     const prev = keepPositions && L ? new Map(L.nodes.map((n) => [n.id, { x: n.x, y: n.y }])) : null
     // 服务器模式：选点 / 选边 / 去孤立点已由服务器做过，这里只按返回结果重建布局（再筛一遍会把它又筛没）
-    shown = filterGraph(data, serverMode ? {} : { kinds: st.kinds, tag: st.tag, minWeight: st.minWeight, types: st.types, hideIsolated: st.hideIsolated })
+    let src = data
+    if (clusterMode) { const d = decorateClusters(data.nodes); src = { nodes: d.nodes, edges: data.edges }; maxCount = d.max }
+    shown = filterGraph(src, serverMode ? {} : { kinds: st.kinds, tag: st.tag, minWeight: st.minWeight, types: st.types, hideIsolated: st.hideIsolated })
     adj = adjacency(shown.edges)
     maxDeg = Math.max(1, ...shown.nodes.map((n) => n.degree))
     const sorted = shown.nodes.map((n) => n.degree).sort((a, b) => b - a)
@@ -290,7 +329,10 @@ export default async function render(ctx) {
     if (selected && !L.idx.has(selected)) { selected = ''; renderSide() }
     updateMatches()
     renderNodeList()
-    countEl.textContent = `显示 ${fmtNum(shown.nodes.length)} 个节点 · ${fmtNum(shown.edges.length)} 条边 · ${L.cl.length} 个簇` + (shown.nodes.length !== data.stats.nodes ? `（已过滤，共 ${fmtNum(data.stats.nodes)}）` : '')
+    if (clusterMode) drawLegend()
+    countEl.textContent = clusterMode
+      ? `${fmtNum(shown.nodes.length)} 个簇 · 覆盖 ${fmtNum(shown.nodes.reduce((a, n) => a + (n.count || 0), 0))} 张卡 · ${fmtNum(shown.edges.length)} 条簇间关联`
+      : `显示 ${fmtNum(shown.nodes.length)} 个节点 · ${fmtNum(shown.edges.length)} 条边 · ${L.cl.length} 个簇` + (shown.nodes.length !== data.stats.nodes ? `（已过滤，共 ${fmtNum(data.stats.nodes)}）` : '')
     if (refit || !fitted) { fitNow() }
     spider.reset()
     dirty = true
@@ -299,8 +341,10 @@ export default async function render(ctx) {
   function fitNow() {
     if (!w || !hgt || !L) return
     refreshBox()
-    const fv = fitView(L.nodes, box.w, box.h)
-    view = { zoom: fv.zoom, panX: fv.panX + box.x, panY: fv.panY + box.y }
+    const fv = fitView(L.nodes, box.w, box.h, clusterMode ? 110 : 36) // 聚合视图留白更大：簇名在圆上方，别贴边或缺给缩放栏
+    // 聚合视图：整体往左下让一点，避开画布右上角的缩放栏
+    const skirt = clusterMode ? Math.min(70, box.w * 0.06) : 0
+    view = { zoom: fv.zoom, panX: fv.panX + box.x - skirt, panY: fv.panY + box.y + (clusterMode ? 6 : 0) }
     fitted = true
     tween = null
     dirty = true
@@ -310,9 +354,11 @@ export default async function render(ctx) {
     dirty = true
   }
 
-  // ---------- 服务器端过滤（仅截断时） ----------
+  // ---------- 服务器端过滤（截断时；聚合视图总是） ----------
   const filterParams = () => {
     const params = { focus: focus || undefined, limit: limit === DEFAULT_LIMIT ? undefined : limit, depth: focus ? 2 : undefined }
+    if (st.mode) params.mode = st.mode
+    if (clusterMode) params.cluster_by = st.clusterBy
     if (st.tag) params.tag = st.tag
     if (st.kinds) params.kinds = [...st.kinds].join(',')
     params.types = [...st.types].join(',')
@@ -369,10 +415,89 @@ export default async function render(ctx) {
   // 缩放补偿：节点屏幕半径 = 基础半径 × zoom^NODE_ZOOM_EXP（缓增），世界半径 = 屏幕半径 / zoom；连线宽/标签字号按屏幕像素恒定（commit 1496dda 的行为）。
   const NODE_ZOOM_EXP = 0.2
   const baseR = (n) => 0.8 + 1.5 * Math.sqrt(n.degree / maxDeg) // 屏幕像素：细小的点，度数越高略大
-  const radiusOf = (n) => Math.max(0.7, baseR(n) * Math.pow(view.zoom, NODE_ZOOM_EXP)) / view.zoom
-  const hubOf = (i) => shown.nodes[i].degree >= hubDeg
+  /** 聚合视图：簇半径按卡数开方（屏幕像素），屏幕大小恒定，不像卡片那样随 zoom 长大。 */
+  const clusterRScreen = (n) => 15 + 34 * Math.sqrt((n.count || 1) / maxCount)
+  const radiusOf = (n) => (clusterMode ? clusterRScreen(n) : Math.max(0.7, baseR(n) * Math.pow(view.zoom, NODE_ZOOM_EXP))) / view.zoom
+  const hubOf = (i) => (clusterMode ? true : shown.nodes[i].degree >= hubDeg)
 
-  const tagText = (n) => { const t = n.title || n.id; return (t.length > 20 ? t.slice(0, 19) + '…' : t) + ' · ' + kindLabel(n.kind) }
+  const tagText = (n) => {
+    if (clusterMode) return `${n.label || n.title} · ${n.count} 张`
+    const t = n.title || n.id
+    return (t.length > 20 ? t.slice(0, 19) + '…' : t) + ' · ' + kindLabel(n.kind)
+  }
+
+  const finishDraw = (t0) => {
+    const ms = performance.now() - t0
+    perf.frames++; perf.last = ms; perf.sum += ms; if (ms > perf.max) perf.max = ms
+  }
+
+  /** 聚合视图：只画簇（带卡数的圆）+ 簇间聚合边（粗细按聚合权重），不画卡片。 */
+  function drawClusterLayer(g, mt) {
+    const z = view.zoom
+    const sx = (x) => x * z + view.panX
+    const sy = (y) => y * z + view.panY
+    const nodes = L.nodes
+    const onScreen = (px, py, m = 40) => px > -m && px < w + m && py > -m && py < hgt + m
+    // 簇星云
+    g.globalCompositeOperation = 'lighter'
+    for (const c of L.cl) {
+      const n0 = nodes[c.idxs[0]]
+      if (!onScreen(sx(n0.x), sy(n0.y), 260)) continue
+      const rr = Math.max(90, clusterRScreen(n0) * 3.4)
+      g.globalAlpha = 0.13 * c.dim
+      g.drawImage(glowSprite(c.color, 128), sx(n0.x) - rr, sy(n0.y) - rr, rr * 2, rr * 2)
+    }
+    // 簇间边：粗细 / 亮度按聚合权重（log 压缩），颜色按主导类型
+    const maxW = Math.max(1, ...shown.edges.map((e) => e.weight))
+    g.globalCompositeOperation = 'source-over'
+    for (const e of shown.edges) {
+      const a = nodes[L.idx.get(e.source)]
+      const b = nodes[L.idx.get(e.target)]
+      if (!a || !b) continue
+      const ax = sx(a.x); const ay = sy(a.y); const bx = sx(b.x); const by = sy(b.y)
+      if (!onScreen(ax, ay, 200) && !onScreen(bx, by, 200)) continue
+      g.globalAlpha = 0.12 + 0.36 * Math.min(1, e.weight / maxW)
+      g.strokeStyle = e.type === 'link' ? '#dfe8ff' : e.type === 'tag' ? rgba(a.c.color, 0.9) : '#9aa6c0'
+      g.lineWidth = 0.6 + 2.6 * Math.min(1, Math.log1p(e.weight) / Math.log1p(maxW))
+      g.beginPath(); g.moveTo(ax, ay); g.lineTo(bx, by); g.stroke()
+    }
+    // 簇节点：带计数的圆（选中的加外环，搜索命中的加光晕）
+    for (let i = 0; i < nodes.length; i++) {
+      const n = nodes[i]
+      const px = sx(n.x); const py = sy(n.y)
+      if (!onScreen(px, py)) continue
+      const r = clusterRScreen(n) * Math.max(0.55, Math.min(1, z)) // 缩得太小时略缩，避免糊成一团
+      const sel = n.id === focusCluster
+      const hit = !mt || mt.has(n.id)
+      g.globalAlpha = 0.2 * n.c.dim * (hit ? 1 : 0.35)
+      g.fillStyle = n.c.color
+      g.beginPath(); g.arc(px, py, r, 0, Math.PI * 2); g.fill()
+      g.globalAlpha = 0.9 * n.c.dim * (hit ? 1 : 0.3)
+      g.lineWidth = sel ? 2.4 : 1.2
+      g.strokeStyle = sel ? '#fff' : n.c.color
+      g.beginPath(); g.arc(px, py, r, 0, Math.PI * 2); g.stroke()
+      g.globalAlpha = 0.95 * Math.min(1, n.c.dim + 0.2)
+      g.fillStyle = '#f2f6ff'
+      g.font = `700 ${Math.round(Math.max(11, Math.min(26, r * 0.62)))}px ${MONO}`
+      g.textAlign = 'center'; g.textBaseline = 'middle'
+      g.fillText(fmtNum(n.count), px, py + 0.5)
+      // 簇名在圆上方，选中时高亮
+      const name = n.label || n.title
+      g.font = `700 ${Math.round(Math.max(12, Math.min(22, r * 0.5)))}px ${MONO}`
+      g.textBaseline = 'alphabetic'
+      const tw = g.measureText(name).width
+      g.lineJoin = 'round'; g.lineWidth = 5; g.strokeStyle = 'rgba(5,6,10,.9)'; g.globalAlpha = 0.85 * n.c.dim
+      g.strokeText(name, px, py - r - 7)
+      g.fillStyle = sel ? '#fff' : mixWhite(n.c.color, 0.4); g.globalAlpha = 0.95 * n.c.dim
+      g.fillText(name, px, py - r - 7)
+      if (n.id === focusCluster) labelRects.push({ key: n.id, x: px - tw / 2 - 6, y: py - r - 7 - 22, w: tw + 12, h: 22 })
+    }
+    g.globalAlpha = 1; g.textAlign = 'left'; g.textBaseline = 'alphabetic'
+    spider.drawBackdrop(g, view, w, hgt)
+    spider.drawBody(g, view, w, hgt, spAlpha)
+    spider.drawInspect(g, view, w, hgt, (ins) => (ins.title.length > 28 ? ins.title.slice(0, 27) + '…' : ins.title))
+    g.globalAlpha = 1; g.globalCompositeOperation = 'source-over'
+  }
 
   function draw() {
     const t0 = performance.now()
@@ -385,6 +510,8 @@ export default async function render(ctx) {
     g.globalCompositeOperation = 'source-over'
     g.fillStyle = BG
     g.fillRect(0, 0, w, hgt)
+    spAlpha += ((selected || focusCluster || drag?.moved ? 0.4 : 0.92) - spAlpha) * 0.15 // 蜘蛛透明度（两种视图共用）
+    if (clusterMode) { drawClusterLayer(g, mt); finishDraw(t0); return }
     const nodes = L.nodes
     const z = view.zoom
     const sx = (x) => x * z + view.panX
@@ -501,7 +628,6 @@ export default async function render(ctx) {
     }
 
     // 蜘蛛：暗化其余节点 + 已被踩到的命中节点高亮 → 蜘蛛本体（聚焦 / 选中 / 拖拽时调淡，且不拦截任何指针事件）
-    spAlpha += ((selected || focusCluster || drag?.moved ? 0.4 : 0.92) - spAlpha) * 0.15
     spider.drawBackdrop(g, view, w, hgt)
     spider.drawBody(g, view, w, hgt, spAlpha)
 
@@ -634,8 +760,7 @@ export default async function render(ctx) {
     g.globalAlpha = 1
     g.globalCompositeOperation = 'source-over'
 
-    const ms = performance.now() - t0
-    perf.frames++; perf.last = ms; perf.sum += ms; if (ms > perf.max) perf.max = ms
+    finishDraw(t0)
   }
 
   // 簇的目标亮度：聚焦簇 → 其余暗；选中节点 → 自己的簇半亮、其余暗；搜索时保持整体可见（点级别另行变暗）
@@ -729,7 +854,12 @@ export default async function render(ctx) {
   function clusterAt(s) {
     const wp = screenToWorld(view, s.x, s.y)
     let best = null; let bd = Infinity
-    for (const c of L.cl) { const d = Math.hypot(c.cx - wp.x, c.cy - wp.y) / c.r; if (d <= 1 && d < bd) { best = c; bd = d } }
+    for (const c of L.cl) {
+      // 聚合视图的簇是一个大圆：命中半径取圆本身的半径（不小于布局给的区域半径）
+      const r = clusterMode ? Math.max(c.r, clusterRScreen(L.nodes[c.idxs[0]] || {})) / view.zoom : c.r
+      const d = Math.hypot(c.cx - wp.x, c.cy - wp.y) / r
+      if (d <= 1 && d < bd) { best = c; bd = d }
+    }
     return best?.key || ''
   }
   let drag = null
@@ -761,7 +891,7 @@ export default async function render(ctx) {
     if (i >= 0) {
       const n = shown.nodes[i]
       tip.textContent = ''
-      tip.append(h('strong', null, n.title || n.id), h('span', null, ` ${kindLabel(n.kind)} · 关联 ${n.degree}`))
+      tip.append(h('strong', null, clusterMode ? n.label || n.title : n.title || n.id), h('span', null, clusterMode ? ` ${fmtNum(n.count)} 张卡 · ${fmtNum(n.degree)} 条簇间关联 · 点击展开` : ` ${kindLabel(n.kind)} · 关联 ${n.degree}`))
       tip.removeAttribute('hidden')
       tip.style.setProperty('left', Math.min(s.x + 14, w - 220) + 'px')
       tip.style.setProperty('top', Math.min(s.y + 14, hgt - 50) + 'px')
@@ -776,11 +906,12 @@ export default async function render(ctx) {
     if (drag.mode === 'node') {
       const n = L.nodes[drag.i]
       if (n) n.fixed = false
-      if (!drag.moved) select(shown.nodes[drag.i].id)
+      if (!drag.moved) { const id = shown.nodes[drag.i].id; if (clusterMode) clickCluster(id); else select(id) }
     } else if (!drag.moved) {
       const s = e && e.clientX !== undefined ? pos(e) : { x: drag.sx, y: drag.sy }
       const key = labelAt(s) || clusterAt(s)
-      if (key && key !== focusCluster) selectCluster(key)
+      if (clusterMode) { if (key) expandCluster(key); else clearFocus() }
+      else if (key && key !== focusCluster) selectCluster(key)
       else clearFocus()
     }
     drag = null
@@ -804,6 +935,20 @@ export default async function render(ctx) {
   })
   function zoomBtn(f) { stopFollow(); tween = null; view = zoomAt(view, w / 2, hgt / 2, f); userMoved = true; dirty = true; kick() }
 
+  /** 聚合视图点簇：第一次选中（右侧面板列簇内卡片），再点一次 / 点簇名 / 点「展开这一簇」→ 展开成卡片视图。 */
+  function clickCluster(key) {
+    if (focusCluster === key) expandCluster(key)
+    else selectCluster(key)
+  }
+  /** 展开一簇 = 切到卡片视图并带上该类型 / 该标签的过滤（走服务器的过滤路径）。 */
+  function expandCluster(key) {
+    const i = L?.idx.get(key)
+    const n = i === undefined ? null : shown.nodes[i]
+    if (!n) return
+    if (n.tag) nav({ mode: 'cards', tag: n.tag, kind: '', focus: '', q: '' })
+    else if (n.id === 'cluster:other') nav({ mode: 'cards', tag: '', kind: '', focus: '', q: '' })
+    else nav({ mode: 'cards', kind: n.kind, tag: '', focus: '', q: '' })
+  }
   function select(id) {
     selected = id
     if (id) focusCluster = ''
@@ -843,6 +988,22 @@ export default async function render(ctx) {
     side.textContent = ''
     const n = selected ? shown.nodes[L.idx.get(selected)] : null
     const fc = !n && focusCluster ? clusterOf(focusCluster) : null
+    if (fc && clusterMode) {
+      // 聚合视图：簇内卡片来自服务器的样卡（最多 50 条），点卡片 → 卡片视图的邻域里看它
+      const node = shown.nodes[L.idx.get(fc.key)]
+      const list = node?.sampleCards || []
+      side.append(
+        h('div', { class: 'graph-side-head' }, [h('h3', null, [h('i', { class: 'gdot', css: { background: fc.color } }), ` ${node?.label || kindLabel(fc.key)} · ${fmtNum(node?.count || 0)} 张`])]),
+        h('p', { class: 'sub' }, node?.tag ? `簇 = 主题「${node.tag}」的卡片。` : node?.id === 'cluster:other' ? '簇 = 其他（小簇 / 无标签的卡片合并）。' : '簇 = 该类型的全部卡片。'),
+        h('div', { class: 'graph-side-actions' }, [h('button', { type: 'button', class: 'btn btn-primary btn-sm', on: { click: () => expandCluster(fc.key) } }, '展开这一簇')]),
+        list.length ? h('div', { class: 'graph-nbrs' }, [
+          h('h4', null, '簇内卡片（按关联数）'),
+          h('ul', null, list.map((c) => h('li', null, h('button', { type: 'button', class: 'graph-nbr', on: { click: () => nav({ mode: 'cards', focus: c.id, tag: '', kind: '', q: '' }) } }, [h('i', { class: 'gdot', css: { background: neon(c.kind) } }), c.title || c.id])))),
+          (node?.count || 0) > list.length ? h('p', { class: 'sub' }, `另有 ${fmtNum((node?.count || 0) - list.length)} 张，展开后可全部看到。`) : null,
+        ]) : null,
+      )
+      return
+    }
     if (fc) {
       const top = [...fc.idxs].sort((a, b) => shown.nodes[b].degree - shown.nodes[a].degree).slice(0, 14)
       side.append(
@@ -856,7 +1017,10 @@ export default async function render(ctx) {
       return
     }
     if (!n) {
-      side.append(h('div', { class: 'graph-side-empty' }, [
+      side.append(h('div', { class: 'graph-side-empty' }, clusterMode ? [
+        h('strong', null, '点击簇查看簇内卡片'),
+        h('p', { class: 'sub' }, '圆 = 一个簇，数字 = 卡数；点簇会列出簇内卡片，再点一次（或点簇名 / 面板里的「展开这一簇」）切到卡片视图并带上过滤。拖动空白处平移，滚轮缩放；点击空白恢复。'),
+      ] : [
         h('strong', null, '点击节点查看卡片'),
         h('p', { class: 'sub' }, '节点按类型分簇：点击节点向邻居辐射并高亮，点击簇名飞到该簇；拖动节点可调整位置；拖动空白处平移，滚轮缩放；点击空白恢复。'),
         focus ? h('p', { class: 'sub' }, '当前为邻域模式（2 跳）。') : null,
@@ -922,14 +1086,32 @@ export default async function render(ctx) {
   const kindUniverse = new Set(Object.keys(data.stats.byKind))
   if (serverMode) for (const k of KIND_ORDER) kindUniverse.add(k)
   const legendKinds = () => KIND_ORDER.filter((k) => kindUniverse.has(k)).concat([...kindUniverse].filter((k) => !KIND_ORDER.includes(k)))
-  const search = h('input', { id: 'graph-search-input', type: 'search', placeholder: '搜索标题 / 标签 / 类型；回车 = 蜘蛛搜索', 'aria-label': '搜索节点（输入即过滤高亮；回车或点「蜘蛛搜索」让蜘蛛按内容检索并 AI 汇总）', autocomplete: 'off',
+  st.search = p.get('q') || ''
+  const search = h('input', { id: 'graph-search-input', type: 'search', placeholder: clusterMode ? '搜索全库卡片；回车跳到卡片视图' : '搜索标题 / 标签 / 类型；回车 = 蜘蛛搜索', 'aria-label': clusterMode ? '搜索全库卡片（回车跳到卡片视图并聚焦第一条命中）' : '搜索节点（输入即过滤高亮；回车或点「蜘蛛搜索」让蜘蛛按内容检索并 AI 汇总）', autocomplete: 'off', value: st.search,
     on: {
-      input: (e) => { st.search = e.target.value; updateMatches(); if (matches?.size === 1) { const id = [...matches][0]; centerOn(id) } kick() },
-      keydown: (e) => { if (e.key === 'Enter' && !e.isComposing) { e.preventDefault(); runSpider() } },
+      input: (e) => {
+        st.search = e.target.value
+        updateMatches()
+        if (!clusterMode && matches?.size === 1) { const id = [...matches][0]; centerOn(id) }
+        kick()
+      },
+      keydown: (e) => { if (e.key === 'Enter' && !e.isComposing) { e.preventDefault(); clusterMode ? searchToCard() : runSpider() } },
     } })
+  /** 聚合视图里搜索的是全库卡片：先问服务端，命中就直接跳到卡片视图并聚焦第一条。 */
+  async function searchToCard() {
+    const q = search.value.trim()
+    if (!q) { search.focus(); return }
+    try {
+      const r = await post('graph/search', { q, limit: 1 })
+      const hit = r.hits?.[0]
+      if (hit) nav({ mode: 'cards', focus: hit.path, q, tag: '', kind: '' })
+      else cutEl.append(notice('info', '没有搜到相关卡片', '换个关键词再试；也可点簇浏览。'))
+    } catch (e) { cutEl.append(notice('error', '搜索失败', e.message || String(e))) }
+  }
   function runSpider() {
     const q = search.value.trim()
     if (!q) { search.focus(); return }
+    if (clusterMode) { nav({ mode: 'cards', q, spider: '1', tag: '', kind: '', focus: '' }); return }
     spiderUi.run(q).then(() => { dirty = true; kick() })
     dirty = true; kick()
   }
@@ -953,11 +1135,22 @@ export default async function render(ctx) {
   const typeBox = (t) => h('label', { class: 'check' }, [h('input', { type: 'checkbox', checked: true, 'aria-label': EDGE_LABEL[t], on: { change: (e) => { if (e.target.checked) st.types.add(t); else st.types.delete(t); applyFilters() } } }), h('span', null, EDGE_LABEL[t])])
   const limitSel = h('select', { 'aria-label': '最多节点数', on: { change: (e) => nav({ limit: e.target.value === DEFAULT_LIMIT ? '' : e.target.value }) } },
     LIMITS.map((n) => h('option', { value: String(n), selected: n === limit }, n === DEFAULT_LIMIT ? '全部节点（自动）' : `最多 ${n} 节点`)))
+  if (clusterMode) { limitSel.disabled = true; limitSel.title = '聚合视图按簇显示，不做节点截断' }
   const zbtn = (label, fn, ic) => h('button', { type: 'button', class: 'graph-zbtn', title: label, 'aria-label': label, on: { click: fn } }, icon(ic))
 
-  // 图例：kind 色块，点击切换显示该 kind（再点恢复）
+  // 图例：卡片视图 = kind 色块，点击切换显示该 kind（再点恢复）；聚合视图 = 簇列表（点击直接展开）
   function drawLegend() {
     legendEl.textContent = ''
+    if (clusterMode) {
+      const cls = (shown.nodes.length ? shown.nodes : []).slice()
+      cls.sort((a, b) => (b.count || 0) - (a.count || 0))
+      for (const n of cls) {
+        legendEl.append(h('button', { type: 'button', class: 'graph-lg', title: '展开这一簇',
+          on: { click: () => expandCluster(n.id) } }, [h('i', { class: 'gdot', css: { background: n.color } }), `${n.label || n.title} ${fmtNum(n.count)}`]))
+      }
+      legendEl.append(h('span', { class: 'graph-lg-sep' }), h('span', { class: 'sub' }, '圆 = 簇 · 数字 = 卡数 · 细线 = 簇间关联数（点击簇可展开）'))
+      return
+    }
     for (const k of legendKinds()) {
       const on = !st.kinds || st.kinds.has(k)
       legendEl.append(h('button', { type: 'button', class: 'graph-lg' + (on ? '' : ' off'), 'aria-pressed': on ? 'true' : 'false', title: '点击仅显示/取消该类型',
@@ -978,7 +1171,17 @@ export default async function render(ctx) {
   drawLegend()
   fillTagOpts()
 
+  // 视图模式开关（aria-pressed）；手动切换记进 URL。卡片视图保留一条回聚合视图的入口（同一个按钮）。
+  const modeBtn = (m, label) => h('button', { type: 'button', class: 'graph-mode-btn', 'aria-pressed': st.mode === m ? 'true' : 'false', title: m === 'clusters' ? '默认视图：只画簇，点簇才展开卡片' : '逐张画卡（超过上限会截断）',
+    on: { click: () => { if (st.mode === m) return; nav({ mode: m, focus: '', cluster_by: '' }) } } }, label)
+  const modeGroup = h('div', { class: 'graph-modes', role: 'group', 'aria-label': '视图模式' }, [modeBtn('clusters', '聚合视图'), modeBtn('cards', '卡片视图')])
+  const bySel = h('select', { 'aria-label': '聚合维度', title: '按什么归簇：类型或主题标签',
+    on: { change: (e) => nav({ cluster_by: e.target.value }) } },
+  [h('option', { value: 'kind', selected: st.clusterBy === 'kind' }, '按类型聚合'), h('option', { value: 'tag', selected: st.clusterBy === 'tag' }, '按主题标签聚合')])
+
   const toolbar = h('div', { class: 'graph-toolbar' }, [
+    modeGroup,
+    clusterMode ? h('label', { class: 'graph-ctl' }, [h('span', null, '聚合'), bySel]) : null,
     h('div', { class: 'search-box graph-search' }, [h('label', { class: 'sp-label', for: 'graph-search-input' }, '搜索'), icon('search'), search]),
     spiderBtn,
     h('label', { class: 'graph-ctl' }, [h('span', null, '标签'), tagSel]),
@@ -1019,6 +1222,13 @@ export default async function render(ctx) {
   const nodeListEl = h('div', { class: 'graph-nodelist' })
   function renderNodeList() {
     nodeListEl.textContent = ''
+    if (clusterMode) {
+      // 聚合视图的读屏 / 键盘入口：列簇，回车直接展开成卡片视图
+      const cls = [...shown.nodes].sort((a, b) => (b.count || 0) - (a.count || 0))
+      if (!cls.length) { nodeListEl.append(h('p', { class: 'sub' }, '当前过滤条件下没有簇。')); return }
+      nodeListEl.append(h('ul', null, cls.map((n) => h('li', null, h('button', { type: 'button', class: 'graph-nbr', on: { click: () => expandCluster(n.id) } }, [h('i', { class: 'gdot', css: { background: n.color } }), h('span', { class: 'graph-nbr-title' }, n.label || n.title), h('span', { class: 'sub' }, `${fmtNum(n.count)} 张 · ${fmtNum(n.degree)} 条关联 · 展开`)])))))
+      return
+    }
     const top = [...shown.nodes].sort((a, b) => b.degree - a.degree).slice(0, 40)
     if (!top.length) { nodeListEl.append(h('p', { class: 'sub' }, '当前过滤条件下没有节点。')); return }
     nodeListEl.append(h('ul', null, top.map((n) => h('li', null, h('button', { type: 'button', class: 'graph-nbr', on: { click: () => { select(n.id); centerOn(n.id); dirty = true; kick() } } }, [h('i', { class: 'gdot', css: { background: neon(n.kind) } }), h('span', { class: 'graph-nbr-title' }, n.title || n.id), h('span', { class: 'sub' }, `${kindLabel(n.kind)} · ${n.degree}`)])))))
@@ -1030,6 +1240,10 @@ export default async function render(ctx) {
   const cutEl = h('div', { class: 'graph-cut' })
   function cutNotice() {
     cutEl.textContent = ''
+    if (clusterMode) {
+      cutEl.append(notice('info', `聚合视图：${fmtNum(data.stats.clusters)} 个${st.clusterBy === 'tag' ? '主题簇' : '类型簇'}，覆盖 ${fmtNum(data.stats.matchedNodes)} 张卡`, `点簇查看簇内卡片，再点簇（或点「展开这一簇」）切到卡片视图；簇数远小于卡数，不受 ${fmtNum(GRAPH_AUTO_LIMIT)} 上限影响。`))
+      return
+    }
     if (!data.truncated) return
     cutEl.append(data.stats.limitAuto
       ? notice('info', `卡片数超过 ${fmtNum(data.stats.limit)}，仅显示关联度最高的 ${fmtNum(data.stats.nodes)} 个`, '可用标签 / 类型 / 最小权重缩小范围，或调低“最多节点数”只看重点。')
@@ -1037,14 +1251,15 @@ export default async function render(ctx) {
   }
   cutNotice()
 
-  const head = pageHead('06', 'Graph', '知识图谱', `主库 ${fmtNum(data.stats.totalCards)} 张卡 · 边 = [[链接]] / 共享标签 Top-6 / 正文相似（≥0.42）· 只读`, [countEl, focus ? h('button', { type: 'button', class: 'btn btn-sm', on: { click: () => nav({ focus: '' }) } }, '返回全图') : null])
+  const head = pageHead('06', 'Graph', '知识图谱', `${clusterMode ? '聚合视图 · ' : ''}主库 ${fmtNum(data.stats.totalCards)} 张卡 · 边 = [[链接]] / 共享标签 Top-6 / 正文相似（≥0.42）· 只读`, [countEl, focus ? h('button', { type: 'button', class: 'btn btn-sm', on: { click: () => nav({ mode: st.mode, focus: '' }) } }, '返回全图') : null])
+
 
   const root = h('div', { class: 'page graph-page' }, [
     head,
     cutEl,
     panel(null, [toolbar, legendEl], { cls: 'panel-filters graph-controls' }),
     data.nodes.length === 0 ? empty('主库里还没有卡片', '图谱只展示已批准的卡片；沉淀并批准几张卡后这里会出现关系网络', h('a', { class: 'btn', href: '#/queue' }, '去待审队列'), 'graph') : h('div', { class: 'graph-layout' }, [stage, side]),
-    data.nodes.length ? h('details', { class: 'fold graph-fold' }, [h('summary', null, [h('span', { class: 'fold-title' }, '节点列表（键盘 / 读屏替代入口）'), h('span', { class: 'sub' }, '按关联数排序，回车选中并定位')]), h('div', { class: 'fold-body' }, nodeListEl)]) : null,
+    data.nodes.length ? h('details', { class: 'fold graph-fold' }, [h('summary', null, [h('span', { class: 'fold-title' }, clusterMode ? '簇列表（键盘 / 读屏替代入口）' : '节点列表（键盘 / 读屏替代入口）'), h('span', { class: 'sub' }, clusterMode ? '按卡数排序，回车展开成卡片视图' : '按关联数排序，回车选中并定位')]), h('div', { class: 'fold-body' }, nodeListEl)]) : null,
   ])
 
   if (data.nodes.length) {
@@ -1053,7 +1268,12 @@ export default async function render(ctx) {
     // 先同步算一版布局；容器挂载后（下一帧）再量尺寸并适配
     rebuild({ keepPositions: false })
     renderSide()
-    requestAnimationFrame(() => { resize(); if (focus && L.idx.has(focus)) select(focus) })
+    requestAnimationFrame(() => {
+      resize()
+      if (focus && L.idx.has(focus)) select(focus)
+      // 聚合视图里点「蜘蛛搜索」是先切到卡片视图、再在这里跑（URL 带 spider=1）
+      if (p.get('spider') === '1' && search.value.trim()) runSpider()
+    })
   }
   // 调试 / 自动化测试钩子（只读）：绘制耗时统计与节点屏幕坐标
   canvas.__mhGraph = {

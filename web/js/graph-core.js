@@ -91,7 +91,8 @@ export function createLayout(nodes, edges, { prev = null, kindCenters = true } =
   const sim = nodes.map((n, i) => {
     const p = prev?.get(n.id)
     const r = 14 * Math.sqrt(i + 1)
-    return { id: n.id, kind: n.kind, degree: n.degree || 0, x: p ? p.x : Math.cos(i * GOLDEN) * r, y: p ? p.y : Math.sin(i * GOLDEN) * r, vx: 0, vy: 0, fixed: false }
+    // 布局节点带上原节点的字段（聚合视图要 count / label / color；卡片视图渲染也用到 title 等）
+    return { ...n, degree: n.degree || 0, x: p ? p.x : Math.cos(i * GOLDEN) * r, y: p ? p.y : Math.sin(i * GOLDEN) * r, vx: 0, vy: 0, fixed: false }
   })
   const idx = new Map(sim.map((n, i) => [n.id, i]))
   const links = []

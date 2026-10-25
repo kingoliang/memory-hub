@@ -180,8 +180,13 @@ export function createAdminHandler({ config, log, llm = null }) {
       if (kinds.length > 7) throw new HttpError(400, 'bad_request', 'kinds 最多 7 个')
       const hi = P(u).get('hide_isolated')
       if (hi !== null && !['', '0', '1'].includes(hi)) throw new HttpError(400, 'bad_request', 'hide_isolated 只能是 0 或 1')
+      // mode / cluster_by：只接受枚举值；mode=clusters 为聚合视图（忽略 limit、不截断）
+      const mode = enumParam(u, 'mode', G.GRAPH_MODES, 'cards')
+      const clusterBy = enumParam(u, 'cluster_by', G.CLUSTER_BYS, 'kind')
       try {
         return G.graphQuery(root, {
+          mode,
+          clusterBy,
           kind: strParam(u, 'kind', 50),
           kinds,
           tags: strParam(u, 'tag', 500).split(',').map((t) => t.trim()).filter(Boolean),
