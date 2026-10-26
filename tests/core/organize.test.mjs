@@ -6,7 +6,7 @@ import { existsSync } from 'node:fs'
 import { closeAllDb, insertCard, cjk, tmpDir, fingerprint } from './tidy-fixture.mjs'
 import { ensureVault } from '../../src/core/vault.js'
 import { getDb } from '../../src/core/db.js'
-import { tidyPlan, tidyApply, tidyRollback, planTagNormalize, formatTidyPlan, TIDY_BATCHES } from '../../src/core/tidy.js'
+import { tidyPlan, tidyApply, tidyRollback, planTagNormalize, planDuplicateGroups, formatTidyPlan, TIDY_BATCHES } from '../../src/core/tidy.js'
 import { titleStem, hasTimestamp, extractEntities, topicSimilarity, planTopicGroups, planSnapshotSeries, timelineTitle } from '../../src/core/topics.js'
 import { canonicalizeTags, loadTagTables, resolveMaxTags, topTags, tagKey, DEFAULT_MAX_TAGS } from '../../src/core/tags.js'
 import { captureCard, pickNeighbors, summarizeTurnDetailed, NEIGHBOR_SUMMARY_CHARS } from '../../src/core/capture.js'
@@ -88,6 +88,45 @@ test('planTopicGroups：确定性；不跨 kind；exclude 生效；保留最长'
   assert.equal(g1[0].canonical.path, 'b.md')
   assert.deepEqual(g1[0].members.map((m) => m.path), ['a.md'])
   assert.equal(planTopicGroups(cards, { exclude: new Set(['a.md']) }).length, 0)
+})
+
+test('topics / 近重复默认跳过「（时间线）」卡（GH #16）：一天一张不被二次合并', () => {
+  const body = '# 快照\n\nCOMBO 值班 UAE NEAR 记录：' + cjk(200)
+  const tl = [
+    { id: 1, path: 'a.md', kind: 'project', title: '值班巡检快照 2026-10-14（时间线）', tags: ['oncall'], body },
+    { id: 2, path: 'b.md', kind: 'project', title: '值班巡检快照 2026-10-15（时间线）', tags: ['oncall'], body },
+  ]
+  assert.deepEqual(planTopicGroups(tl), [], '时间线卡不进同主题组')
+  assert.equal(planTopicGroups(tl, { skipTimelines: false }).length, 1, '可显式关掉')
+  assert.deepEqual(planDuplicateGroups(tl, 0.3), [], '也不靠近重复组（同一套标题只差日期的正文相似度远超阈值）')
+  assert.equal(planDuplicateGroups(tl, 0.3, { skipTimelines: false }).length, 1)
+})
+
+test('snapshots 之后 topics 不再塌成 1 张：snapshots,topics 连跑时间线卡张数 = 天/段数', async () => {
+  const { root, db } = await freshVault()
+  // 3 天 x 3 张同前缀快照 → 应得 3 张按天的时间线卡
+  for (const d of ['2026-10-14', '2026-10-15', '2026-10-16']) {
+    for (let i = 0; i < 3; i++) {
+      insertCard(db, {
+        path: `02-Projects/oncall-${d}-${i}.md`, kind: 'project', title: `值班巡检快照 ${d} 0${i}:00`,
+        tags: ['oncall'], body: `# 值班巡检快照\n\n状态：${cjk(120)}\n队列：${cjk(80)}\n第 ${i} 条：${cjk(60)}`, updatedAt: `${d}T0${i}:00:00.000Z`,
+      })
+    }
+  }
+  const plan = await tidyPlan(root, quiet)
+  assert.equal(plan.snapshots.length, 3, '一天一个段')
+  const r1 = await tidyApply(root, { ...quiet, confirm: true, planId: plan.planId, batches: ['snapshots', 'topics'] })
+  assert.equal(r1.ok, true, JSON.stringify(r1.batches))
+  const timelines = () => db.prepare("SELECT path FROM cards WHERE title LIKE '%（时间线）'").all().map((r) => r.path)
+  assert.equal(timelines().length, 3, '时间线卡张数 = 序列数，topics 没再吞')
+  assert.ok(timelines().every((p) => /2026-10-1[456]-\d\.md$/.test(p)), '天天都有卡')
+  // 再跑 topics：没有可并的，库不变
+  const plan2 = await tidyPlan(root, quiet)
+  assert.deepEqual(plan2.topics, [])
+  const r2 = await tidyApply(root, { ...quiet, confirm: true, planId: plan2.planId, batches: ['topics'] })
+  assert.equal(r2.ok, true)
+  assert.equal(r2.batches[0].counts.removed, 0)
+  assert.equal(timelines().length, 3)
 })
 
 test('planSnapshotSeries：同前缀 + 时间戳且 ≥ minSeries 才成序列；已有时间线卡 1 张也追加', () => {
