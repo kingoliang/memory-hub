@@ -6,11 +6,22 @@
 // 只取主库 cards 表（status='approved' 且未软删）：隔离区（待审/驳回/回收站）的卡不入图。
 
 import { getDb } from '../core/db.js'
-import { KIND_ROOTS, bigramHashSet, jaccardSets } from '../core/vault.js'
-import { minhashSignature, lshCandidates } from '../core/minhash.js'
+import { KIND_ROOTS } from '../core/vault.js'
 import { redactSecrets } from '../core/tidy.js'
 
 export const EDGE_TYPES = ['link', 'tag', 'similar']
+/** 视图模式：`cards` = 逐张画卡（老行为，默认）；`clusters` = 聚合视图（簇节点 + 簇间聚合边，不受 limit 截断）。 */
+export const GRAPH_MODES = ['cards', 'clusters']
+/** 聚合维度的取值：按卡片类型（kind）或按主标签（tag）。 */
+export const CLUSTER_BYS = ['kind', 'tag']
+/** 卡数少于该值的簇合并进「其他」簇，避免长尾标签把默认聚合视图撑满。 */
+export const CLUSTER_MIN_COUNT = 3
+/** 簇节点里带的样例标题条数（前端提示 / 调试用）。 */
+const CLUSTER_SAMPLE_TITLES = 5
+/** 簇节点里带的样例卡片条数（前端右侧面板最多列这么多，规格上限 50）。 */
+const CLUSTER_SAMPLE_CARDS = 50
+/** 合并小簇的落点簇 id（kind 里没有 'other' 这个类型，所以不会与真实簇撞名）。 */
+export const CLUSTER_OTHER_ID = 'cluster:other'
 export const GRAPH_MAX_LIMIT = 5000
 /** 「自动上限」：请求不带 limit 时用它，默认等于 GRAPH_MAX_LIMIT（= 全部节点，除非撑不住）。 */
 export const GRAPH_AUTO_LIMIT = GRAPH_MAX_LIMIT
@@ -26,15 +37,106 @@ const TAG_HOT_WINDOW = 64
 const TAG_MAX_TAGS_PER_CARD = 24
 const TAG_EDGE_TAGS = 5
 const SIM_THRESHOLD = 0.42
-const DF_CAP = 24
-const RARE_CAP = 120
-const CAND_CAP = 40
-const MH_K = 48
-const MH_BANDS = 24
-const MH_ROWS = 2
-/** 相似度只看正文前 N 字符（控制 ~700 卡规模下的建图耗时；tidy 预览同样截断）。 */
-const SIM_BODY_CHARS = 4000
+/**
+ * 每卡保留的「草图」gram 数：取正文 bigram 哈希最小的前 k 个（= bottom-k MinHash 签名）。
+ * 它同时是候选倒排的键和 Jaccard 的估计样本；k 越大估计越准（k=32 时标准差约 0.09）。
+ */
+const SKETCH_K = 32
+/**
+ * 草图预筛比例：草图交集 / 草图长度 < 该值的候选直接丢弃、不进精确求交。
+ * 这是 Jaccard 的无偏估计（阈值 0.42），取 0.30 留足方差余量：只丢明显不可能的候选，召回优先。
+ */
+const SKETCH_MIN_RATIO = 0.30
+/** 单卡最多对多少个候选做精确求交（按草图估计降序，命中一条即止）。 */
+const CAND_CAP = 10
+/** 精确求交前的「分块计数上界」过滤：gram 空间均分 2^10 块，上界 = Σ min(A 块计数, B 块计数)。 */
+const SIM_BLOCKS = 1024
+const SIM_BLOCK_SHIFT = 22
+/**
+ * 热门 gram 的窗口：一个 gram 出现在很多卡里时，只回看最近 HOT_POSTING_WINDOW 张**前驱**卡。
+ * 倒排是边遍历边建的，所以「最近」= 最靠近当前卡的上文，不会只偏爱排序末尾；单卡候选量因此有上界。
+ */
+const HOT_POSTING_WINDOW = 32
+/**
+ * 相似度只看正文前 N 字符（近重复几乎都出现在开头，越往后越是各卡独有的细节）。
+ * 真实数据（1535 张卡）上：前 4000 字判出 75 对、1200 字 77 对、600 字 141 对（理想值 141，命中 137，
+ * 召回 97%），而 gram 构建量随 N 线性下降；改这个值会改变「近重复」的定义（tidy 预览另有自己的截断）。
+ */
+const SIM_BODY_CHARS = 600
 const WIKILINK_RE = /\[\[([^\]|]+)(?:\|[^\]]+)?\]\]/g
+/** 清洗时丢掉的标点（与 vault.bigramHashSet 的字符类一字不差），空白另有判断。 */
+const STRIP_PUNCT = new Set([...'#', '*', '_', '`', '|', '[', ']', '(', ')', '（', '）', '-', '—', '・'].map((c) => c.charCodeAt(0)))
+const isSpaceCode = (c) => c === 32 || (c >= 9 && c <= 13) || c === 0xa0 || c === 0x1680 || (c >= 0x2000 && c <= 0x200a) ||
+  c === 0x2028 || c === 0x2029 || c === 0x202f || c === 0x205f || c === 0x3000 || c === 0xfeff
+
+/**
+ * 把正文的字符 bigram 哈希写进可复用的 Int32Array，返回写入个数（未去重、未排序）。
+ * 清洗（去空白与标点、转小写）与哈希在同一次遍历里完成，不生成中间字符串；哈希与 vault.hash32 逐字等价
+ * （FNV-1a over 两个 charCode）。只截取正文前 SIM_BODY_CHARS 个字符参与（与 tidy 预览无关）。
+ */
+function hashBigramsInto(text, buf) {
+  const s = String(text)
+  const limit = s.length < SIM_BODY_CHARS ? s.length : SIM_BODY_CHARS
+  let n = 0
+  let prev = -1
+  for (let i = 0; i < limit; i++) {
+    let c = s.charCodeAt(i)
+    if (c >= 65 && c <= 90) c += 32 // A-Z → a-z（同 toLowerCase 对 ASCII 的处理）
+    else if (c < 0x80 && !(c >= 97 && c <= 122) && !(c >= 48 && c <= 57) && (isSpaceCode(c) || STRIP_PUNCT.has(c))) continue
+    else if (c >= 0x80 && (isSpaceCode(c) || STRIP_PUNCT.has(c))) continue
+    if (prev >= 0) {
+      const pair = Math.imul((0x811c9dc5 ^ prev) >>> 0, 0x01000193) >>> 0
+      buf[n++] = Math.imul((pair ^ c) >>> 0, 0x01000193) >>> 0
+    }
+    prev = c
+  }
+  if (n === 0 && prev >= 0) buf[n++] = Math.imul((0x811c9dc5 ^ prev) >>> 0, 0x01000193) >>> 0 // 只剩单字：与 hash32 一致
+  return n
+}
+
+/** MH_GRAPH_DEBUG=1 时收集的分段计时与候选计数（只在调试时非 null）。 */
+let debugStats = null
+
+/**
+ * 精确 Jaccard 复核（两个已排序去重的 gram 数组）。返回相似度（< 阈值返回 0）。
+ * 先按块做数学上界过滤（Σ min(块计数) 一定 ≥ 真实交集，不会漏真对），再有序归并、边数边判：
+ * 只剩的元素已经补不够阈值时立刻放弃。命中后继续数完，保证返回的是**精确**值而不是刚过线时的下界。
+ */
+function similarAbove(a, b, blocksA, blocksB) {
+  const need = Math.ceil(SIM_THRESHOLD * (a.length + b.length) / (1 + SIM_THRESHOLD))
+  let ub = 0
+  for (let k = 0; k < SIM_BLOCKS; k++) { const x = blocksA[k]; const y = blocksB[k]; ub += x < y ? x : y }
+  if (ub < need) return 0
+  if (debugStats) debugStats.blockPass++
+  let x = 0
+  let y = 0
+  let c = 0
+  while (x < a.length && y < b.length) {
+    const p = a[x]
+    const q = b[y]
+    if (p === q) {
+      c++
+      x++
+      y++
+    } else if (p < q) x++
+    else y++
+    // 剩下的元素全都能配上也不够阈值：提前退出
+    if (c + (a.length - x) < need || c + (b.length - y) < need) return 0
+  }
+  return c / (a.length + b.length - c)
+}
+
+/** 让出事件循环：建图不再把 hub 的请求处理堵在同步循环里。 */
+const yieldToLoop = () => new Promise((resolve) => setImmediate(resolve))
+/** 每攒够 8ms 工作量就让出一次（按时间而不是按条数，块大小与机器快慢无关）。 */
+function makeTicker() {
+  let last = Date.now()
+  return async () => {
+    if (Date.now() - last < 8) return
+    await yieldToLoop()
+    last = Date.now()
+  }
+}
 
 function parseTags(raw) {
   try {
@@ -60,14 +162,32 @@ function fingerprint(db) {
   return [c.n, c.m || '', c.s || 0, c.t || 0, c.ti || 0, c.b || 0, log.id || 0, upd].join('|')
 }
 
+/**
+ * 标题是否「可能藏密钥」的廉价预检：redactSecrets 对每条标题要跑 20 多趟正则（1500 卡约 120ms），
+ * 而绝大多数标题是纯中文短语。只有含分隔符 / 长 token / 关键词的标题才真跑遮蔽。
+ */
+const SUSPECT_TITLE_RE = /-----|[=:]|[A-Za-z0-9_-]{16,}|token|key|secret|passw|bearer|ghp_|sk-/i
+const redactTitle = (t) => (SUSPECT_TITLE_RE.test(String(t || '')) ? redactSecrets(t).text : String(t || ''))
+
 /** 全量建图（不含过滤）。返回 { cards, edges, buildMs }。 */
-function buildFull(db) {
+async function buildFull(db) {
+  const tick = makeTicker()
   const t0 = Date.now()
+  const timings = process.env.MH_GRAPH_DEBUG ? { marks: [] } : null
+  debugStats = timings ? { verified: 0, blockPass: 0, touches: 0, passed: 0, used: 0 } : null
+  const mark = (k) => { if (timings) timings.marks.push([k, Date.now() - t0]) }
   const rows = db.prepare("SELECT path, kind, title, tags, status, created_at, updated_at, body FROM cards WHERE status = 'approved' AND deleted_at IS NULL ORDER BY updated_at DESC, path").all()
-  const cards = rows.map((r) => ({
-    id: r.path, kind: r.kind, title: redactSecrets(r.title).text, rawTitle: r.title || '', tags: parseTags(r.tags), status: r.status,
-    createdAt: isoOrNull(r.created_at), updatedAt: isoOrNull(r.updated_at),
-  }))
+  // 逐条映射并分批让出：遮蔽标题（redactTitle）对 1500 张卡就是几百毫秒，不能整段堵住事件循环
+  const cards = new Array(rows.length)
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i]
+    cards[i] = {
+      id: r.path, kind: r.kind, title: redactTitle(r.title), rawTitle: r.title || '', tags: parseTags(r.tags), status: r.status,
+      createdAt: isoOrNull(r.created_at), updatedAt: isoOrNull(r.updated_at),
+    }
+    if ((i & 127) === 127) await tick()
+  }
+  mark('load+map')
   const byPath = new Map(cards.map((c) => [c.id, c]))
   const byTitle = new Map()
   const byBase = new Map()
@@ -101,60 +221,127 @@ function buildFull(db) {
     }
   })
 
+  mark('wikilinks')
+  await tick()
   // ---- ② 共享标签：按共享标签数取每卡 Top-K ----
-  buildTagEdges(cards, addEdge)
+  await buildTagEdges(cards, addEdge, tick)
 
-  // ---- ③ 正文相似（Jaccard(bigram) ≥ 0.42，每卡至多 1 条；稀有 gram 倒排 + MinHash/LSH 取候选，再精确求交）----
-  const hashes = new Map()
-  const gramDf = new Map()
-  rows.forEach((r, i) => {
-    const s = bigramHashSet(String(r.body || '').slice(0, SIM_BODY_CHARS))
-    hashes.set(cards[i].id, s)
-    for (const g of s) gramDf.set(g, (gramDf.get(g) || 0) + 1)
-  })
-  const rareBy = new Map()
-  const rareIndex = new Map()
-  for (const c of cards) {
-    const buckets = Array.from({ length: DF_CAP + 1 }, () => null)
-    for (const g of hashes.get(c.id)) {
-      const df = gramDf.get(g) || 0
-      if (df > DF_CAP) continue
-      ;(buckets[df] ||= []).push(g)
+  mark('tagEdges')
+  await tick()
+  // ---- ③ 正文相似（Jaccard(bigram) ≥ 0.42，每卡至多 1 条）----
+  // 每卡把正文 bigram 哈希排序去重成 Int32Array，并用哈希最小的前 SKETCH_K 个 gram 当草图：
+  // 两张卡共享的草图数 / 草图长度就是 Jaccard 的无偏 MinHash 估计，用来取候选、按估计排序。
+  // 命中判定仍走精确求交（分块上界过滤 + 有序归并 + 提前退出），阈值与「每卡至多 1 条」「跳 kind 必共享标签」都不变。
+  const n = cards.length
+  // gram 与分块计数都放在整块内存里（每卡一个 subarray 视图），1535 张卡只分配两次，省掉每卡的小数组与 GC
+  const STRIDE = SIM_BODY_CHARS + 2 // +1 给「只剩单字」的那一个 gram，+1 对齐
+  const arena = new Int32Array(n * STRIDE)
+  const blockArr = new Uint8Array(n * SIM_BLOCKS)
+  const grams = new Array(n)
+  const blocks = new Array(n)
+  const sketch = new Array(n)
+  for (let i = 0; i < n; i++) {
+    const view = arena.subarray(i * STRIDE, (i + 1) * STRIDE)
+    const len = hashBigramsInto(rows[i].body || '', view)
+    const g = view.subarray(0, len)
+    g.sort()
+    let m = 0
+    const bl = blockArr.subarray(i * SIM_BLOCKS, (i + 1) * SIM_BLOCKS)
+    blocks[i] = bl
+    // 原地去重（已排序），顺手数分块直方图
+    for (let x = 0; x < len; x++) {
+      const v = g[x]
+      if (m === 0 || v !== g[m - 1]) { g[m++] = v; const k = v >>> SIM_BLOCK_SHIFT; if (bl[k] < 255) bl[k]++ }
     }
-    const rare = []
-    for (let df = 1; df <= DF_CAP && rare.length < RARE_CAP; df++) {
-      for (const g of buckets[df] || []) { rare.push(g); if (rare.length >= RARE_CAP) break }
-    }
-    rareBy.set(c.id, rare)
-    for (const g of rare) { const a = rareIndex.get(g); if (a) a.push(c.id); else rareIndex.set(g, [c.id]) }
+    const uniq = g.subarray(0, m)
+    grams[i] = uniq
+    sketch[i] = uniq.subarray(0, Math.min(SKETCH_K, m))
+    await tick()
   }
-  const sigs = new Map()
-  for (const c of cards) sigs.set(c.id, minhashSignature(rareBy.get(c.id), MH_K))
-  const lsh = lshCandidates(sigs, { bands: MH_BANDS, rows: MH_ROWS, maxPerCard: CAND_CAP })
-  const used = new Set()
-  const tagSet = new Map(cards.map((c) => [c.id, new Set(c.tags)]))
-  const merged = new Map()
-  for (const card of cards) {
-    if (used.has(card.id)) continue
-    merged.clear()
-    for (const g of rareBy.get(card.id)) for (const o of rareIndex.get(g) || []) if (o !== card.id) merged.set(o, (merged.get(o) || 0) + 1)
-    for (const o of lsh.get(card.id) || []) if (o !== card.id) merged.set(o, (merged.get(o) || 0) + 2)
-    if (!merged.size) continue
-    const ranked = [...merged.entries()].sort((x, y) => y[1] - x[1]).slice(0, CAND_CAP)
-    const A = hashes.get(card.id)
-    for (const [other] of ranked) {
-      if (used.has(other)) continue
-      const b = byPath.get(other)
-      if (!b) continue
-      if (b.kind !== card.kind && !card.tags.some((t) => tagSet.get(other).has(t))) continue // 跨 kind 必须至少共享一个标签
-      const sim = jaccardSets(A, hashes.get(other), SIM_THRESHOLD)
-      if (sim >= SIM_THRESHOLD) {
-        addEdge(card.id, other, 'similar', WEIGHT_SIMILAR, { sim: Math.round(sim * 100) / 100 })
-        used.add(card.id); used.add(other)
+  mark('hashes')
+  // 草图倒排：边遍历边建，posting 里只有「已经处理过的卡」——窗口取到的永远是**最近的前驱**，
+  // 不会像「先建完整倒排再取尾部」那样只偏爱排序末尾的卡（真实数据上召回会从 96% 掉到 23%）。
+  const postings = new Map()
+  mark('sketchIndex')
+  const used = new Uint8Array(n)
+  const tagSet = cards.map((c) => new Set(c.tags))
+  const weights = new Int32Array(n) // 候选的共享草图 gram 数
+  const stamp = new Int32Array(n)
+  let ver = 0
+  // 当前卡的候选 Top-CAND_CAP：固定小数组 + 插入排序（不建临时二元组、不整批 sort）
+  const bestJ = new Int32Array(CAND_CAP)
+  const bestR = new Float64Array(CAND_CAP)
+  const touches = []
+  for (let i = 0; i < n; i++) {
+    const card = cards[i]
+    const mine = sketch[i]
+    if (!mine.length) { await tick(); continue }
+    // 自己的草图先入倒排（即使自己已被配对，后面也要能选中自己）；posting 裁到最近 2W 张，读取时再取末尾 W 张
+    for (let x = 0; x < mine.length; x++) {
+      const g = mine[x]
+      let p = postings.get(g)
+      if (!p) { p = []; postings.set(g, p) }
+      p.push(i)
+      if (p.length > HOT_POSTING_WINDOW * 2) p.splice(0, p.length - HOT_POSTING_WINDOW)
+    }
+    if (used[i]) { await tick(); continue }
+    ver++
+    touches.length = 0
+    for (let x = 0; x < mine.length; x++) {
+      const posting = postings.get(mine[x])
+      const d = posting.length
+      const from = d > HOT_POSTING_WINDOW ? d - HOT_POSTING_WINDOW : 0
+      for (let y = from; y < d; y++) {
+        const j = posting[y]
+        if (j === i) continue
+        if (stamp[j] !== ver) { stamp[j] = ver; weights[j] = 0; touches.push(j) }
+        weights[j]++
+      }
+    }
+    if (debugStats) debugStats.touches += touches.length
+    let bn = 0
+    // 按草图估计取 Top-CAND_CAP（插入排序，容量固定）
+    for (let t = 0; t < touches.length; t++) {
+      const j = touches[t]
+      const kmax = sketch[j].length
+      if (kmax < 2) continue
+      const r = weights[j] / kmax
+      if (r < SKETCH_MIN_RATIO) continue // 草图估计明显不够 → 不进精确求交
+      if (debugStats) debugStats.passed++
+      let pos = bn < CAND_CAP ? bn : CAND_CAP - 1
+      if (bn === CAND_CAP && (r < bestR[pos] || (r === bestR[pos] && j > bestJ[pos]))) continue
+      while (pos > 0 && (bestR[pos - 1] < r || (bestR[pos - 1] === r && bestJ[pos - 1] > j))) {
+        if (pos < CAND_CAP) { bestR[pos] = bestR[pos - 1]; bestJ[pos] = bestJ[pos - 1] }
+        pos--
+      }
+      bestR[pos] = r
+      bestJ[pos] = j
+      if (bn < CAND_CAP) bn++
+    }
+    if (!bn) { await tick(); continue }
+    const A = grams[i]
+    for (let z = 0; z < bn; z++) {
+      const j = bestJ[z]
+      if (used[j]) continue
+      const other = cards[j]
+      const B = grams[j]
+      const lo = A.length < B.length ? A.length : B.length
+      const hi = A.length < B.length ? B.length : A.length
+      if (!hi || lo / hi < SIM_THRESHOLD) continue
+      if (other.kind !== card.kind && !card.tags.some((t) => tagSet[j].has(t))) continue // 跳 kind 必须至少共享一个标签
+      const sim = similarAbove(A, B, blocks[i], blocks[j])
+      if (debugStats) debugStats.verified++
+      if (sim) {
+        addEdge(card.id, other.id, 'similar', WEIGHT_SIMILAR, { sim: Math.round(sim * 100) / 100 })
+        used[i] = 1
+        used[j] = 1
         break
       }
     }
+    await tick()
   }
+  mark('similar')
+  if (timings) console.log('BUILD_TIMINGS', JSON.stringify(timings.marks), JSON.stringify(debugStats))
   return { cards, edges, buildMs: Date.now() - t0 }
 }
 
@@ -180,7 +367,7 @@ function lowerBound(arr, target) {
  *
  * 候选累积用 Int32Array 权重 + 版本戳 + 复用 touched，避免每卡建 Map / 整体 sort。
  */
-function buildTagEdges(cards, addEdge) {
+async function buildTagEdges(cards, addEdge, tick) {
   const n = cards.length
   if (!n) return
   // posting：标签 → 卡片在 cards 里的下标（按 cards 顺序追加，天然稳定）
@@ -247,6 +434,7 @@ function buildTagEdges(cards, addEdge) {
       if (cur && cur.w >= w) continue
       pairBest.set(key, { w, i, j })
     }
+    if ((i & 127) === 127) await tick()
   }
 
   for (const [key, { w, i, j }] of pairBest) {
@@ -257,16 +445,217 @@ function buildTagEdges(cards, addEdge) {
 }
 
 const cache = new Map() // root -> { fp, full }
+/** root -> { fp, promise }：同一指纹的并发请求合并成一次建图，不要各建一份。 */
+const inflight = new Map()
 
-function getFull(root) {
+function putFull(root, fp, full) {
+  cache.set(root, { fp, full })
+  if (cache.size > 4) cache.delete(cache.keys().next().value)
+}
+
+/**
+ * 取全量建图结果：指纹命中缓存就直接返回；否则建图（分批 await setImmediate，不把事件循环堵住）。
+ * 同一 fingerprint 的并发请求共享同一个 Promise；指纹不同（期间有人写库）就再建一份，后完成的覆盖缓存。
+ */
+async function getFull(root) {
   const db = getDb(root)
   const fp = fingerprint(db)
   const hit = cache.get(root)
-  if (hit && hit.fp === fp) return { full: hit.full, cached: true }
-  const full = buildFull(db)
-  cache.set(root, { fp, full })
-  if (cache.size > 4) cache.delete(cache.keys().next().value)
-  return { full, cached: false }
+  if (hit && hit.fp === fp) return { full: hit.full, fp, cached: true }
+  const running = inflight.get(root)
+  if (running && running.fp === fp) return running.promise
+  const promise = buildFull(db)
+    .then((full) => { putFull(root, fp, full); return { full, fp, cached: false } })
+    .finally(() => { if (inflight.get(root)?.promise === promise) inflight.delete(root) })
+  inflight.set(root, { fp, promise })
+  return promise
+}
+
+// ---------------------------------------------------------------------------
+// 聚合视图（mode=clusters）：把卡片按 kind / 主标签归簇，只在簇之间画聚合边。
+// 默认视图因此只有几十个节点，与库里卡数无关（5 万卡也不受 limit 上限影响）。
+// 聚合底图（卡 → 簇、簇间边计数）同样按指纹缓存，与 full 一起失效。
+// ---------------------------------------------------------------------------
+
+const clusterCache = new Map() // `${root}\u0000${clusterBy}` -> { fp, base }
+
+/**
+ * 每张卡归入一个簇：按 kind 直接归；按 tag 取该卡 DF 最低（最稀有）的标签，无标签进「其他」。
+ * 卡数 < CLUSTER_MIN_COUNT 的簇也合并进「其他」。返回 { clusterOfCard, clusters, pairs, ms }。
+ */
+function buildClusterBase(full, clusterBy) {
+  const t0 = Date.now()
+  const n = full.cards.length
+  const df = clusterBy === 'tag' ? new Map() : null
+  if (df) for (const c of full.cards) for (const t of c.tags) df.set(t, (df.get(t) || 0) + 1)
+  // 卡下标 → 簇下标（Int32Array，避免 2 万条 Map）；簇下标 → 簇对象
+  const clusterOfIdx = new Int32Array(n).fill(-1)
+  const clusters = []
+  const byId = new Map()
+  const ensure = (id, kind, tag) => {
+    let ci = byId.get(id)
+    if (ci === undefined) { ci = clusters.length; clusters.push({ id, kind, tag, idxs: [] }); byId.set(id, ci) }
+    return ci
+  }
+  for (let i = 0; i < n; i++) {
+    const c = full.cards[i]
+    let ci
+    if (clusterBy === 'tag') {
+      let best = ''
+      let bestDf = Infinity
+      for (const t of c.tags) { const d = df.get(t) || 0; if (d < bestDf || (d === bestDf && best && t < best)) { bestDf = d; best = t } }
+      ci = best ? ensure(`cluster:tag:${best}`, 'other', best) : ensure(CLUSTER_OTHER_ID, 'other')
+    } else {
+      ci = ensure(`cluster:kind:${c.kind || 'other'}`, c.kind || 'other')
+    }
+    clusterOfIdx[i] = ci
+    clusters[ci].idxs.push(i)
+  }
+  // 小簇合并：保留「其他」自身，其余卡数不足的整簇并进去（删簇时把它标成 -2，最后压实下标）
+  const otherIdx = byId.get(CLUSTER_OTHER_ID)
+  for (let ci = 0; ci < clusters.length; ci++) {
+    const cl = clusters[ci]
+    if (ci === otherIdx || !cl || cl.id === CLUSTER_OTHER_ID || cl.idxs.length >= CLUSTER_MIN_COUNT) continue
+    const target = otherIdx === undefined ? ensure(CLUSTER_OTHER_ID, 'other') : otherIdx
+    for (const i of cl.idxs) { clusterOfIdx[i] = target; clusters[target].idxs.push(i) }
+    clusters[ci] = null
+  }
+  // 卡 id → 下标（只在聚合时建一次）
+  const idxOf = new Map()
+  for (let i = 0; i < n; i++) idxOf.set(full.cards[i].id, i)
+  // 卡片度数（来自全部边）：样卡按它降序
+  const cardDeg = new Int32Array(n)
+  for (const e of full.edges) { cardDeg[idxOf.get(e.source)]++; cardDeg[idxOf.get(e.target)]++ }
+  // 簇间边：同一对簇只留一条，weight = 原始边数，byType 保留三类计数（数值键，不用字符串拼接）
+  const pairs = new Map()
+  const K = clusters.length + 1
+  for (const e of full.edges) {
+    const a = clusterOfIdx[idxOf.get(e.source)]
+    const b = clusterOfIdx[idxOf.get(e.target)]
+    if (a < 0 || b < 0 || a === b) continue // 簇内边在簇视图里不画
+    const key = a < b ? a * K + b : b * K + a
+    let pr = pairs.get(key)
+    if (!pr) { pr = { weight: 0, byType: { link: 0, tag: 0, similar: 0 } }; pairs.set(key, pr) }
+    pr.weight++
+    if (pr.byType[e.type] !== undefined) pr.byType[e.type]++
+  }
+  // 样卡顺序：全局按度数降序，但用计数排序（度数都是小整数）而不是比较排序；异常大的度数退回 sort
+  let maxCardDeg = 0
+  for (let i = 0; i < n; i++) if (cardDeg[i] > maxCardDeg) maxCardDeg = cardDeg[i]
+  let order
+  if (maxCardDeg <= 10000) {
+    const bucket = new Int32Array(maxCardDeg + 1)
+    for (let i = 0; i < n; i++) bucket[cardDeg[i]]++
+    let acc = 0
+    for (let d = maxCardDeg; d >= 0; d--) { const c = bucket[d]; bucket[d] = acc; acc += c } // 起点：度数降序
+    order = new Int32Array(n)
+    for (let i = 0; i < n; i++) order[bucket[cardDeg[i]]++] = i // 同度数内按下标升序（稳定、确定性）
+  } else order = Array.from({ length: n }, (_, i) => i).sort((a, b) => cardDeg[b] - cardDeg[a] || a - b)
+  for (const cl of clusters) if (cl) { cl.sample = []; cl.count = cl.idxs.length }
+  const sampleCap = Math.max(CLUSTER_SAMPLE_TITLES, CLUSTER_SAMPLE_CARDS)
+  for (const i of order) {
+    const cl = clusters[clusterOfIdx[i]]
+    if (cl && cl.sample.length < sampleCap) cl.sample.push(i)
+  }
+  return { clusterOfIdx, clusters, pairs, K, ms: Date.now() - t0 }
+}
+
+function getClusterBase(root, fp, full, clusterBy) {
+  const key = `${root}\u0000${clusterBy}`
+  const hit = clusterCache.get(key)
+  if (hit && hit.fp === fp) return { base: hit.base, cached: true }
+  const base = buildClusterBase(full, clusterBy)
+  clusterCache.set(key, { fp, base })
+  for (const k of clusterCache.keys()) if (clusterCache.size > 8) clusterCache.delete(k)
+  return { base, cached: false }
+}
+
+const clusterLabel = (cl) => (cl.tag ? `# ${cl.tag}` : cl.id === CLUSTER_OTHER_ID ? '其他' : cl.kind)
+
+/** 聚合视图查询：先按 kinds/tags 选卡（focus → 该卡所在簇 + 邻簇），再把簇与聚合边吐出来。不做 limit 截断。 */
+async function clusterQuery(root, o = {}) {
+  const { full, fp } = await getFull(root)
+  const clusterBy = o.clusterBy === 'tag' ? 'tag' : 'kind'
+  const { base, cached } = getClusterBase(root, fp, full, clusterBy)
+  const minWeight = o.minWeight ?? 1
+  const allowedTypes = o.types?.length ? new Set(o.types) : null
+  const tags = o.tags || []
+  const kindSet = new Set([...(o.kind ? [o.kind] : []), ...(o.kinds || [])])
+  const kinds = kindSet.size ? kindSet : null
+
+  let focusIdx = -1
+  if (o.focus) {
+    focusIdx = full.cards.findIndex((c) => c.id === o.focus)
+    if (focusIdx < 0) throw new GraphNotFound('焦点卡片不在知识图谱中（不存在、已删除或在隔离区）')
+  }
+  const keep = (c) => (!kinds || kinds.has(c.kind)) && tags.every((t) => c.tags.includes(t))
+  const counts = new Int32Array(base.clusters.length)
+  const included = new Set()
+  for (let i = 0; i < full.cards.length; i++) {
+    if (!keep(full.cards[i])) continue
+    const ci = base.clusterOfIdx[i]
+    if (ci < 0) continue
+    counts[ci]++
+    included.add(ci)
+  }
+  // focus：只看焦点所在簇 + 一跳邻簇（与卡片视图的邻居展开语义对齐）
+  const K = base.K
+  if (focusIdx >= 0) {
+    const own = base.clusterOfIdx[focusIdx]
+    const around = new Set(own >= 0 ? [own] : [])
+    for (const key of base.pairs.keys()) {
+      const a = Math.floor(key / K)
+      const b = key % K
+      if (a === own) around.add(b); else if (b === own) around.add(a)
+    }
+    for (const ci of [...included]) if (!around.has(ci)) included.delete(ci)
+  }
+
+  // 聚合边：按边类型 / 最小权重重新算权重（base 里按全部类型计过数，这里按过滤条件取舍）
+  const degree = new Int32Array(base.clusters.length)
+  let edges = []
+  for (const [key, pr] of base.pairs) {
+    const a = Math.floor(key / K)
+    const b = key % K
+    if (!included.has(a) || !included.has(b)) continue
+    const byType = { link: 0, tag: 0, similar: 0 }
+    let weight = 0
+    for (const t of EDGE_TYPES) { if (allowedTypes && !allowedTypes.has(t)) continue; byType[t] = pr.byType[t] || 0; weight += byType[t] }
+    if (!weight || weight < minWeight) continue
+    const type = EDGE_TYPES.reduce((best, t) => (byType[t] > (byType[best] || 0) ? t : best), 'link')
+    edges.push({ source: base.clusters[a].id, target: base.clusters[b].id, type, weight, byType })
+    degree[a] += weight
+    degree[b] += weight
+  }
+  // 「其他」与焦点簇即使在去孤立点时也保留
+  const keepEmpty = new Set([base.clusters.findIndex((cl) => cl && cl.id === CLUSTER_OTHER_ID), focusIdx >= 0 ? base.clusterOfIdx[focusIdx] : -1])
+  const chosen = [...included].filter((ci) => base.clusters[ci] && (!o.hideIsolated || degree[ci] > 0 || keepEmpty.has(ci)))
+  const nodes = chosen
+    .map((ci) => ({ ci, cl: base.clusters[ci], count: counts[ci] }))
+    .sort((a, b) => b.count - a.count || (a.cl.id < b.cl.id ? -1 : 1))
+    .map(({ ci, cl, count }) => ({
+      id: cl.id, type: 'cluster', kind: cl.kind, tag: cl.tag || null, label: clusterLabel(cl), count,
+      sampleTitles: cl.sample.slice(0, CLUSTER_SAMPLE_TITLES).map((i) => full.cards[i].title),
+      sampleCards: cl.sample.slice(0, CLUSTER_SAMPLE_CARDS).map((i) => ({ id: full.cards[i].id, title: full.cards[i].title, kind: full.cards[i].kind })),
+      degree: degree[ci],
+    }))
+  const keptIds = new Set(nodes.map((n) => n.id))
+  edges = edges.filter((e) => keptIds.has(e.source) && keptIds.has(e.target))
+  const byKind = {}
+  for (const n of nodes) byKind[n.kind] = (byKind[n.kind] || 0) + n.count
+  const byType = { link: 0, tag: 0, similar: 0 }
+  for (const e of edges) for (const t of EDGE_TYPES) byType[t] += e.byType[t]
+  let matched = 0
+  for (const ci of chosen) matched += counts[ci]
+  return {
+    nodes, edges,
+    truncated: false,
+    stats: {
+      totalCards: full.cards.length, matchedNodes: matched, nodes: nodes.length, edges: edges.length,
+      isolated: nodes.filter((n) => n.degree === 0).length, byKind, byType, limit: null, limitAuto: true, focus: o.focus || null,
+      cached, buildMs: full.buildMs, mode: 'clusters', clusterBy, clusters: nodes.length, aggregateMs: base.ms,
+    },
+  }
 }
 
 export class GraphNotFound extends Error {
@@ -274,13 +663,16 @@ export class GraphNotFound extends Error {
 }
 
 /**
- * @param {object} o { tags?:string[], kind?:string, kinds?:string[], types?:string[], minWeight?:number, focus?:string, depth?:number, hideIsolated?:boolean, limit?:number }
+ * @param {object} o { mode?:'cards'|'clusters', clusterBy?:'kind'|'tag', tags?:string[], kind?:string, kinds?:string[], types?:string[], minWeight?:number, focus?:string, depth?:number, hideIsolated?:boolean, limit?:number }
+ * `mode='clusters'` 进聚合视图（簇节点 + 簇间聚合边，忽略 limit、不截断）；默认 `mode='cards'` 为逐张画卡的原行为。
+ * **异步**：建图分段 await，不会把 hub 的事件循环堵住（缓存命中时只有一次指纹查询）。
  * 处理顺序：kind/kinds/tag 选点 → 按类型/权重选边 → focus 邻域 → 去孤立点 → 按加权度数截断到 limit。
  * kind（单值）与 kinds（多值）都传就取并集。
  * 不带 limit（= 自动上限 GRAPH_AUTO_LIMIT）时 stats.limitAuto = true，前端据此区分“卡片太多自动截断”和“用户选了更小的上限”。
  */
-export function graphQuery(root, o = {}) {
-  const { full, cached } = getFull(root)
+export async function graphQuery(root, o = {}) {
+  if (o.mode === 'clusters') return await clusterQuery(root, o)
+  const { full, cached } = await getFull(root)
   const limitAuto = o.limit === undefined || o.limit === null
   const limit = limitAuto ? GRAPH_AUTO_LIMIT : o.limit
   const minWeight = o.minWeight ?? 1
@@ -348,10 +740,10 @@ export function graphQuery(root, o = {}) {
     stats: {
       totalCards: full.cards.length, matchedNodes: totalNodes, nodes: nodes.length, edges: edges.length,
       isolated: nodes.filter((n) => n.degree === 0).length, byKind, byType, limit, limitAuto, focus: o.focus || null,
-      cached, buildMs: full.buildMs,
+      cached, buildMs: full.buildMs, mode: 'cards', clusterBy: null,
     },
   }
 }
 
 /** 测试用：清缓存。 */
-export function resetGraphCache() { cache.clear() }
+export function resetGraphCache() { cache.clear(); clusterCache.clear() }
