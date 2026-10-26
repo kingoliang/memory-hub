@@ -92,7 +92,7 @@ export default async function render(ctx) {
       h('ul', null, g.members.map((m) => h('li', null, [badge('同主题', 'accent'), cardLink(m.path, m.title || m.path), h('span', { class: 'sub' }, ` 得分 ${m.score} · 标题 ${m.titleSim} · 正文 ${m.bodySim} · 标签 ${m.tagSim} · 实体 ${m.entitySim}`)]))),
     ])), more('topics', topics.length)], { tone: 'accent', sub: '只报告；勾选可选批次「合并同主题组」才合并' }),
     section('周期性快照序列', c.snapshotSeries ?? 0, [snapshots.map((g) => h('div', { class: 'dup-group' }, [
-      h('div', { class: 'dup-keep' }, [badge(g.timeline.existing ? '已有时间线卡' : '时间线卡', 'ok'), cardLink(g.timeline.path, g.timeline.title), h('span', { class: 'sub' }, ` ${g.count} 张 · ${String(g.first || '').slice(0, 10)} ~ ${String(g.last || '').slice(0, 10)}`)]),
+      h('div', { class: 'dup-keep' }, [badge(g.timeline.existing ? '已有时间线卡' : '时间线卡', 'ok'), cardLink(g.timeline.path, g.timeline.title), h('span', { class: 'sub' }, ` ${g.day || '（不按日期分段）'} · ${g.count} 张 · ${String(g.first || '').slice(0, 10)} ~ ${String(g.last || '').slice(0, 10)}`)]),
       h('ul', null, g.members.map((m) => h('li', null, [cardLink(m.path, m.title || m.path)]))),
     ])), more('snapshots', snapshots.length)], { tone: 'accent', sub: '只报告；勾选可选批次「快照归入时间线卡」才归并' }),
     section('标签归一', c.tagChanges, [

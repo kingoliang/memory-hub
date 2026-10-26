@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// memory-hub 每日整理（保守版）：备份 → lint/plan → 应用高置信可逆批次（merge + tags）→ 写报告。
+// memory-hub 每日整理（保守版）：备份 → lint/plan → 应用高置信可逆批次（merge + tags + 快照归入时间线卡）→ 写报告。
 // 直接调用同一代码目录里的 src/core/tidy.js（与管理台"整理中心"同一份实现：先 VACUUM INTO 备份、
 // 批次事务 + 自检、只软删、写回滚文件），不经 MCP，因此不需要 exposeTidyApply，也不需要令牌。
 // 代码与脚本同属一个目录树（按本文件位置解析 ../src/core），部署时随代码一起升级，接口不会错配。
@@ -8,12 +8,14 @@
 //   --home DIR          数据目录（含 memory-eternal.db）。缺省取 MEMORY_HUB_HOME
 //   --report-dir DIR    报告目录，缺省 <home>/tidy-reports
 //   --threshold N       近重复合并阈值，缺省 0.85（TIDY_THRESHOLD）
-//   --max-delete N      单次最多软删张数，缺省 10（TIDY_MAX_DELETE）
-//   --batches a,b       自动应用的批次，缺省 merge,tags（TIDY_AUTO_BATCHES）；可选 merge/tags/topics/snapshots，noise 永远只进报告
+//   --max-delete N      单次最多软删张数，缺省 10（TIDY_MAX_DELETE）；快照批次会把上限抬到本次计划数
+//   --max-snapshots N   单次最多处理几个快照序列，缺省 20（TIDY_MAX_SNAPSHOTS）
+//   --batches a,b       自动应用的批次，缺省 merge,tags,snapshots（TIDY_AUTO_BATCHES）；可选 merge/tags/topics/snapshots，noise 永远只进报告
 //   --help
 // 退出码：0 正常；1 整理失败/应用失败；2 参数错误。
 //
-// 自动应用：merge（近重复合并，高阈值，保留卡并入独特行，被吸收卡软删）、tags（标签规整，写回滚文件）
+// 自动应用：merge（近重复合并，高阈值，保留卡并入独特行，被吸收卡软删）、tags（标签规整，写回滚文件）、
+// snapshots（周期性快照按标题前缀 + 日期归入时间线卡，只软删，可回滚）
 // 只进报告：noise（启发式噪声卡）、kind 错放、密钥疑似、超大 raw 卡、低于自动阈值的重复组
 import fs from 'node:fs'
 import path from 'node:path'
@@ -22,13 +24,13 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 const CODE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const imp = (f) => import(pathToFileURL(path.join(CODE_ROOT, 'src/core', f)).href)
 
-const HELP = fs.readFileSync(fileURLToPath(import.meta.url), 'utf8').split('\n').slice(1, 16).map((l) => l.replace(/^\/\/ ?/, '')).join('\n')
+const HELP = fs.readFileSync(fileURLToPath(import.meta.url), 'utf8').split('\n').slice(1, 18).map((l) => l.replace(/^\/\/ ?/, '')).join('\n')
 
 const num = (v, d) => { const n = Number(v); return v !== undefined && v !== '' && Number.isFinite(n) ? n : d }
 
 /** 解析参数 + 环境变量。出错返回 { error }。 */
 export function parseArgs(argv, env = process.env) {
-  const o = { apply: false, home: env.MEMORY_HUB_HOME, reportDir: '', threshold: num(env.TIDY_THRESHOLD, 0.85), maxDelete: Math.floor(num(env.TIDY_MAX_DELETE, 10)), batches: (env.TIDY_AUTO_BATCHES || 'merge,tags'), help: false }
+  const o = { apply: false, home: env.MEMORY_HUB_HOME, reportDir: '', threshold: num(env.TIDY_THRESHOLD, 0.85), maxDelete: Math.floor(num(env.TIDY_MAX_DELETE, 10)), maxSnapshots: Math.floor(num(env.TIDY_MAX_SNAPSHOTS, 20)), batches: (env.TIDY_AUTO_BATCHES || 'merge,tags,snapshots'), help: false }
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
     const val = () => { const v = argv[++i]; if (v === undefined) throw new Error(`${a} 需要参数`); return v }
@@ -38,12 +40,14 @@ export function parseArgs(argv, env = process.env) {
     else if (a === '--report-dir') o.reportDir = val()
     else if (a === '--threshold') o.threshold = num(val(), NaN)
     else if (a === '--max-delete') o.maxDelete = Math.floor(num(val(), NaN))
+    else if (a === '--max-snapshots') o.maxSnapshots = Math.floor(num(val(), NaN))
     else if (a === '--batches') o.batches = val()
     else if (a === '--help' || a === '-h') o.help = true
     else return { error: `未知参数：${a}` }
   }
   if (!Number.isFinite(o.threshold) || o.threshold <= 0 || o.threshold > 1) return { error: `--threshold 必须在 (0,1]：${o.threshold}` }
   if (!Number.isFinite(o.maxDelete) || o.maxDelete < 0) return { error: `--max-delete 必须是非负整数` }
+  if (!Number.isFinite(o.maxSnapshots) || o.maxSnapshots < 0) return { error: `--max-snapshots 必须是非负整数` }
   o.batches = String(o.batches).split(',').map((s) => s.trim()).filter(Boolean)
   return o
 }
@@ -62,6 +66,7 @@ export async function runTidyDaily(o, { stderr = (s) => process.stderr.write(s),
   const { writeLog } = await imp('writelog.js')
   const THRESHOLD = o.threshold
   const MAX_DELETE = o.maxDelete
+  const MAX_SNAPSHOTS = o.maxSnapshots
   const AUTO = o.batches
   const allowed = T.ALL_TIDY_BATCHES || T.TIDY_BATCHES // topics / snapshots 属可选批次，显式传入才跑
   for (const b of AUTO) if (!allowed.includes(b) || b === 'noise') { stderr(`不允许自动批次：${b}（可选 ${allowed.filter((x) => x !== 'noise').join('/')}；noise 只进报告）\n`); return 2 }
@@ -93,7 +98,7 @@ export async function runTidyDaily(o, { stderr = (s) => process.stderr.write(s),
     }
 
     // 2. lint + plan
-    const opts = { threshold: THRESHOLD, maxDelete: MAX_DELETE, logger: () => {} }
+    let opts = { threshold: THRESHOLD, maxDelete: MAX_DELETE, snapshotMaxSeries: MAX_SNAPSHOTS, logger: () => {} }
     const lint = await T.tidyLint(root, opts)
     const plan = await T.tidyPlan(root, opts)
     const lowPlan = THRESHOLD > 0.62 ? await T.tidyPlan(root, { ...opts, threshold: 0.62, sections: ['duplicates'] }) : plan
@@ -101,7 +106,16 @@ export async function runTidyDaily(o, { stderr = (s) => process.stderr.write(s),
     const autoDupAbsorb = autoDup.reduce((n, g) => n + g.absorbs.length, 0)
 
     // 3. dry-run 预览（取 planId）
-    const preview = await T.tidyApply(root, { ...opts, batches: AUTO })
+    let preview = await T.tidyApply(root, { ...opts, batches: AUTO })
+    // 快照批次一轮会软删较多张（序列 x 上限），maxDelete 是防意外的刮子而不是目标：
+    // 只在确实是快照把计划顶上去时把上限抬到本次计划数，并在报告里写明。
+    let maxDeleteRaised = 0
+    if (preview.code === 'max_delete_exceeded' && preview.plannedDeletes > MAX_DELETE) {
+      maxDeleteRaised = preview.plannedDeletes
+      opts = { ...opts, maxDelete: maxDeleteRaised }
+      log('WARN', `计划软删 ${preview.plannedDeletes} 张超过 maxDelete=${MAX_DELETE}，本次把上限抬到 ${maxDeleteRaised}`)
+      preview = await T.tidyApply(root, { ...opts, batches: AUTO })
+    }
     log('INFO', `plan=${preview.planId} 自动批次=${AUTO.join(',')} 预计软删=${preview.plannedDeletes} ok=${preview.ok} code=${preview.code || ''}`)
 
     // 4. 真正应用（仅 --apply 且预览 ok）
@@ -124,7 +138,7 @@ export async function runTidyDaily(o, { stderr = (s) => process.stderr.write(s),
     L(`- 生成时间：${now.toISOString()}（服务器时区 UTC）`)
     L(`- 模式：**${apply ? 'APPLY（已应用自动批次）' : 'DRY-RUN（未改库）'}**`)
     L(`- 库：${root}（卡片 ${lint.total} 张，回收站 ${lint.quarantine.deleted}，待审 ${lint.quarantine.pending}，integrity=${lint.integrity}）`)
-    L(`- 参数：自动批次=${AUTO.join('+')}，合并阈值=${THRESHOLD}，maxDelete=${MAX_DELETE}，planId=${preview.planId}`)
+    L(`- 参数：自动批次=${AUTO.join('+')}，合并阈值=${THRESHOLD}，maxDelete=${maxDeleteRaised || MAX_DELETE}${maxDeleteRaised ? `（已从 ${MAX_DELETE} 抬高）` : ''}，maxSnapshots=${MAX_SNAPSHOTS}，planId=${preview.planId}`)
     if (backupFile) L(`- 备份：${backupFile}`)
     L()
     L('## 一、自动批次（高置信、可逆）')
@@ -138,9 +152,14 @@ export async function runTidyDaily(o, { stderr = (s) => process.stderr.write(s),
     L(`### 标签规整：${plan.tags.changes.length} 张卡将改动；标签种类 ${plan.tags.distinctBefore} → ${plan.tags.distinctAfter}`)
     for (const [k, v] of Object.entries(plan.tags.map || {}).slice(0, 20)) L(`- ${t40(k)} → ${t40(Array.isArray(v) ? v.join(',') : v)}`)
     L()
-    L(`### 可选批次（默认不执行，需显式 --batches）：同主题组 ${plan.topics.length} 组 / 快照序列 ${plan.snapshots.length} 个`)
+    L(`### 周期性快照归入时间线卡：${plan.snapshots.length} 个序列 / 将软删 ${plan.snapshots.reduce((n, g) => n + g.members.filter((m) => m.path !== g.timeline.path).length, 0)} 张（本次最多处理 ${MAX_SNAPSHOTS} 个序列）`)
+    for (const sn of plan.snapshots.slice(0, 20)) {
+      L(`- 序列「${t40(sn.stem)}」${sn.day ? ` ${sn.day}` : ''}：${sn.count} 张（${String(sn.first).slice(0, 10)} ~ ${String(sn.last).slice(0, 10)}）→ ${sn.timeline.existing ? '追加到已有时间线卡' : '时间线卡'} ${t40(sn.timeline.path)}`)
+    }
+    if (plan.snapshots.length > 20) L(`- … 另有 ${plan.snapshots.length - 20} 个序列`)
+    L()
+    L(`### 其他可选批次（默认不执行，需显式 --batches）：同主题组 ${plan.topics.length} 组`)
     for (const g of plan.topics.slice(0, 15)) L(`- 同主题：保留「${t40(g.canonical.title)}」 ← ${g.members.length} 张（如「${t40(g.members[0]?.title)}」）`)
-    for (const sn of plan.snapshots.slice(0, 10)) L(`- 快照：${t40(sn.stem)} × ${sn.count} 张（${String(sn.first).slice(0, 10)} ~ ${String(sn.last).slice(0, 10)}）`)
     L()
     if (apply) {
       L('### 应用结果')

@@ -37,6 +37,13 @@ const tidyCommon = {
   synonyms: synonyms.describe('自定义标签同义映射，如 {"k8s":"kubernetes"}'),
 }
 
+/** 快照序列参数（plan / apply 共用，两边得一致才对得上 planId）。 */
+const snapshotCommon = {
+  snapshotMaxPoints: num('单个快照序列最多并入多少张（更旧的留在原处），默认 40'),
+  snapshotMinAgeHours: num('快照序列里最新一张至少多少小时前才出建议，默认 24；0 = 不卡'),
+  snapshotMaxSeries: num('本次最多处理几个快照序列，默认 0 = 不限'),
+}
+
 /** 工具定义。handler(args, ctx) 返回 MCP CallToolResult；ctx = { root, identity, config, llm, log }。 */
 export const TOOL_DEFS = [
   {
@@ -203,7 +210,7 @@ export const TOOL_DEFS = [
       '只读：扫描记忆库并产出「整理计划」，不改任何数据。包含：噪声卡（定时提醒批次/超时通知/无信息碎片，仅 raw 原文卡）、' +
       '近似重复组（保留最长卡、独特行并入）、同主题组（标题+正文+标签+实体多信号）、周期性快照序列（建议归入时间线卡）、标签归一映射、kind 与路径前缀不一致的卡、明文密钥疑似卡（只给卡路径与命中类型，绝不返回值）、超大 raw 卡。' +
       '返回 planId，可在 memory_tidy_apply 里带上以确保执行的正是这份计划。发现问题请提醒用户，执行由用户在管理界面/CLI 完成。',
-    shape: { ...tidyCommon, limit: num('每类最多列出多少项，默认 15') },
+    shape: { ...tidyCommon, ...snapshotCommon, limit: num('每类最多列出多少项，默认 15') },
     async handler(args, ctx) {
       await ensureVault(ctx.root)
       const plan = await tidyPlan(ctx.root, tidyArgs(args, ctx))
@@ -223,6 +230,7 @@ export const TOOL_DEFS = [
       planId: z.string().max(200).optional().describe('memory_tidy_plan 返回的 planId；库在 plan 之后变化则拒绝执行'),
       batches: z.array(z.enum(['noise', 'merge', 'tags', 'topics', 'snapshots'])).optional().describe('要执行的批次：noise / merge / tags 为默认（按此顺序）；topics（同主题合并）与 snapshots（快照归入时间线卡）是可选批次，只有显式列出才执行'),
       ...tidyCommon,
+      ...snapshotCommon,
       maxDelete: num('单次最多软删张数的保险，默认 50；计划超限则拒绝执行'),
     },
     async handler(args, ctx) {
@@ -294,7 +302,7 @@ function result(text, isError = false) {
 }
 
 function tidyArgs(args, ctx) {
-  return { threshold: args.threshold, maxTags: args.maxTags, rawMaxChars: args.rawMaxChars, noiseCategories: args.noiseCategories, synonyms: args.synonyms, logger: (level, msg) => ctx.log[String(level).toLowerCase() === 'error' ? 'error' : 'info']('tidy ' + msg) }
+  return { threshold: args.threshold, maxTags: args.maxTags, rawMaxChars: args.rawMaxChars, noiseCategories: args.noiseCategories, synonyms: args.synonyms, snapshotMaxPoints: args.snapshotMaxPoints, snapshotMinAgeHours: args.snapshotMinAgeHours, snapshotMaxSeries: args.snapshotMaxSeries, logger: (level, msg) => ctx.log[String(level).toLowerCase() === 'error' ? 'error' : 'info']('tidy ' + msg) }
 }
 
 /** capture 结果 → write_log 的 action / outcome / card_path。 */

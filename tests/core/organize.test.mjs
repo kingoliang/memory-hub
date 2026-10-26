@@ -90,8 +90,8 @@ test('planTopicGroups：确定性；不跨 kind；exclude 生效；保留最长'
   assert.equal(planTopicGroups(cards, { exclude: new Set(['a.md']) }).length, 0)
 })
 
-test('planSnapshotSeries：同主干 + 时间戳且 ≥ minSeries 才成序列；已有时间线卡 1 张也归入', () => {
-  const mk = (id, title, kind = 'project') => ({ id, path: `${id}.md`, kind, title, body: cjk(50), tags: [], createdAt: `2026-10-${10 + id}` })
+test('planSnapshotSeries：同前缀 + 时间戳且 ≥ minSeries 才成序列；已有时间线卡 1 张也追加', () => {
+  const mk = (id, title, kind = 'project', tags = ['巡检']) => ({ id, path: `${id}.md`, kind, title, body: cjk(50), tags, createdAt: `2026-10-${10 + id}` })
   const cards = [mk(1, '巡检 2026-10-11'), mk(2, '巡检 2026-10-12'), mk(3, '巡检 2026-10-13'), mk(4, '日报 2026-10-11'), mk(5, '日报 2026-10-12')]
   const s = planSnapshotSeries(cards)
   assert.equal(s.length, 1)
@@ -287,8 +287,8 @@ test('可选批次 snapshots：归入时间线卡（改标题 + 时间线小节�
   for (const p of sn.slice(0, -1)) assert.ok(rows[0].body.includes(`### 值班巡检快照 ${p.slice(-13, -3)}`), p)
   const again = await tidyPlan(root, quiet)
   assert.equal(again.snapshots.length, 0, '归并后再 plan 没有新的快照建议')
-  // 新快照进来：归入已有时间线卡
-  insertCard(db, { path: '02-Projects/oncall-2026-10-20.md', kind: 'project', title: '值班巡检快照 2026-10-20 09:00', tags: ['oncall'], body: cjk(100) })
+  // 新快照进来：归入已有时间线卡（插入时间往前放，避开 24 小时新鲜度门槛）
+  insertCard(db, { path: '02-Projects/oncall-2026-10-20.md', kind: 'project', title: '值班巡检快照 2026-10-20 09:00', tags: ['oncall'], body: cjk(100), updatedAt: '2026-10-20T09:00:00.000Z' })
   const p3 = await tidyPlan(root, quiet)
   assert.equal(p3.snapshots.length, 1)
   assert.equal(p3.snapshots[0].timeline.existing, true)
