@@ -4,7 +4,7 @@ import { test, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { existsSync } from 'node:fs'
 import { closeAllDb, insertCard, cjk, tmpDir, fingerprint } from './tidy-fixture.mjs'
-import { ensureVault } from '../../src/core/vault.js'
+import { ensureVault, search } from '../../src/core/vault.js'
 import { getDb } from '../../src/core/db.js'
 import { tidyPlan, tidyApply, tidyRollback } from '../../src/core/tidy.js'
 import {
@@ -81,7 +81,9 @@ test('snapshotSeriesKey：分隔符残渣（– / ~ / /）归一到同一个 key
   assert.equal(snapshotSeriesKey('COMBO 值班/UAE'), 'combo 值班')
   assert.equal(snapshotSeriesKey('COMBO 值班 UAE'), 'combo 值班', '没有残渣的写法同键')
   assert.equal(snapshotSeriesKey('Combo  值班\u3000UAE extra'), 'combo 值班', 'NFKC + 小写 + 折叠空白 + 只取前 2 个词')
-  assert.equal(snapshotSeriesKey('3.5 巡检 记录'), '巡检 记录', '纯数字词不算，避免落到「3 5」')
+  assert.equal(snapshotSeriesKey('3.5 巡检 记录'), '巡检', '纯数字词不算，尾部通用词「记录」也不进身份')
+  assert.equal(snapshotSeriesKey('COMBO 值班快照'), 'combo 值班', '尾部通用词「快照」不进身份')
+  assert.equal(snapshotSeriesKey('COMBO 值班快照'), snapshotSeriesKey('COMBO 值班 UAE'), '早期快照写法与普通写法同键')
   assert.equal(snapshotSeriesKey(''), '')
   // 前 2 个词不同就是两个序列
   assert.notEqual(snapshotSeriesKey('COMBO 网格 UAE'), snapshotSeriesKey('COMBO 值班 UAE'))
@@ -140,33 +142,75 @@ test('同一个前缀内也要证据：标签 / 实体都不共享时按正文�
     mk(3, '巡检 2026-10-16 11:00', { tags: [], body: bodyA + cjk(20) }),
   ]
   assert.equal(planSnapshotSeries(plain, { now: NOW }).length, 1)
-  // 正文也完全不同 → 一组都成不了
+  // 正文也完全不同 → 不合并；同一天的三张各自成一张单卡序列（日期已写进标题，不会跨天）
   const disjoint = plain.map((c, i) => ({ ...c, body: `# 巡检\n\n${'别的内容'.repeat(20)}${cjk(200)}${i}` }))
-  assert.equal(planSnapshotSeries(disjoint, { now: NOW }).length, 0)
+  const dj = planSnapshotSeries(disjoint, { now: NOW })
+  assert.equal(dj.length, 3)
+  assert.deepEqual(dj.map((s) => s.count), [1, 1, 1])
+  for (const s of dj) assert.equal(s.timeline.newTitle, '巡检 2026-10-16（时间线）')
 })
 
-test('没有日期退化成单段；一天不到 minSeries 张的稀疏日并进不带日期的段', () => {
+test('没有日期退化成单段；有日期的卡一律按天分段（GH #19）', () => {
   const cards = [mk(1, '巡检 #1', { tags: ['oncall'] }), mk(2, '巡检 #2', { tags: ['oncall'] }), mk(3, '巡检 #3', { tags: ['oncall'] })]
   const s = planSnapshotSeries(cards, { now: NOW })
   assert.equal(s.length, 1)
   assert.equal(s[0].day, '')
   assert.equal(s[0].timeline.newTitle, '巡检（时间线）')
+  assert.equal(planSnapshotSeries(cards.slice(0, 2), { now: NOW }).length, 0, '无日期仍守 minSeries')
 
-  // 一天一张：4 天各 1 张 → 归成一段，否则一天一张的日常快照会被拆成每张一卡
+  // 一天一张：4 天各 1 张 → 4 张，每张带日期（不再合成跨天的无日期卡）
   const daily = [1, 2, 3, 4].map((i) => mk(i, `值班巡检快照 2026-10-${10 + i} 09:00`, { tags: ['oncall'] }))
   const d = planSnapshotSeries(daily, { now: NOW })
-  assert.equal(d.length, 1)
-  assert.equal(d[0].day, '')
-  assert.equal(d[0].count, 4)
+  assert.equal(d.length, 4)
+  assert.deepEqual(d.map((s) => s.day), ['2026-10-11', '2026-10-12', '2026-10-13', '2026-10-14'])
+  for (const x of d) assert.match(x.timeline.newTitle, /2026-10-\d{2}（时间线）$/)
 
-  // 够 minSeries 张的日期单独成段；不够的稀疏日归到不带日期的段
+  // 4 张的一天 + 只有 1 张的另一天：两天都各自成段，1 张那天不再并入前一天
   const mixed = [
     ...[1, 2, 3, 4].map((i) => mk(i, `值班巡检快照 2026-10-16 0${i}:00`, { tags: ['oncall'] })),
     mk(5, '值班巡检快照 2026-10-17 09:00', { tags: ['oncall'] }),
   ]
-  assert.deepEqual(planSnapshotSeries(mixed, { now: NOW }).map((s) => s.day), ['2026-10-16'], '另 1 张单独成不了段的先不动')
-  const mixed2 = mixed.concat([2, 3].map((i) => mk(5 + i, `值班巡检快照 2026-10-17 1${i}:00`, { tags: ['oncall'] })))
-  assert.deepEqual(planSnapshotSeries(mixed2, { now: NOW }).map((s) => s.day), ['2026-10-16', '2026-10-17'])
+  assert.deepEqual(planSnapshotSeries(mixed, { now: NOW }).map((s) => s.day), ['2026-10-16', '2026-10-17'], '稀疏日也单独成段')
+})
+
+test('GH #19：早期「快照：MM-DD」与「值班 MM-DD」必须分成两天，标题各带日期、stem 去掉「快照」', () => {
+  const body = `# 快照\n\nCOMBO 值班 UAE 记录：${cjk(80)}`
+  const cards = [
+    mk(1, 'COMBO 值班快照：10-14 17:38 UAE 持仓与场线状态', { tags: ['combo'], body }),
+    mk(2, 'COMBO 值班 10-15 09:12 UAE：横盘，NEAR 补回', { tags: ['combo'], body }),
+  ]
+  const s = planSnapshotSeries(cards, { now: NOW })
+  assert.deepEqual(s.map((x) => x.day), ['10-14', '10-15'], '两天各自成序列，即使每天只有 1 张')
+  assert.equal(s[0].stem, 'COMBO 值班', '展示 stem 去掉尾部通用词「快照」')
+  assert.deepEqual(s.map((x) => x.timeline.newTitle), [
+    'COMBO 值班 10-14（时间线）',
+    'COMBO 值班 10-15（时间线）',
+  ])
+  for (const x of s) assert.match(x.timeline.newTitle, /10-1[45]（时间线）$/, '两张标题都带日期')
+})
+
+test('GH #19：同一天混用 10-14 / 2026-10-14 先归一计数，再分段，不会被拆散也不会落成无日期段', () => {
+  const body = `# 快照\n\nCOMBO 值班 UAE 记录：${cjk(80)}`
+  const cards = [
+    mk(1, 'COMBO 值班 10-14 15:08 UAE：巡检', { tags: ['combo'], body }),
+    mk(2, 'COMBO 值班快照：10-14 17:38 UAE：持仓', { tags: ['combo'], body }),
+    mk(3, 'COMBO 值班 2026-10-14 19:38 UAE：观察', { tags: ['combo'], body }),
+  ]
+  const s = planSnapshotSeries(cards, { now: NOW })
+  assert.equal(s.length, 1)
+  assert.equal(s[0].day, '2026-10-14')
+  assert.equal(s[0].count, 3)
+  assert.equal(s[0].timeline.newTitle, 'COMBO 值班 UAE 2026-10-14（时间线）')
+})
+
+test('GH #19：桶内只剩一天时，已有的无日期时间线卡补上日期而不是继续无日期', () => {
+  const body = `# 快照\n\nCOMBO 值班 UAE 记录：${cjk(80)}`
+  const timeline = mk(1, 'COMBO 值班 – UAE（时间线）', { tags: ['combo'], body, at: '2026-10-14T23:00:00.000Z' })
+  const extra = mk(2, 'COMBO 值班快照：10-14 17:38 UAE：持仓', { tags: ['combo'], body, at: '2026-10-14T17:38:00.000Z' })
+  const s = planSnapshotSeries([timeline, extra], { now: NOW })
+  assert.equal(s.length, 1)
+  assert.equal(s[0].timeline.existing, true)
+  assert.equal(s[0].timeline.newTitle, 'COMBO 值班 10-14（时间线）')
 })
 
 test('同一批次出现三种分隔符残渣写法 → 只出 1 个序列、1 张时间线卡', () => {
@@ -212,6 +256,49 @@ test('已有时间线卡是别的残渣写法时照样追加，不新建重复�
   assert.equal(s[0].timeline.path, timeline.path)
   assert.equal(s[0].timeline.newTitle, 'COMBO 值班 ~ UAE 10-16（时间线）', '已有卡标题不动')
   assert.deepEqual(s[0].members.map((m) => m.id), [2])
+})
+
+// ---------------------------------------------------------------------------
+// 生产形态复现：15 张早期混写标题（GH #19）
+// ---------------------------------------------------------------------------
+
+const EARLY_TITLES = [
+  ['10-14', 'COMBO 值班：2026-10-14 14:08 UAE 班次快照'],
+  ['10-14', 'COMBO 值班 10-14 15:08 UAE 巡检快照（178.75U 双多仓窄幅对冲）'],
+  ['10-14', 'COMBO 值班快照：10-14 17:38 UAE 持仓与场线状态'],
+  ['10-14', 'COMBO 值班 10-14 18:38 UAE 实盘快照：SUI 逼近离场线'],
+  ['10-14', 'COMBO 值班 10-14 21:38 UAE 持仓快照：NEAR 首破 −10% 浮亏'],
+  ['10-14', 'COMBO 值班 10-14 夜班持仓与决策点观察'],
+  ['10-15', 'COMBO 值班 10-15 00:38 UAE 班次：横盘微跌持仓快照'],
+  ['10-15', 'COMBO 值班 10-15 02:08 UAE 班次快照'],
+  ['10-15', 'COMBO 值班：SUI 场线收窄至 −4.8% 的临界观察（10-15 02:38 UAE）'],
+  ['10-15', 'COMBO 值班：10-15 04:08 主信号班无动作与双通道兜底再验证'],
+  ['10-15', 'COMBO 值班 2026-10-15 05:38 UAE 横盘班次快照'],
+  ['10-15', 'COMBO 值班：10-15 弱势延续与"浮亏≠已实现损失"认知'],
+  ['10-15', 'COMBO 值班：放量后波动特征与 SUI 场线拉锯观察（10-15 10:38 UAE）'],
+  ['10-15', 'COMBO 值班：SUI 第三次贴场线，破位即清仓（10-15 14:38 UAE）'],
+  ['10-15', 'COMBO 值班 10-15 22:08 UAE：账户回血转正、敞口放大后最坏情景升至 −6U'],
+]
+
+test('生产形态：15 张混写标题重建后 = 2 张带日期时间线卡，15 个 ### 原标题不丢，recall 首条是 10-15', async () => {
+  const { root, db } = await freshVault()
+  for (const [i, [day, title]] of EARLY_TITLES.entries()) {
+    insertCard(db, {
+      path: `02-Projects/early-${i}.md`, kind: 'project', title, tags: ['combo'],
+      body: `# 快照\n\n${day} 第 ${i} 条独有内容：${cjk(40)}`, updatedAt: `${day === '10-14' ? '2026-10-14' : '2026-10-15'}T${String(i % 24).padStart(2, '0')}:00:00.000Z`,
+    })
+  }
+  const plan = await tidyPlan(root, quiet)
+  assert.equal(plan.snapshots.length, 2, '两天两个序列')
+  const res = await tidyApply(root, { ...quiet, confirm: true, planId: plan.planId, batches: ['snapshots'] })
+  assert.equal(res.ok, true, JSON.stringify(res.batches))
+  const timelines = db.prepare("SELECT path, title, body FROM cards WHERE title LIKE '%（时间线）'").all()
+  assert.equal(timelines.length, 2, '时间线卡张数 = 序列数')
+  assert.ok(timelines.every((t) => /10-1[45]（时间线）$/.test(t.title)), '每张标题带日期，无一张跨天')
+  const headings = timelines.flatMap((t) => t.body.match(/^### .+$/gm) || [])
+  assert.equal(headings.length, EARLY_TITLES.length, '### 原标题数量 = 被并入数，内容不丢')
+  const hits = await search(root, '10-15 COMBO 值班 快照', { limit: 5 })
+  assert.match(hits[0].title, /10-15（时间线）$/, 'recall 首条是 10-15 那张')
 })
 
 // ---------------------------------------------------------------------------
@@ -277,15 +364,15 @@ test('snapshots 批次：连跑两次幂等，已有时间线卡时新卡追加�
   assert.equal(second.batches[0].counts.removed, 0)
   assert.deepEqual(fingerprint(db), afterFirst)
 
-  // 新快照插进已有序列（时间往前放到 24 小时以前）→ 直接追加到已有时间线卡
+  // 新快照插进已有序列的同一天（时间往前放到 24 小时以前）→ 直接追加到该天的时间线卡
   const fresh = '02-Projects/oncall-new.md'
   const freshBody = '# 快照\n\n补记：本条是新增的补充说明文字，长度够了不会被行过滤掉。'
-  insertCard(db, { path: fresh, kind: 'project', title: 'COMBO 值班 10-19 03:00 UAE：补记', tags: ['combo'], body: freshBody, updatedAt: '2026-10-19T03:00:00.000Z' })
+  insertCard(db, { path: fresh, kind: 'project', title: 'COMBO 值班 10-18 03:00 UAE：补记', tags: ['combo'], body: freshBody, updatedAt: '2026-10-18T03:00:00.000Z' })
   const beforeThird = fingerprint(db)
   const plan3 = await tidyPlan(root, quiet)
   assert.ok(plan3.snapshots.length >= 1)
   const appending = plan3.snapshots.find((s) => s.timeline.existing)
-  assert.ok(appending, '已有时间线卡 → 追加，不新建')
+  assert.ok(appending, '同一天已有时间线卡 → 追加，不新建')
   const keeperPath = appending.timeline.path
   const third = await tidyApply(root, { ...quiet, confirm: true, planId: plan3.planId, batches: ['snapshots'] })
   assert.equal(third.ok, true, JSON.stringify(third.batches))
