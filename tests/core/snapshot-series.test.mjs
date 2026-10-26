@@ -304,6 +304,108 @@ test('snapshots 批次：连跑两次幂等，已有时间线卡时新卡追加�
   assert.deepEqual(strip(fingerprint(db)), strip(beforeThird), '回滚后与追加前完全一致')
 })
 
+// ---------------------------------------------------------------------------
+// 同一天多张时间线卡 + 摘录预算（GH #16）
+// ---------------------------------------------------------------------------
+
+const tlCard = (id, title, { day = '2026-10-16', tags = ['combo'], at, body } = {}) => {
+  const segTitle = `原始快照 ${id}`
+  return {
+    ...mk(id, title, {
+      tags,
+      body: body ?? `# 快照\n\n公共记录 ${cjk(40)}\n## 时间线（周期性快照，按时间排列）\n\n### ${segTitle}\n第 ${id} 段独有内容：${cjk(40)}`,
+      at: at || `${day}T23:00:00.000Z`,
+    }),
+  }
+}
+
+test('同一天多张时间线卡（日期写法不同也算同一天）：只出一组，其余作附加成员一起合回', () => {
+  const cards = [
+    tlCard(1, 'COMBO 值班 UAE 2026-10-16（时间线）'),
+    tlCard(2, 'COMBO 值班 ~ UAE 10-16（时间线）'),
+    tlCard(3, 'COMBO 值班 UAE 2026-10-17（时间线）', { day: '2026-10-17' }),
+  ]
+  const s = planSnapshotSeries(cards, { now: NOW })
+  assert.equal(s.length, 1, '同一天只出一组，不再各留一张')
+  assert.equal(s[0].timeline.path, '02-Projects/snap-1.md', '保留 id 最小的那张做时间线卡')
+  assert.deepEqual(s[0].members.map((m) => m.id), [2], '同一天的另一张时间线卡进 members（会被合过去）')
+  assert.equal(s[0].count, 1, 'count 只数被归入的卡（保留卡本身不算）')
+})
+
+test('同一天多张时间线卡合并：每段都保留 ### 原标题，可逐字回滚', async () => {
+  const { root, db } = await freshVault()
+  const cards = [
+    tlCard(1, 'COMBO 值班 UAE 2026-10-16（时间线）'),
+    tlCard(2, 'COMBO 值班 ~ UAE 10-16（时间线）'),
+  ]
+  for (const c of cards) insertCard(db, { path: c.path, kind: c.kind, title: c.title, tags: c.tags, body: c.body, updatedAt: c.updatedAt })
+  const before = fingerprint(db)
+  const plan = await tidyPlan(root, quiet)
+  assert.equal(plan.snapshots.length, 1)
+  const res = await tidyApply(root, { ...quiet, confirm: true, planId: plan.planId, batches: ['snapshots'] })
+  assert.equal(res.ok, true, JSON.stringify(res.batches))
+  const left = db.prepare("SELECT path, body FROM cards WHERE title LIKE '%（时间线）'").all()
+  assert.equal(left.length, 1, '合回一张')
+  assert.equal(left[0].path, '02-Projects/snap-1.md')
+  assert.ok(left[0].body.includes('### COMBO 值班 ~ UAE 10-16（时间线）'), '被吸收的时间线卡标题保留')
+  assert.ok(left[0].body.includes('### 原始快照 1') && left[0].body.includes('### 原始快照 2'), '两边的段标题都在')
+  assert.ok(left[0].body.includes('第 2 段独有内容'), '被吸收卡的段内容并了进来')
+  const rb = await tidyRollback(root, res.rollbackFile, quiet)
+  assert.equal(rb.ok, true)
+  const strip = (s) => JSON.parse(s).cards.map(({ updated_at: _u, id: _i, ...r }) => r)
+  assert.deepEqual(strip(fingerprint(db)), strip(before), '回滚后逐字还原')
+})
+
+test('时间线摘录预算：默认下限 600 行 / 每张 3 行，张数多时按张数抬总量，单卡另设上限', async () => {
+  const { root, db } = await freshVault()
+  // 一张保留 + 9 张同一天快照，每张 30 条独特行
+  const body = (tag) => `# 快照\n\n${Array.from({ length: 30 }, () => `${tag}：${cjk(30)}`).join('\n')}`
+  for (let i = 0; i < 10; i++) {
+    insertCard(db, { path: `02-Projects/bud-${i}.md`, kind: 'project', title: `COMBO 值班 2026-10-16 1${i}:00 UAE：记录 ${i}`, tags: ['combo'], body: body(`卡${i}`), updatedAt: `2026-10-16T1${i}:00:00.000Z` })
+  }
+  const plan = await tidyPlan(root, quiet)
+  assert.ok(plan.options.timelineLines >= 600, '默认预算提高到 600 行量级')
+  assert.equal(plan.options.timelineLinesPerCard, 3)
+  // 预算 6 行 / 每张 1 行：9 张来源各最多 1 行，总量不超预算
+  const res = await tidyApply(root, { ...quiet, confirm: true, planId: plan.planId, batches: ['snapshots'], timelineLines: 6, timelineLinesPerCard: 1 })
+  assert.equal(res.ok, true, JSON.stringify(res.batches))
+  const kept = db.prepare("SELECT body FROM cards WHERE title LIKE '%（时间线）'").get().body
+  const blocks = kept.slice(kept.indexOf('## 时间线（周期性快照，按时间排列）')).split(/\n### /).slice(1) // 去掉保留卡自己那段
+  const added = blocks.flatMap((b) => b.split('\n').slice(1).filter((l) => l && !l.startsWith('(')))
+  assert.equal(added.length, 9, '按张数均分：9 张来源各留 1 行，共 9 行')
+  assert.equal(blocks.filter((b) => b.includes('(与时间线已有内容一致，无新增)')).length, 0, '预算够时不出现占位')
+})
+
+test('时间线摘录预算：预算耗尽后保留占位行，单卡行数受上限约束', async () => {
+  const { root, db } = await freshVault()
+  const lines = (tag) => `# 快照\n\n${Array.from({ length: 30 }, () => `${tag}：${cjk(30)}`).join('\n')}`
+  for (let i = 0; i < 10; i++) {
+    insertCard(db, { path: `02-Projects/pb-${i}.md`, kind: 'project', title: `COMBO 值班 2026-10-16 1${i}:00 UAE：记录 ${i}`, tags: ['combo'], body: lines(`卡${i}`), updatedAt: `2026-10-16T1${i}:00:00.000Z` })
+  }
+  const plan = await tidyPlan(root, quiet)
+  const res = await tidyApply(root, { ...quiet, confirm: true, planId: plan.planId, batches: ['snapshots'], timelineLines: 2, timelineLinesPerCard: 0 })
+  assert.equal(res.ok, true, JSON.stringify(res.batches))
+  const kept = db.prepare("SELECT body FROM cards WHERE title LIKE '%（时间线）'").get().body
+  const sec = kept.slice(kept.indexOf('## 时间线（周期性快照，按时间排列）'))
+  const blocks = sec.split(/\n### /).slice(2) // 去掉小节标题 + 保留卡自己那段
+  assert.equal(blocks.flatMap((b) => b.split('\n').slice(1).filter((l) => l && !l.startsWith('('))).length, 2, '只留预算允许的 2 行')
+  assert.equal(blocks.filter((b) => b.includes('(与时间线已有内容一致，无新增)')).length, 7, '其余段保留占位行')
+  assert.equal(blocks.length, 9, '每段标题都还在')
+
+  // 单卡上限：预算很大时单张来源也只摘 timelineMaxLinesPerCard 行
+  const { root: r2, db: d2 } = await freshVault()
+  for (let i = 0; i < 3; i++) {
+    insertCard(d2, { path: `02-Projects/cap-${i}.md`, kind: 'project', title: `COMBO 值班 2026-10-16 1${i}:00 UAE：记录 ${i}`, tags: ['combo'], body: lines(`卡${i}`), updatedAt: `2026-10-16T1${i}:00:00.000Z` })
+  }
+  const p2 = await tidyPlan(r2, quiet)
+  const r2res = await tidyApply(r2, { ...quiet, confirm: true, planId: p2.planId, batches: ['snapshots'], timelineMaxLinesPerCard: 5 })
+  assert.equal(r2res.ok, true, JSON.stringify(r2res.batches))
+  const b2 = d2.prepare("SELECT body FROM cards WHERE title LIKE '%（时间线）'").get().body
+  const blocks2 = b2.slice(b2.indexOf('## 时间线（周期性快照，按时间排列）')).split(/\n### /).slice(2)
+  const perCard = blocks2.map((b) => b.split('\n').slice(1).filter((l) => l && !l.startsWith('(')).length)
+  assert.deepEqual(perCard, [5, 5], '每张来源最多 5 行（上限生效，预算没被吃光）')
+})
+
 test('hasTimestamp：前缀抽取用的时间戳判定仍只认日期 / 时间 / 序号', () => {
   assert.ok(hasTimestamp('COMBO 值班 10-17 01:45 UAE：微正'))
   assert.ok(!hasTimestamp('COMBO 值班 SOP'))

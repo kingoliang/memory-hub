@@ -106,6 +106,28 @@ test('--apply：snapshots 在默认批次里，按天归入时间线卡且连跑
   assert.equal(db2.prepare('SELECT title FROM cards WHERE path = ?').get(keep.path).title, keep.title)
 })
 
+test('--apply：显式跑 snapshots,topics 时两者不互相打架（时间线卡按天保留）', async () => {
+  const { root, db } = await buildFixture()
+  // 3 天 x 3 张同前缀快照（一天 ≥ minSeries 才单独成段）：应为 3 张按天的时间线卡，且 topics 不再把它们并成 1 张
+  for (const d of ['10-16', '10-17', '10-18']) {
+    for (let i = 0; i < 3; i++) {
+      insertCard(db, { path: `02-Projects/combo-${d}-${i}.md`, kind: 'project', title: `COMBO 值班 ${d} 0${i}:10 UAE：第 ${i} 班`, tags: ['combo'], body: `# COMBO 值班快照\n\n第 ${i} 班记录，队列 ${i * 7} 条。`, updatedAt: `2026-${d}T0${i}:10:00.000Z` })
+    }
+  }
+  const reportDir = path.join(root, 'out-reports')
+  const { io, buf } = quietIo()
+  const code = await runTidyDaily(parseArgs(['--home', root, '--apply', '--report-dir', reportDir, '--batches', 'snapshots,topics', '--max-delete', '50'], {}), io)
+  assert.equal(code, 0, buf.join(''))
+  const { getDb } = await import('../src/core/db.js')
+  const timelines = getDb(root).prepare("SELECT path, title FROM cards WHERE title LIKE '%（时间线）' ORDER BY path").all()
+  assert.equal(timelines.length, 3, '一天一张：topics 不再把时间线卡并成 1 张')
+  for (const t of timelines) assert.match(t.path, /combo-10-1[678]-/, '每张时间线卡对应各自那天')
+  // 再跑一次：snapshots 判 0 个序列、topics 也无可并，天数不变
+  const code2 = await runTidyDaily(parseArgs(['--home', root, '--apply', '--report-dir', reportDir, '--batches', 'snapshots,topics', '--max-delete', '50'], {}), io)
+  assert.equal(code2, 0, buf.join(''))
+  assert.equal(getDb(root).prepare("SELECT COUNT(*) n FROM cards WHERE title LIKE '%（时间线）'").get().n, 3, '连跑幂等')
+})
+
 test('--apply：快照计划超过 maxDelete 时抬高上限并在报告里写明', async () => {
   const { root, db } = await buildFixture()
   for (let i = 0; i < 6; i++) {
