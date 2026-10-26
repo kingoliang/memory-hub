@@ -8,7 +8,7 @@ import { ensureVault } from '../../src/core/vault.js'
 import { getDb } from '../../src/core/db.js'
 import { tidyPlan, tidyApply, tidyRollback } from '../../src/core/tidy.js'
 import {
-  titleStem, hasTimestamp, snapshotPrefix, snapshotDay, snapshotTimelineTitle, planSnapshotSeries,
+  titleStem, hasTimestamp, snapshotPrefix, snapshotSeriesKey, snapshotDay, snapshotTimelineTitle, planSnapshotSeries,
 } from '../../src/core/topics.js'
 
 after(() => closeAllDb())
@@ -72,6 +72,19 @@ test('snapshotDay：YYYY-MM-DD / YYYYMMDD / MM-DD 归一；无日期返回空', 
   assert.equal(snapshotDay('巡检 回 5.0 上方'), '')
   assert.equal(snapshotTimelineTitle('COMBO 值班 UAE', '2026-10-17'), 'COMBO 值班 UAE 2026-10-17（时间线）')
   assert.equal(snapshotTimelineTitle('巡检', ''), '巡检（时间线）')
+})
+
+test('snapshotSeriesKey：分隔符残渣（– / ~ / /）归一到同一个 key，纯数字词跳过', () => {
+  // stripStamps() 剥时间后残留的分隔符写法：同一批次里三种都可能出现
+  assert.equal(snapshotSeriesKey('COMBO 值班 – UAE'), 'combo 值班')
+  assert.equal(snapshotSeriesKey('COMBO 值班 ~ UAE'), 'combo 值班')
+  assert.equal(snapshotSeriesKey('COMBO 值班/UAE'), 'combo 值班')
+  assert.equal(snapshotSeriesKey('COMBO 值班 UAE'), 'combo 值班', '没有残渣的写法同键')
+  assert.equal(snapshotSeriesKey('Combo  值班\u3000UAE extra'), 'combo 值班', 'NFKC + 小写 + 折叠空白 + 只取前 2 个词')
+  assert.equal(snapshotSeriesKey('3.5 巡检 记录'), '巡检 记录', '纯数字词不算，避免落到「3 5」')
+  assert.equal(snapshotSeriesKey(''), '')
+  // 前 2 个词不同就是两个序列
+  assert.notEqual(snapshotSeriesKey('COMBO 网格 UAE'), snapshotSeriesKey('COMBO 值班 UAE'))
 })
 
 // ---------------------------------------------------------------------------
@@ -154,6 +167,51 @@ test('没有日期退化成单段；一天不到 minSeries 张的稀疏日并进
   assert.deepEqual(planSnapshotSeries(mixed, { now: NOW }).map((s) => s.day), ['2026-10-16'], '另 1 张单独成不了段的先不动')
   const mixed2 = mixed.concat([2, 3].map((i) => mk(5 + i, `值班巡检快照 2026-10-17 1${i}:00`, { tags: ['oncall'] })))
   assert.deepEqual(planSnapshotSeries(mixed2, { now: NOW }).map((s) => s.day), ['2026-10-16', '2026-10-17'])
+})
+
+test('同一批次出现三种分隔符残渣写法 → 只出 1 个序列、1 张时间线卡', () => {
+  const body = `# 快照\n\nCOMBO 值班 UAE NEAR 记录：${cjk(80)}`
+  const cards = [
+    mk(1, 'COMBO 值班 10-21 09:00 – UAE | 成本线下穿，NEAR 减半', { tags: ['combo'], body }),
+    mk(2, 'COMBO 值班 10-21 12:00 ~ UAE | 横盘，NEAR 补回', { tags: ['combo'], body }),
+    mk(3, 'COMBO 值班 10-21 22:00 UAE | 本班收平，SUI 触线', { tags: ['combo'], body }),
+    mk(4, 'COMBO 值班 10-21 23:30 – UAE | 本班补记，焦点 SUI', { tags: ['combo'], body }),
+  ]
+  const s = planSnapshotSeries(cards, { now: NOW })
+  assert.equal(s.length, 1, '同一天只出 1 个序列，不再按残渣劈成 3 个')
+  assert.equal(s[0].count, 4)
+  assert.equal(s[0].day, '10-21')
+  assert.equal(s[0].stem, 'COMBO 值班 – UAE', '展示前缀取桶内最常见写法')
+  assert.equal(s[0].timeline.newTitle, 'COMBO 值班 – UAE 10-21（时间线）')
+  assert.equal(s[0].timeline.existing, false)
+})
+
+test('前 2 个词不同就不并：COMBO 值班 与 COMBO 网格 同一天也各自成序列', () => {
+  const body = `# 快照\n\n同一批记录 ${cjk(60)}`
+  const cards = [
+    mk(1, 'COMBO 值班 10-21 09:00 – UAE | 成本线下穿', { tags: ['combo'], body }),
+    mk(2, 'COMBO 值班 10-21 12:00 – UAE | 横盘', { tags: ['combo'], body }),
+    mk(3, 'COMBO 值班 10-21 22:00 – UAE | 收工', { tags: ['combo'], body }),
+    mk(4, 'COMBO 网格 10-21 09:30 – UAE | 网格下调', { tags: ['combo'], body }),
+    mk(5, 'COMBO 网格 10-21 13:30 – UAE | 网格回调', { tags: ['combo'], body }),
+    mk(6, 'COMBO 网格 10-21 21:30 – UAE | 网格收工', { tags: ['combo'], body }),
+  ]
+  const s = planSnapshotSeries(cards, { now: NOW })
+  assert.deepEqual(s.map((x) => [x.stem, x.count]), [['COMBO 值班 – UAE', 3], ['COMBO 网格 – UAE', 3]])
+})
+
+test('已有时间线卡是别的残渣写法时照样追加，不新建重复时间线卡', () => {
+  const body = `# 快照\n\nCOMBO 值班 UAE 记录：${cjk(80)}`
+  const timeline = {
+    ...mk(1, 'COMBO 值班 ~ UAE 10-16（时间线）', { tags: ['combo'], body, at: '2026-10-16T23:00:00.000Z' }),
+  }
+  const extra = mk(2, 'COMBO 值班 10-16 21:00 – UAE | 本班补记', { tags: ['combo'], body, at: '2026-10-16T21:00:00.000Z' })
+  const s = planSnapshotSeries([timeline, extra], { now: NOW })
+  assert.equal(s.length, 1)
+  assert.equal(s[0].timeline.existing, true, '跨残渣写法认得出同一条时间线')
+  assert.equal(s[0].timeline.path, timeline.path)
+  assert.equal(s[0].timeline.newTitle, 'COMBO 值班 ~ UAE 10-16（时间线）', '已有卡标题不动')
+  assert.deepEqual(s[0].members.map((m) => m.id), [2])
 })
 
 // ---------------------------------------------------------------------------
