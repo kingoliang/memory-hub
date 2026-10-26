@@ -51,7 +51,11 @@ export function timelineTitle(title) {
 // 快照系列前缀 + 日期段（GH #11）
 //
 // 旧实现要求「剥时间戳后的整条标题主干」全等，而真实班次快照标题的尾巴每次都不同，生产库上恒 0 命中。
-// 改为取前缀（第一个分隔符之前）+ 证据 + 日期分段：前缀是系列身份，日期是时间线卡的分段单位。
+// 改为「前缀归一键 + 证据 + 日期分段」：键是系列身份，前缀只用来展示，日期是时间线卡的分段单位。
+//
+// 前缀不能直接当身份：stripStamps() 剥时间后还会残留 `–` / `~` / `/` 之类分隔符，同一批次会写成
+// `COMBO 值班 – UAE | …`、`COMBO 值班 ~ UAE | …`、`COMBO 值班 UAE | …` 三种，按前缀分组就把同一天
+// 劈成三张时间线卡。所以身份用「前缀归一后的前 2 个词」，前缀本身只取桶内最常见的写法做标题。
 // ---------------------------------------------------------------------------
 
 /** 系列前缀的分隔符（取最早出现的一个；全角冒号已由 NFKC 归一成半角）。 */
@@ -60,8 +64,25 @@ const EDGE_RE = /^[\s\-—_:：,，.。·|/]+|[\s\-—_:：,，.。·|/]+$/g
 /** 前缀至少要有一个「非数字词」（2 字以上的字母/汉字），否则纯日期 / 序号就能把全库并成一组。 */
 const WORD_RE = /[^\d\s\p{P}\p{S}]{2,}/u
 
+/** 含非数字字符的「词」（纯数字 / 纯标点不算）。 */
+const WORDLIKE_RE = /[^\d]/u
+/** 系列身份只取前缀的前这么多个词。 */
+const SERIES_KEY_WORDS = 2
+
 /**
- * 快照系列前缀：先剥时间戳，再取第一个分隔符之前的部分。
+ * 快照系列身份 key：前缀归一（NFKC、小写、标点符号一律当分隔、折叠空白）后取前 2 个「词」。
+ * 纯数字词跳过（`3.5 巡检` 这类前缀不能只剩 `3 5`）。同一批次的 `A – B` / `A ~ B` / `A/B` 因此同键。
+ * 不合格返回 ''，该卡就不进快照批次。
+ */
+export function snapshotSeriesKey(prefix) {
+  const words = String(prefix || '').normalize('NFKC').toLowerCase()
+    .replace(/[\p{P}\p{S}]+/gu, ' ').replace(/\s+/g, ' ').trim().split(' ')
+    .filter((w) => w && WORDLIKE_RE.test(w))
+  return words.slice(0, SERIES_KEY_WORDS).join(' ')
+}
+
+/**
+ * 快照系列前缀（展示用）：先剥时间戳，再取第一个分隔符之前的部分。
  * 不合格（空，或剥完只剩日期 / 标点 / 单个字符）返回 ''，该卡就不进快照批次。
  */
 export function snapshotPrefix(title) {
@@ -197,12 +218,25 @@ const snapshotTime = (c) => {
   return Number.isFinite(ms) ? ms : null
 }
 
+/** 桶内展示前缀：出现最多的写法（平手取短的、再取字典序小的），保证结果确定。 */
+function displayPrefix(prefixes) {
+  let best = ''
+  let bestN = -1
+  for (const [prefix, n] of prefixes) {
+    const better = n > bestN || (n === bestN && (prefix.length < best.length
+      || (prefix.length === best.length && prefix < best)))
+    if (better) { best = prefix; bestN = n }
+  }
+  return best
+}
+
 /**
- * 周期性快照序列（GH #11）：同 kind + 同系列前缀 + 同日期段，且要证据佐证。
+ * 周期性快照序列（GH #11）：同 kind + 同系列 key（前缀归一前 2 个词）+ 同日期段，且要证据佐证。
  *
  * 分组不再是「整条标题主干全等」，因为真实快照标题的尾巴每次都不同：
- *   1. 前缀 = 剥掉时间戳后第一个分隔符之前的部分（必须含非数字词）；
- *   2. 同前缀内还要共享实体 / 共享标签（两者都空则要求正文相似度 ≥ 0.15）才算同一系列；
+ *   1. 身份 = 前缀归一后的前 2 个词（前缀 = 剥掉时间戳后第一个分隔符之前的部分，必须含非数字词），
+ *      展示用的前缀取桶内最常见写法 —— 分隔符残渣（`–` / `~` / `/`）不会再把同一天劈开；
+ *   2. 同 key 内还要共享实体 / 共享标签（两者都空则要求正文相似度 ≥ 0.15）才算同一系列；
  *   3. 系列内再按日期（YYYY-MM-DD / MM-DD / YYYYMMDD）分段：一天一张时间线卡，只有 1 张的稀疏日归入不带日期的段（免得一天一张的日常快照被拆成每张一卡）；无日期退化成单段；
  *   4. 单序列最多 maxPoints 张（超出的旧卡留在原处），且最新一张要早于 minAgeHours 才出建议；
  *   5. 已有「（时间线）」卡的序列直接追加（哪怕只有 1 张新卡），保持幂等 + 可回滚。
@@ -210,7 +244,8 @@ const snapshotTime = (c) => {
  * @param cards [{id,path,kind,title,body,tags,createdAt?,updatedAt?}]
  * @param opts {minSeries, maxPoints, minAgeHours, bodyCorroborate, maxSeries, now}
  * @returns [{stem, kind, day, count, first, last, timeline, members:[{id,path,title,createdAt}]}]
- *          按张数降序、前缀与日期字典序；`maxSeries` 只截取最前面这么多个序列。
+ *          `stem` 是展示用前缀（桶内最常见写法）；按张数降序、前缀与日期字典序；
+ *          `maxSeries` 只截取最前面这么多个序列。
  */
 export function planSnapshotSeries(cards, opts = {}) {
   const o = { ...TOPIC_DEFAULTS, ...SNAPSHOT_DEFAULTS, ...opts }
@@ -219,33 +254,40 @@ export function planSnapshotSeries(cards, opts = {}) {
   const minAgeMs = Math.max(0, Number(o.minAgeHours) || 0) * 3_600_000
   const maxSeries = Number(o.maxSeries) > 0 ? Math.floor(Number(o.maxSeries)) : Infinity
 
-  // 时间线卡按 (kind, 前缀) 归位，快照卡按 (kind, 前缀, 日期) 归桶
-  const timelines = new Map() // `${kind}\0${prefix}` -> [{card, day, used}]
-  const groups = new Map() // `${kind}\0${prefix}` -> Map(day -> cards[])
+  // 时间线卡按 (kind, 系列 key) 归位，快照卡按 (kind, 系列 key, 日期) 归桶
+  const timelines = new Map() // `${kind}\0${key}` -> [{card, day, used}]
+  const groups = new Map() // `${kind}\0${key}` -> { prefixes: Map(前缀 -> 次数), byDay: Map(day -> cards[]) }
+  const groupFor = (k) => {
+    let g = groups.get(k)
+    if (!g) { g = { prefixes: new Map(), byDay: new Map() }; groups.set(k, g) }
+    return g
+  }
   for (const c of cards) {
-    if (isTimelineTitle(c.title)) {
-      const prefix = snapshotPrefix(c.title)
-      if (!prefix) continue
-      const k = `${c.kind}\u0000${prefix}`
+    const timeline = isTimelineTitle(c.title)
+    if (!timeline && !hasTimestamp(c.title)) continue
+    const prefix = snapshotPrefix(c.title)
+    if (!prefix) continue
+    const series = snapshotSeriesKey(prefix)
+    if (!series) continue
+    const k = `${c.kind}\u0000${series}`
+    if (timeline) {
       if (!timelines.has(k)) timelines.set(k, [])
       timelines.get(k).push({ card: c, day: snapshotDay(c.title), used: false })
       continue
     }
-    if (!hasTimestamp(c.title)) continue
-    const prefix = snapshotPrefix(c.title)
-    if (!prefix) continue
-    const k = `${c.kind}\u0000${prefix}`
+    const g = groupFor(k)
+    g.prefixes.set(prefix, (g.prefixes.get(prefix) || 0) + 1)
     const day = snapshotDay(c.title)
-    if (!groups.has(k)) groups.set(k, new Map())
-    const byDay = groups.get(k)
-    if (!byDay.has(day)) byDay.set(day, [])
-    byDay.get(day).push(c)
+    if (!g.byDay.has(day)) g.byDay.set(day, [])
+    g.byDay.get(day).push(c)
   }
 
   const out = []
   for (const key of [...groups.keys()].sort()) {
-    const [kind, prefix] = key.split('\u0000')
-    const byDay = groups.get(key)
+    const [kind] = key.split('\u0000')
+    const g = groups.get(key)
+    const { byDay } = g
+    const prefix = displayPrefix(g.prefixes)
     const slots = timelines.get(key) || []
     // 同一天有 minSeries 张以上、或已经有当天时间线卡的日期才单独成段；其余稀疏日归入不带日期的段
     const days = [...byDay.keys()]

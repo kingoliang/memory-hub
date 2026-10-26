@@ -25,12 +25,14 @@ async function addMessyLayer(root) {
     const r = await writeCard(root, { kind: 'project', title: rewrites[i], tags: [i % 2 ? 'modelx' : 'ModelX', '部署'], body: `# ${rewrites[i]}\n\nModelX-7B 在 GPU-A100 上的第 ${i + 1} 次整理。\n${phr[i % phr.length]}\n${phr[(i + 2) % phr.length]}`, source: 'demo', submittedBy: 'demo', status: 'approved' }, { dedup: false })
     paths.push(r.path)
   }
-  // 班次快照：一天几张、标题前缀相同而尾巴不同（真实库的形态）；只用前缀 + 日期才归得出来
+  // 班次快照：一天几张、标题前缀相同而尾巴不同（真实库的形态）；只用前缀 + 日期才归得出来。
+  // 分隔符来回换（` – ` / ` ~ ` / `/` / `:`）：看着像不同前缀，其实是同一序列，靠前缀归一才不拆卡。
+  const SEPS = [' – ', ' ~ ', '/', ': ']
   for (let d = 1; d <= 5; d++) {
     const day = `2026-10-${String(d).padStart(2, '0')}`
-    for (const [h, tail] of [[1, '成本线下穿，仓位减半'], [9, '横盘，网格补回'], [17, '回撤，子仓止损'], [23, '收工，网格全平']]) {
+    for (const [i, [h, tail]] of [[1, '成本线下穿，仓位减半'], [9, '横盘，网格补回'], [17, '回撤，子仓止损'], [23, '收工，网格全平']].entries()) {
       await writeCard(root, {
-        kind: 'project', title: `值班巡检快照 ${day} ${String(h).padStart(2, '0')}:00 UTC: ${tail}，负载 ${d}${h}`,
+        kind: 'project', title: `值班巡检快照 ${day} ${String(h).padStart(2, '0')}:00 UTC${SEPS[i % SEPS.length]}${tail}，负载 ${d}${h}`,
         tags: [d % 3 ? 'oncall' : 'OnCall'], body: `# 值班巡检快照\n\n队列积压 ${d * h} 条，错误率 0.${d}%，磁盘 ${40 + d}%。`, source: 'demo', submittedBy: 'demo', status: 'approved',
       }, { dedup: false })
     }
