@@ -28,7 +28,7 @@ import {
 } from './vault.js'
 import { resolveDedupConfig } from './dedup-config.js'
 import { tagKey, pickCanonical, resolveMaxTags, loadTagTables, readConfigRaw, writeConfigRaw, patchTagTable, TAG_CANON_KEY } from './tags.js'
-import { planTopicGroups, planSnapshotSeries, SNAPSHOT_DEFAULTS } from './topics.js'
+import { planTopicGroups, planSnapshotSeries, isTimelineTitle, SNAPSHOT_DEFAULTS } from './topics.js'
 
 export { tagKey }
 /** 默认批次（不传 batches 时执行这些）。 */
@@ -38,7 +38,12 @@ export const OPTIONAL_TIDY_BATCHES = ['topics', 'snapshots']
 export const ALL_TIDY_BATCHES = [...TIDY_BATCHES, ...OPTIONAL_TIDY_BATCHES]
 export const NOISE_CATEGORIES = ['schedule-reminder', 'timeout-notice', 'fragment', 'agent-chatter']
 const DEFAULT_NOISE_CATEGORIES = ['schedule-reminder', 'timeout-notice', 'fragment']
-const DEFAULTS = { rawMaxChars: 6000, maxDelete: 50, simBodyLimit: 8000, mergeLinesPerGroup: 15, timelineLines: 200 }
+const DEFAULTS = {
+  rawMaxChars: 6000, maxDelete: 50, simBodyLimit: 8000, mergeLinesPerGroup: 15,
+  // 时间线卡的摘录预算：总量取「时间线行数下限」与「每张卡行数 x 张数」的较大者（按张数均分），
+  // 免得 200 行在多天 / 多组快照上只摘出个位数百分比；单卡再卡一个上限防止一张巨卡吃掉全部预算。
+  timelineLines: 600, timelineLinesPerCard: 3, timelineMaxLinesPerCard: 40,
+}
 
 // ---------------------------------------------------------------------------
 // 日志
@@ -214,9 +219,11 @@ export function planTagNormalize(rows, { synonyms = {}, canon: persisted = {}, m
 /**
  * 近似重复分组（纯函数）：最长者为保留卡（canonical），与它直接相似度 ≥ threshold 且 kind 相同的卡被吸收。
  * 刻意用「星形」而非传递闭包，避免 A≈B、B≈C 链式把互不相关的 A 和 C 并到一起。
+ * 默认跳过「（时间线）」卡：它们标题只差日期，靠近重复合并会把一天一张的时间线抹成一张。
  */
-export function planDuplicateGroups(cards, threshold, { limit = DEFAULTS.simBodyLimit, linesPerGroup = DEFAULTS.mergeLinesPerGroup } = {}) {
-  const items = cards.map((c) => ({ c, set: bigramHashSet(c.body.slice(0, limit)) }))
+export function planDuplicateGroups(cards, threshold, { limit = DEFAULTS.simBodyLimit, linesPerGroup = DEFAULTS.mergeLinesPerGroup, skipTimelines = true } = {}) {
+  const pool = skipTimelines ? cards.filter((c) => !isTimelineTitle(c.title)) : cards
+  const items = pool.map((c) => ({ c, set: bigramHashSet(c.body.slice(0, limit)) }))
     .sort((a, b) => b.c.body.length - a.c.body.length || a.c.id - b.c.id)
   const used = new Set()
   const groups = []
@@ -284,6 +291,8 @@ function planGroups(cards, o, want) {
     const exclude = new Set()
     for (const g of duplicates) { exclude.add(g.canonical.path); g.absorbs.forEach((a) => exclude.add(a.path)) }
     for (const s of snapshots) { exclude.add(s.timeline.path); s.members.forEach((m) => exclude.add(m.path)) }
+    // 时间线卡不靠近重复分组、也不进同主题分组：一天一张由 snapshots 批次维护（GH #16）
+    for (const c of live) if (isTimelineTitle(c.title)) exclude.add(c.path)
     topics = planTopicGroups(live, { threshold: o.topicThreshold, exclude })
   }
   return { noisePaths, duplicates, snapshots, topics }
@@ -301,6 +310,9 @@ function resolveOptions(opts = {}) {
     snapshotMinAgeHours: num(opts.snapshotMinAgeHours, SNAPSHOT_DEFAULTS.minAgeHours, 0, 24 * 365),
     snapshotMaxSeries: Math.floor(num(opts.snapshotMaxSeries, 0, 0, 100_000)), // 0 = 不限
     maxTags: Math.floor(num(opts.maxTags, resolveMaxTags(opts.env ?? process.env), 1, 20)),
+    timelineLines: Math.floor(num(opts.timelineLines, DEFAULTS.timelineLines, 0, 100_000)),
+    timelineLinesPerCard: Math.floor(num(opts.timelineLinesPerCard, DEFAULTS.timelineLinesPerCard, 0, 1000)),
+    timelineMaxLinesPerCard: Math.floor(num(opts.timelineMaxLinesPerCard, DEFAULTS.timelineMaxLinesPerCard, 1, 10_000)),
     rawMaxChars: Math.floor(num(opts.rawMaxChars, DEFAULTS.rawMaxChars, 500, 10_000_000)),
     maxDelete: Math.floor(num(opts.maxDelete, DEFAULTS.maxDelete, 0, 100000)),
     noiseCategories: cats,
@@ -521,7 +533,7 @@ function runBatch(db, root, name, o, rollback, log) {
   }
 }
 
-function recordRemoved(db, rollback, p, why) {
+function recordRemoved(_db, rollback, p, why) {
   rollback.removed.push({ path: p, why })
 }
 
@@ -603,9 +615,31 @@ function batchTopics(db, o, rollback, log) {
 }
 
 /**
+ * 把一张「（时间线）」卡的正文拆成「自重 + 时间线段落」：返回 [{title, body}]，title 为段落的 ### 原标题。
+ * 合并多张时间线卡时逐段保留原标题，不让标题退化成无标题文本块（GH #16）。
+ */
+function timelineSegments(body) {
+  const s = String(body || '')
+  const idx = s.indexOf(TIMELINE_SECTION)
+  const head = (idx < 0 ? s : s.slice(0, idx)).trim()
+  const out = []
+  if (head) out.push({ title: '', body: head })
+  if (idx < 0) return out
+  for (const block of s.slice(idx + TIMELINE_SECTION.length).split(/\n(?=### )/)) {
+    const b = block.trim()
+    if (!b) continue
+    const m = b.match(/^### (.+)\n?([\s\S]*)$/)
+    if (m) out.push({ title: m[1].trim(), body: m[2] })
+    else out.push({ title: '', body: b })
+  }
+  return out
+}
+
+/**
  * 可选批次 snapshots：周期性快照归入一张「时间线」卡。
  * 时间线卡 = 序列里最新的一张（改标题为「主干（时间线）」）或已有的时间线卡；其余快照按时间顺序
  * 以「### 原标题」+ 独特行的形式追加进「时间线」小节，然后软删。原卡全文仍在回收站 / 备份里，可回滚。
+ * 同一段标题下没有新增内容时保留占位行；重复行不重复堆，总量受按张数均分的行预算限制。
  */
 function batchSnapshots(db, o, rollback, log) {
   const cards = liveCards(db, o)
@@ -613,6 +647,7 @@ function batchSnapshots(db, o, rollback, log) {
   const series = planSnapshotSeries(cards, snapshotOptions(o))
   const total = series.reduce((n, g) => n + g.members.filter((m) => m.path !== g.timeline.path).length, 0)
   if (total > o.maxDelete) throw new Error(`实时计划软删 ${total} 张，超过 maxDelete=${o.maxDelete}`)
+  const placeholder = '(与时间线已有内容一致，无新增)'
   for (const g of series) {
     const keeper = byPath.get(g.timeline.path)
     const sources = g.members.filter((m) => m.path !== keeper.path).map((m) => byPath.get(m.path))
@@ -620,11 +655,25 @@ function batchSnapshots(db, o, rollback, log) {
     let body = keeper.body.trim()
     if (!body.includes(TIMELINE_SECTION)) body += `\n\n${TIMELINE_SECTION}\n\n### ${keeper.title}\n(当前正文即这一时点的状态)`
     const tagSet = new Set(keeper.tags)
-    let budget = DEFAULTS.timelineLines
-    for (const src of sources) {
-      const lines = budget > 0 ? uniqueLinesAgainst(body, src.body, { max: Math.min(budget, 20) }).filter((l) => detectSecrets(l).length === 0) : []
-      budget -= lines.length
-      body += `\n\n### ${src.title}\n` + (lines.length ? lines.join('\n') : '(与时间线已有内容一致，无新增)')
+    // 预算：下限 DEFAULTS.timelineLines，或每张卡 timelineLinesPerCard 行，取大者；按剩余张数均分，后面不被前面饿死
+    const budgetTotal = Math.max(o.timelineLines, o.timelineLinesPerCard * sources.length)
+    let budget = budgetTotal
+    const take = (text, share) => (share > 0
+      ? uniqueLinesAgainst(body, text, { max: share }).filter((l) => detectSecrets(l).length === 0)
+      : [])
+    for (const [i, src] of sources.entries()) {
+      const remaining = sources.length - i
+      const share = Math.min(budget, Math.max(1, Math.ceil(budget / remaining)), o.timelineMaxLinesPerCard)
+      // 来源本身是时间线卡：逐段保留它原有的 ### 原标题（否则多张时间线卡合并后标题全丢）
+      const segs = isTimelineTitle(src.title) ? timelineSegments(src.body) : [{ title: src.title, body: src.body }]
+      let used = 0
+      for (const seg of segs) {
+        const room = Math.min(share - used, budget - used)
+        const lines = take(seg.body, room)
+        used += lines.length
+        body += `\n\n${seg.title ? `### ${seg.title}` : `### ${src.title}`}\n` + (lines.length ? lines.join('\n') : placeholder)
+      }
+      budget -= used
       src.tags.forEach((t) => tagSet.add(t))
     }
     const title = g.timeline.newTitle
@@ -797,7 +846,7 @@ export function formatTidyPlan(plan, { limit = 15 } = {}) {
   return L.join('\n')
 }
 
-export function formatTidyApply(res, { limit = 15 } = {}) {
+export function formatTidyApply(res) {
   if (res.error && !res.batches) return `整理未执行：${res.error}`
   const L = []
   if (res.dryRun) {

@@ -239,7 +239,9 @@ function displayPrefix(prefixes) {
  *   2. 同 key 内还要共享实体 / 共享标签（两者都空则要求正文相似度 ≥ 0.15）才算同一系列；
  *   3. 系列内再按日期（YYYY-MM-DD / MM-DD / YYYYMMDD）分段：一天一张时间线卡，只有 1 张的稀疏日归入不带日期的段（免得一天一张的日常快照被拆成每张一卡）；无日期退化成单段；
  *   4. 单序列最多 maxPoints 张（超出的旧卡留在原处），且最新一张要早于 minAgeHours 才出建议；
- *   5. 已有「（时间线）」卡的序列直接追加（哪怕只有 1 张新卡），保持幂等 + 可回滚。
+ *   5. 已有「（时间线）」卡的序列直接追加（哪怕只有 1 张新卡），保持幂等 + 可回滚；
+ *   6. 同一天出现多张时间线卡（历史上被别的批次并过、或前缀写法漂移过）时，保留一张、其余作为附加成员
+ *      一并返回，合并方按「### 原标题」逐段保留，不让一天一张的骨架散成多张。
  *
  * @param cards [{id,path,kind,title,body,tags,createdAt?,updatedAt?}]
  * @param opts {minSeries, maxPoints, minAgeHours, bodyCorroborate, maxSeries, now}
@@ -253,6 +255,7 @@ export function planSnapshotSeries(cards, opts = {}) {
   const maxPoints = Math.max(1, Math.floor(Number(o.maxPoints) || SNAPSHOT_DEFAULTS.maxPoints))
   const minAgeMs = Math.max(0, Number(o.minAgeHours) || 0) * 3_600_000
   const maxSeries = Number(o.maxSeries) > 0 ? Math.floor(Number(o.maxSeries)) : Infinity
+  const chrono = (a, b) => String(a.createdAt || '').localeCompare(String(b.createdAt || '')) || a.id - b.id
 
   // 时间线卡按 (kind, 系列 key) 归位，快照卡按 (kind, 系列 key, 日期) 归桶
   const timelines = new Map() // `${kind}\0${key}` -> [{card, day, used}]
@@ -282,32 +285,47 @@ export function planSnapshotSeries(cards, opts = {}) {
     g.byDay.get(day).push(c)
   }
 
+  // 只有时间线卡、没有待归入快照的序列也要处理（同一天多张时间线卡需要合回一张）
+  const keys = [...new Set([...groups.keys(), ...timelines.keys()])].sort()
   const out = []
-  for (const key of [...groups.keys()].sort()) {
+  for (const key of keys) {
     const [kind] = key.split('\u0000')
-    const g = groups.get(key)
+    const g = groups.get(key) || { prefixes: new Map(), byDay: new Map() }
     const { byDay } = g
-    const prefix = displayPrefix(g.prefixes)
     const slots = timelines.get(key) || []
+    const prefix = displayPrefix(g.prefixes) || (slots[0] ? stripStamps(slots[0].card.title) : '')
+    // 日期段归一：MM-DD 与同年份的 YYYY-MM-DD 视为同一天（真实库里两种写法都出现过）
+    const allDays = [...byDay.keys(), ...slots.map((s) => s.day)]
+    const canonDay = (d) => (d && d.length === 5 ? allDays.find((x) => x && x.length === 10 && x.endsWith(d)) || d : d)
     // 同一天有 minSeries 张以上、或已经有当天时间线卡的日期才单独成段；其余稀疏日归入不带日期的段
-    const days = [...byDay.keys()]
-      .filter((d) => d && (byDay.get(d).length >= Math.max(2, o.minSeries) || slots.some((s) => !s.used && s.day === d)))
+    const days = [...new Set(allDays.map(canonDay))]
+      .filter((d) => d && ((byDay.get(d) || []).length >= Math.max(2, o.minSeries) || slots.some((s) => !s.used && canonDay(s.day) === d)))
       .sort()
+    const buckets = new Map(days.map((d) => [d, []]))
     const sparse = []
-    for (const d of [...byDay.keys()].sort()) if (!days.includes(d)) sparse.push(...byDay.get(d))
-    const buckets = new Map(days.map((d) => [d, byDay.get(d)]))
+    for (const d of [...byDay.keys()].sort()) {
+      const k = canonDay(d)
+      if (days.includes(k)) buckets.get(k).push(...byDay.get(d))
+      else sparse.push(...byDay.get(d))
+    }
+    // 不带日期的段：稀疏快照 + 已有无日期时间线卡都要走一遍（后者可能同一天有多张）
     if (sparse.length) buckets.set('', [...(buckets.get('') || []), ...sparse])
+    if (slots.some((s) => s.day === '')) buckets.set('', buckets.get('') || [])
     // 稀疏段最后处理：它只能接最近一张已有时间线卡，不能抢走别的日期的专属卡
-    const order = [...buckets.keys()].sort((a, b) => (a === '' ? 1 : b === '' ? -1 : a < b ? -1 : 1))
+    const order = buckets.has('')
+      ? [...[...buckets.keys()].filter((d) => d !== '').sort(), '']
+      : [...buckets.keys()].sort()
 
     for (const day of order) {
-      const members = buckets.get(day)
-        .sort((a, b) => String(a.createdAt || '').localeCompare(String(b.createdAt || '')) || a.id - b.id)
       // 先找同一天的时间线卡，再退到没有日期的时间线卡；稀疏段则接到最近一张（都没用过才算）
       const free = slots.filter((s) => !s.used).sort((a, b) => a.card.id - b.card.id)
       const slot = day
-        ? free.find((s) => s.day === day) || free.find((s) => !s.day) || null
+        ? free.find((s) => canonDay(s.day) === day) || free.find((s) => !s.day) || null
         : free.find((s) => !s.day) || free.filter((s) => s.day).sort((a, b) => b.day.localeCompare(a.day))[0] || null
+      // 同一天多出来的时间线卡：作为附加成员并进选中的那张，各自保留 ### 原标题（标记已用，不再重复处理）
+      const extras = slot ? free.filter((s) => s !== slot && canonDay(s.day) === day) : []
+      for (const e of extras) e.used = true
+      const members = [...(buckets.get(day) || []), ...extras.map((e) => e.card)].sort(chrono)
 
       const clusters = []
       if (slot) {
@@ -336,8 +354,9 @@ export function planSnapshotSeries(cards, opts = {}) {
         if (keep.length < need) continue
         const newest = keep[keep.length - 1]
         const newestMs = snapshotTime(newest)
-        // 还在进行中（最新一张不到 minAgeHours）：先不动，免得每轮都改写同一天的时间线卡
-        if (newestMs !== null && minAgeMs > 0 && nowMs - newestMs < minAgeMs) continue
+        // 还在进行中（最新一张不到 minAgeHours）：先不动，免得每轮都改写同一天的时间线卡。
+        // 只有时间线卡互相合并（extras）时不卡新鲜度：合回一张不会每轮反复改写。
+        if (!extras.length && newestMs !== null && minAgeMs > 0 && nowMs - newestMs < minAgeMs) continue
         if (cl.timeline) slot.used = true
         const keeper = cl.timeline || newest
         out.push({
@@ -361,13 +380,18 @@ export function planSnapshotSeries(cards, opts = {}) {
 /**
  * 同主题分组（多信号，纯函数，结果确定）：同 kind 内两两比较，得分达标的连边，取连通分量。
  * 保留卡 = 组内正文最长者（平手取 id 小的）。超过 maxGroup 的组只取与保留卡得分最高的 maxGroup-1 张。
+ * 默认跳过「（时间线）」卡：它们标题只差日期、正文又高度相似，留下来才守得住「一天一张」；
+ * 同一天多张时间线卡的合并交给 planSnapshotSeries。传 skipTimelines:false 可关掉。
  * @param opts.exclude Set<path>：不参与分组的卡（噪声 / 已在近重复组 / 快照序列里）
  * @returns [{canonical:{id,path,title}, members:[{id,path,title,score,title_sim,body_sim,tag_sim,entity_sim}]}]
  */
 export function planTopicGroups(cards, opts = {}) {
   const o = { ...TOPIC_DEFAULTS, ...opts, weights: { ...TOPIC_DEFAULTS.weights, ...(opts.weights || {}) } }
   const exclude = opts.exclude instanceof Set ? opts.exclude : new Set()
-  const items = cards.filter((c) => !exclude.has(c.path)).sort((a, b) => a.id - b.id).map((c) => prep(c, o))
+  const skipTimelines = opts.skipTimelines !== false
+  const items = cards
+    .filter((c) => !exclude.has(c.path) && !(skipTimelines && isTimelineTitle(c.title)))
+    .sort((a, b) => a.id - b.id).map((c) => prep(c, o))
   const parent = items.map((_, i) => i)
   const find = (i) => { while (parent[i] !== i) { parent[i] = parent[parent[i]]; i = parent[i] } return i }
   const byKind = new Map()
