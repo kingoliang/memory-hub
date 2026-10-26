@@ -6,7 +6,7 @@
 import { getDb, enforceAudit, nextCardId, MAIN_STATUS, QUARANTINE_STATUSES, tableForStatus } from './db.js'
 import { minhashSignature, lshCandidates } from './minhash.js'
 import { makeSummary, snippetAround, SUMMARY_VERSION } from './text.js'
-import { mainIndex, scoreCorpus } from './search-index.js'
+import { mainIndex, scoreCorpus, docsFromRows } from './search-index.js'
 
 export { makeSummary, stripMarkdown, snippetAround } from './text.js'
 export { invalidateIndex } from './search-index.js'
@@ -904,25 +904,79 @@ export { scoreCorpus, docsFromRows } from './search-index.js'
 
 export const MEMORY_READ_MAX_CHARS = 20000
 
-/**
- * Agent 读整张卡（memory_read 用）：**只读主库**（approved）。
- * 返回 { path, title, kind, tags, created, updated, body, updates:[{at, content}], totalChars }，不在主库 → 抛 CARD_NOT_FOUND / CARD_NOT_APPROVED（不泄露隔离区正文）。
- */
-export function readApprovedCard(root, rel) {
-  const db = getDb(root)
-  const row = db.prepare('SELECT * FROM cards WHERE path = ?').get(rel)
-  if (!row) {
-    const inQ = db.prepare('SELECT 1 FROM quarantine WHERE path = ?').get(rel)
-    const err = new Error(inQ ? `卡片未通过审核或已删除，不能读取：${rel}` : `卡片不存在：${rel}`)
-    err.code = inQ ? 'CARD_NOT_APPROVED' : 'CARD_NOT_FOUND'
-    throw err
-  }
+/** 标签列 → 数组（坏 JSON 不抛，落空数组）。 */
+function parseTags(raw) {
+  try { const v = JSON.parse(raw || '[]'); return Array.isArray(v) ? v.map((t) => String(t)) : [] } catch { return [] }
+}
+
+/** 卡片行 → 读结果（正文 + 更新记录）。 */
+function cardFromRow(db, row) {
+  const body = String(row.body || '')
   const updates = db.prepare('SELECT content, created_at FROM card_updates WHERE card_id = ? ORDER BY created_at ASC').all(row.id)
     .map((u) => ({ at: u.created_at, content: u.content }))
   return {
-    path: row.path, title: row.title, kind: row.kind, tags: JSON.parse(row.tags || '[]'),
-    created: row.created_at, updated: row.updated_at, body: String(row.body || ''), updates,
+    path: row.path, title: row.title, kind: row.kind, tags: parseTags(row.tags),
+    created: row.created_at, updated: row.updated_at, body, totalChars: body.length + updates.reduce((n, u) => n + String(u.content).length, 0), updates,
   }
+}
+
+/**
+ * Agent 读整张卡（memory_read 用）：默认**只读主库**（approved）。
+ * includeDeleted 时再放开回收站（quarantine 里 status=deleted）：照常返回全文，另带
+ * recycle = { deletedAt, quarantineReason }，调用方据此标注「已删除 / 归档去向 / 可 restore」。
+ * 待审 / 驳回仍一律拒绝 —— 它们还没定稿，读出来会误导。
+ * 不在任何可读状态 → 抛 CARD_NOT_FOUND / CARD_NOT_APPROVED（不泄露隔离区正文）。
+ */
+export function readApprovedCard(root, rel, { includeDeleted = false } = {}) {
+  const db = getDb(root)
+  const row = db.prepare('SELECT * FROM cards WHERE path = ?').get(rel)
+  if (row) return cardFromRow(db, row)
+  const inQ = db.prepare('SELECT * FROM quarantine WHERE path = ?').get(rel)
+  if (!inQ) {
+    const err = new Error(`卡片不存在：${rel}`)
+    err.code = 'CARD_NOT_FOUND'
+    throw err
+  }
+  if (inQ.status !== 'deleted' || !includeDeleted) {
+    const err = new Error(`卡片未通过审核或已删除，不能读取：${rel}`)
+    err.code = 'CARD_NOT_APPROVED'
+    err.status = inQ.status
+    throw err
+  }
+  return {
+    ...cardFromRow(db, inQ),
+    recycle: { deletedAt: inQ.deleted_at || inQ.updated_at || '', quarantineReason: inQ.quarantine_reason || '' },
+  }
+}
+
+// ---- 回收站检索（memory_recall 的「另有 N 张在回收站」用）----
+const deletedIndexes = new Map()
+const DELETED_SIG_SQL = "SELECT COUNT(*) n, MAX(deleted_at) d, TOTAL(LENGTH(body)) b, TOTAL(LENGTH(title)) t FROM quarantine WHERE status = 'deleted'"
+
+/** 回收站索引：签名不变且未过期则复用（与主库索引同一套失效策略）。 */
+function deletedIndex(root, now = Date.now()) {
+  const db = getDb(root)
+  const sig = db.prepare(DELETED_SIG_SQL).get()
+  const key = `${sig.n}|${sig.d}|${sig.b}|${sig.t}`
+  const cur = deletedIndexes.get(db)
+  if (cur && cur.sig === key && now - cur.builtAt < 60_000) return cur
+  const rows = db.prepare("SELECT id, path, kind, title, tags, body, summary, status, source, submitted_by, severity, reason, created_at, updated_at, deleted_at FROM quarantine WHERE status = 'deleted' ORDER BY deleted_at DESC").all()
+  const idx = { sig: key, builtAt: now, corpus: rows.length ? docsFromRows(db, rows) : { docs: [], avgLen: 1, postings: new Map() } }
+  deletedIndexes.set(db, idx)
+  return idx
+}
+
+/**
+ * 统计回收站里与查询同主题的卡（不计入命中数，只作提示）。
+ * 用与召回相同的严格覆盖率判定；返回 { total, paths }，paths 最多 limit 条（默认 3）供直接读取。
+ */
+export function countDeletedCards(root, query, { strict = true, limit = 3 } = {}) {
+  const q = String(query || '').trim()
+  if (!q) return { total: 0, paths: [] }
+  const { corpus } = deletedIndex(root)
+  if (!corpus.docs.length) return { total: 0, paths: [] }
+  const scored = scoreCorpus(corpus, q, { strict })
+  return { total: scored.length, paths: scored.slice(0, Math.max(0, limit)).map((s) => corpus.docs[s.i].path) }
 }
 
 /**
@@ -1026,7 +1080,6 @@ export async function addFeedback(root, rec) {
  * `status` / `quarantine` 描述隔离区（审核中心与回收站）。
  */
 export async function overview(root) {
-  const db = getDb(root)
   const cards = await listCards(root, { status: [MAIN_STATUS] })
   const byKind = {}
   const statusCounts = {}

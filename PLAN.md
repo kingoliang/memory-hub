@@ -281,7 +281,7 @@
 | `memory_capture` | 写 | ❌ | ✅ | ✅ | 新卡一律受 `auditMode` 约束（默认进待审队列）；署名=令牌名 |
 | `memory_tidy_apply` | 写（破坏性） | ❌ | ❌ | ✅ **且** `exposeTidyApply=true` | 默认**不在 `tools/list` 中出现** |
 | `memory_tag_normalize` | 写（破坏性） | ❌ | ❌ | ✅ **且** `exposeTidyApply=true` | 同上 |
-| *(建议新增)* `memory_read` | 读 | ✅ | ✅ | ✅ | 按 path 读单张 approved 卡全文。现状 recall 只回 130 字摘要（`mcp.js:166`），Agent 无法取全文。是否新增待拍板 |
+| *(建议新增)* `memory_read` | 读 | ✅ | ✅ | ✅ | 按 path 读单张 approved 卡全文。现状 recall 只回 130 字摘要（`mcp.js:166`），Agent 无法取全文。是否新增待拍板。`includeDeleted: true` 时也读回收站卡（GH #15），权限沿用 read |
 
 **整理类写操作默认不对 Agent 开放——论证**
 1. **爆炸半径是全体 Agent 共享的记忆**：一个 Agent 的 apply 会软删/合并别的 Agent 写的卡，而 `merge` 会改写保留卡的正文（`tidy.js` `batchMerge :463`）。

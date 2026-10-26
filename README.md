@@ -108,8 +108,8 @@ stdio（本机单 Agent，身份取环境变量 `MEMORY_HUB_AGENT`，不经网�
 
 | 工具 | 所需 scope | 说明 |
 |---|---|---|
-| `memory_recall` | `read` | 按关键词检索相关知识卡（BM25 相关度排序），返回标题 / 路径 / 命中词附近的片段与总命中数；`detail: "full"` 在字数预算内直接附全文 |
-| `memory_read` | `read` | 按路径读整张卡：正文 + 标签 + 更新时间 + 追加的更新记录；可一次读多张，超长卡用 `offset` / `maxChars` 分段；只读已批准卡 |
+| `memory_recall` | `read` | 按关键词检索相关知识卡（BM25 相关度排序），返回标题 / 路径 / 命中词附近的片段与总命中数；`detail: "full"` 在字数预算内直接附全文。命中数只算在库卡，回收站里的同主题卡另起一句报张数与路径 |
+| `memory_read` | `read` | 按路径读整张卡：正文 + 标签 + 更新时间 + 追加的更新记录；可一次读多张，超长卡用 `offset` / `maxChars` 分段；默认只读已批准卡，`includeDeleted: true` 时也读回收站里的卡（头部标注删除时间与归档去向，可 restore 还原），待审 / 驳回仍读不到 |
 | `memory_capture` | `write` | 沉淀一条自包含知识（一次一个主题，上限 64K 字符） |
 | `memory_stats` | `read` | 库概览：总数、分类分布、近期新增 |
 | `memory_audit_list` | `read` | 列出待审 / 已驳回卡片（只读，不改变状态） |
