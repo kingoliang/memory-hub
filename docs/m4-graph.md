@@ -5,7 +5,7 @@
 ## 原版语义（出处）
 - 数据：上游 `lib/vault.js` `graph()`（:852，另有内存+磁盘缓存 :810-:850）；路由 `lib/api.js` `case '/graph'`（:325）。
 - 节点 = 主库卡片（id=path，title/kind/tags/summary[:80]/updated，`linkCount`=度数）。
-- 边三种：`link`（正文 `[[wikilink]]`，按 kind 目录/知识目录/裸名/标题解析，vault.js ~:880）；`tag:<标签>`（共享标签，按共享数取每卡 Top-6，`TAG_TOPK=6`）；`similar`（bigram Jaccard ≥0.42，稀有 gram 倒排 + MinHash/LSH 取候选，每卡至多 1 条，跨 kind 须共享标签）。
+- 边三种：`link`（正文 `[[wikilink]]`，按 kind 目录/知识目录/裸名/标题解析，vault.js ~:880）；`tag:<标签>`（共享标签，按共享数取每卡 Top-6，`TAG_TOPK=6`）；`similar`（bigram Jaccard ≥0.42，bottom-k 草图取候选 + 精确求交复核，每卡至多 1 条，跨 kind 须共享标签）。
 - 前端：上游只有压缩后的 `web/app.js`（组件 `eh`/`nh`，源码 `src/client` 未随 fork 提供，**uncertain**）：canvas 力导向；颜色按 kind（project 蓝/knowledge 绿/content 橙/prompt 紫/business 粉/tool 青/mistake 红），半径 9+≤8·度数占比；kind 聚类中心；搜索（标题/kind）定位；kind 图例筛选、Top-24 标签筛选；缩放/平移/框选/右键菜单/导出/全屏；LOD（视口剔除 + 标签预算，`tests/graph-lod.test.mjs`）。
 
 ## 数据模型（本实现）
@@ -15,11 +15,25 @@
 |---|---|---|
 | `link` | 正文 `[[x]]`（解析顺序：`<kind目录>/x.md` → `03-Knowledge/x.md` → `x.md` → 标题 → 文件名） | 3 |
 | `tag` | 共享标签，每卡按共享数取 Top-6（见下「标签边如何选边」）；附 `tags`（共享标签，≤5） | 共享标签数 |
-| `similar` | 正文前 4000 字 bigram Jaccard ≥ 0.42，每卡至多 1 条，跨 kind 须共享标签；附 `sim` | 2 |
+| `similar` | 正文前 600 字 bigram Jaccard ≥ 0.42（精确求交，非估计），每卡至多 1 条，跨 kind 须共享标签；附 `sim` | 2 |
 
-bigram 集合的计算用与 `vault.bigramHashSet` 数值等价（同清洗正则、同 FNV-1a 哈希，逐 gram 结果一致）但不做每 gram 的 `slice` 的实现（`bigramHashesFast`），2 万卡时快一些；语义不变。
+gram 的清洗与哈希（`hashBigramsInto`）与 `vault.bigramHashSet` 数值等价：同一套「去空白与标点、转小写」的规则、同一条 FNV-1a（逐 gram 的哈希值一致），但清洗与哈希在同一次遍历里完成、直接写进复用缓冲，不生成中间字符串、不做每 gram 的 slice。
 
-与原版差异：标签边 type 统一为 `tag`（共享标签放 `tags` 字段）；wikilink 解析单次命中（原版可能因标题回退多加一条）；相似度只取正文前 4000 字；标题经 `redactSecrets` 遮蔽。
+与原版差异：标签边 type 统一为 `tag`（共享标签放 `tags` 字段）；wikilink 解析单次命中（原版可能因标题回退多加一条）；相似度只取正文前 600 字；标题经 `redactSecrets` 遮蔽。
+
+### 相似边如何取候选（bottom-k 草图 + 精确复核）
+
+命中判定**没有放宽**：仍然是精确 `Jaccard ≥ 0.42`（排好序的 gram 数组归并求交，先按 1024 个分块的上界剪枝，凑不够阈值立刻退出），每卡至多 1 条，跨 kind 必须共享标签。变的只是「谁值得算」：
+
+1. 每卡把自己的 gram 排序去重成 `Int32Array`，取**哈希最小的 32 个**当草图（= bottom-k MinHash 签名），只有它们进倒排；
+2. 倒排边遍历边建，所以 posting 里只有已经处理过的卡；某个 gram 出现在很多卡里时只看最近的 `HOT_POSTING_WINDOW=32` 个**前驱**（不是排序末尾——先建完整倒排再取尾部会只偏爱末尾，真实数据上召回从 96% 掉到 23%）；
+3. 共享草图数 / 草图长度是 Jaccard 的无偏估计，低于 `SKETCH_MIN_RATIO=0.30` 直接丢，剩下的按估计取 Top-`CAND_CAP=10` 精确复核，命中一条即止。
+
+这条路径对「一整批卡复用同一段模板」是宽容的：旧实现只索引 DF ≤ 24 的 gram，模板一旦被反复复用就整批落空（5000 张合成卡只出 1 条边）；现在靠哈希最小的草图，不依赖 DF。
+
+### 不阻塞事件循环
+
+建图是**异步**的（`graphQuery`/`clusterQuery` 返回 Promise）：取库、映射、gram 构建、标签选边、相似配对都按时间片（攒满 8ms）`await setImmediate()` 让出，所以建图期间 MCP `memory_recall` 照常服务。同一指纹的并发请求共享同一个 Promise（只建一份图），指纹变化才重建；缓存仍按 root 保留最后一次结果。
 
 ### 标签边如何选边（稀有标签优先 + 热门标签窗口采样 + 精确复核权重）
 

@@ -12,7 +12,7 @@ if (!Number.isInteger(n) || n < 1) { console.error('用法：graph-perf-edges.mj
 const home = tmpHome('mh-graph-edges-')
 const { ms: seedMs } = await seedCards(home, n)
 const t0 = performance.now()
-const g = graphQuery(home, { limit: 1_000_000 })
+const g = await graphQuery(home, { limit: 1_000_000 })
 const ms = performance.now() - t0
 const byType = { link: 0, tag: 0, similar: 0 }
 for (const e of g.edges) byType[e.type]++

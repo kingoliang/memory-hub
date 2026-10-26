@@ -169,7 +169,7 @@ export function createAdminHandler({ config, log, llm = null }) {
       if (!d) throw new HttpError(404, 'not_found', '卡片不存在')
       return d
     },
-    'GET /graph': (ctx) => {
+    'GET /graph': async (ctx) => {
       // 只读（GET）：即使 MEMORY_HUB_ADMIN_READONLY=1 也可访问；节点不含正文/摘要，详情走 GET /card
       const u = ctx.url
       enumParam(u, 'status', ['approved'], 'approved') // 图只含主库（approved）卡；隔离区/回收站不入图
@@ -184,7 +184,7 @@ export function createAdminHandler({ config, log, llm = null }) {
       const mode = enumParam(u, 'mode', G.GRAPH_MODES, 'cards')
       const clusterBy = enumParam(u, 'cluster_by', G.CLUSTER_BYS, 'kind')
       try {
-        return G.graphQuery(root, {
+        return await G.graphQuery(root, {
           mode,
           clusterBy,
           kind: strParam(u, 'kind', 50),
