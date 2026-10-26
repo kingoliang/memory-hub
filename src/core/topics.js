@@ -70,12 +70,13 @@ const WORDLIKE_RE = /[^\d]/u
 const SERIES_KEY_WORDS = 2
 
 /**
- * 快照系列身份 key：前缀归一（NFKC、小写、标点符号一律当分隔、折叠空白）后取前 2 个「词」。
+ * 快照系列身份 key：前缀先去掉尾部通用词（`COMBO 值班快照` 与 `COMBO 值班` 同键），再归一
+ * （NFKC、小写、标点符号一律当分隔、折叠空白）后取前 2 个「词」。
  * 纯数字词跳过（`3.5 巡检` 这类前缀不能只剩 `3 5`）。同一批次的 `A – B` / `A ~ B` / `A/B` 因此同键。
  * 不合格返回 ''，该卡就不进快照批次。
  */
 export function snapshotSeriesKey(prefix) {
-  const words = String(prefix || '').normalize('NFKC').toLowerCase()
+  const words = cleanPrefix(prefix).normalize('NFKC').toLowerCase()
     .replace(/[\p{P}\p{S}]+/gu, ' ').replace(/\s+/g, ' ').trim().split(' ')
     .filter((w) => w && WORDLIKE_RE.test(w))
   return words.slice(0, SERIES_KEY_WORDS).join(' ')
@@ -218,6 +219,18 @@ const snapshotTime = (c) => {
   return Number.isFinite(ms) ? ms : null
 }
 
+/** 前缀尾部的通用词（`COMBO 值班快照` → `COMBO 值班`）：身份 key 与展示 / 标题都先去掉。 */
+const GENERIC_PREFIX_TAIL_RE = /\s*(?:快照|记录|日志|日报|周报|月报|简报|摘要|小结)$/u
+/** 去掉尾部通用词；不能把前缀削空（`快照` 本身还要留着）。 */
+function cleanPrefix(prefix) {
+  let s = String(prefix || '').trim()
+  for (;;) {
+    const next = s.replace(GENERIC_PREFIX_TAIL_RE, '').replace(EDGE_RE, '').trim()
+    if (!next || next === s || !WORDLIKE_RE.test(next)) return s
+    s = next
+  }
+}
+
 /** 桶内展示前缀：出现最多的写法（平手取短的、再取字典序小的），保证结果确定。 */
 function displayPrefix(prefixes) {
   let best = ''
@@ -227,7 +240,7 @@ function displayPrefix(prefixes) {
       || (prefix.length === best.length && prefix < best)))
     if (better) { best = prefix; bestN = n }
   }
-  return best
+  return cleanPrefix(best)
 }
 
 /**
@@ -237,7 +250,8 @@ function displayPrefix(prefixes) {
  *   1. 身份 = 前缀归一后的前 2 个词（前缀 = 剥掉时间戳后第一个分隔符之前的部分，必须含非数字词），
  *      展示用的前缀取桶内最常见写法 —— 分隔符残渣（`–` / `~` / `/`）不会再把同一天劈开；
  *   2. 同 key 内还要共享实体 / 共享标签（两者都空则要求正文相似度 ≥ 0.15）才算同一系列；
- *   3. 系列内再按日期（YYYY-MM-DD / MM-DD / YYYYMMDD）分段：一天一张时间线卡，只有 1 张的稀疏日归入不带日期的段（免得一天一张的日常快照被拆成每张一卡）；无日期退化成单段；
+ *   3. 系列内再按日期（YYYY-MM-DD / MM-DD / YYYYMMDD）分段：标题带日期的卡一律按日期分段（位置不限），
+ *      同一天才合并，不把稀疏日降级成无日期的跨天段（GH #19）；只有标题完全没有日期的才退化成单段；
  *   4. 单序列最多 maxPoints 张（超出的旧卡留在原处），且最新一张要早于 minAgeHours 才出建议；
  *   5. 已有「（时间线）」卡的序列直接追加（哪怕只有 1 张新卡），保持幂等 + 可回滚；
  *   6. 同一天出现多张时间线卡（历史上被别的批次并过、或前缀写法漂移过）时，保留一张、其余作为附加成员
@@ -294,34 +308,39 @@ export function planSnapshotSeries(cards, opts = {}) {
     const { byDay } = g
     const slots = timelines.get(key) || []
     const prefix = displayPrefix(g.prefixes) || (slots[0] ? stripStamps(slots[0].card.title) : '')
-    // 日期段归一：MM-DD 与同年份的 YYYY-MM-DD 视为同一天（真实库里两种写法都出现过）
+    // 日期段归一：MM-DD 与同年份的 YYYY-MM-DD 视为同一天（真实库里两种写法都出现过）。
+    // 计数必须按归一后的日期合并；否则同一天的两种写法各自只有 1~2 张时会全部落选，退化回无日期段。
     const allDays = [...byDay.keys(), ...slots.map((s) => s.day)]
     const canonDay = (d) => (d && d.length === 5 ? allDays.find((x) => x && x.length === 10 && x.endsWith(d)) || d : d)
-    // 同一天有 minSeries 张以上、或已经有当天时间线卡的日期才单独成段；其余稀疏日归入不带日期的段
-    const days = [...new Set(allDays.map(canonDay))]
-      .filter((d) => d && ((byDay.get(d) || []).length >= Math.max(2, o.minSeries) || slots.some((s) => !s.used && canonDay(s.day) === d)))
-      .sort()
-    const buckets = new Map(days.map((d) => [d, []]))
-    const sparse = []
+    const byCanon = new Map()
+    const undated = []
     for (const d of [...byDay.keys()].sort()) {
       const k = canonDay(d)
-      if (days.includes(k)) buckets.get(k).push(...byDay.get(d))
-      else sparse.push(...byDay.get(d))
+      if (!k) { undated.push(...byDay.get(d)); continue }
+      if (!byCanon.has(k)) byCanon.set(k, [])
+      byCanon.get(k).push(...byDay.get(d))
     }
-    // 不带日期的段：稀疏快照 + 已有无日期时间线卡都要走一遍（后者可能同一天有多张）
-    if (sparse.length) buckets.set('', [...(buckets.get('') || []), ...sparse])
-    if (slots.some((s) => s.day === '')) buckets.set('', buckets.get('') || [])
-    // 稀疏段最后处理：它只能接最近一张已有时间线卡，不能抢走别的日期的专属卡
+    // 标题带日期的一律按日期分段（同一天才合并）；只有整桶都没有日期的才走无日期段。
+    // 只有时间线卡、没有待归入快照的日期也要保留（同日多张时间线卡需要合回一张）。
+    const days = [...new Set([...byCanon.keys(), ...slots.map((s) => canonDay(s.day)).filter(Boolean)])].sort()
+    const buckets = new Map(days.map((d) => [d, byCanon.get(d) || []]))
+    const hasUndatedSlot = slots.some((s) => s.day === '')
+    if (undated.length && (undated.length >= Math.max(2, o.minSeries) || hasUndatedSlot)) buckets.set('', undated)
+    else if (hasUndatedSlot) buckets.set('', [])
+    // 无日期段最后处理：它只能接无日期时间线卡，不能抢走某个日期的专属卡
     const order = buckets.has('')
-      ? [...[...buckets.keys()].filter((d) => d !== '').sort(), '']
-      : [...buckets.keys()].sort()
+      ? [...days.filter((d) => buckets.has(d)), '']
+      : days
 
     for (const day of order) {
-      // 先找同一天的时间线卡，再退到没有日期的时间线卡；稀疏段则接到最近一张（都没用过才算）
       const free = slots.filter((s) => !s.used).sort((a, b) => a.card.id - b.card.id)
+      // 有日期的段先找同一天的时间线卡；整桶只有这一天且只剩无日期卡时才复用它（并补上日期）。
+      // 无日期段只接无日期时间线卡，绝不接别的日期，免得标题永远没有日期。
       const slot = day
-        ? free.find((s) => canonDay(s.day) === day) || free.find((s) => !s.day) || null
-        : free.find((s) => !s.day) || free.filter((s) => s.day).sort((a, b) => b.day.localeCompare(a.day))[0] || null
+        ? free.find((s) => canonDay(s.day) === day)
+          || (days.length === 1 && !undated.length && free.find((s) => !s.day))
+          || null
+        : free.find((s) => !s.day) || null
       // 同一天多出来的时间线卡：作为附加成员并进选中的那张，各自保留 ### 原标题（标记已用，不再重复处理）
       const extras = slot ? free.filter((s) => s !== slot && canonDay(s.day) === day) : []
       for (const e of extras) e.used = true
@@ -350,21 +369,24 @@ export function planSnapshotSeries(cards, opts = {}) {
       for (const cl of clusters) {
         // 超上限：留在时间线上的取最新的 maxPoints 张，更旧的留在原处不并入
         const keep = cl.members.length > maxPoints ? cl.members.slice(cl.members.length - maxPoints) : cl.members
-        const need = cl.timeline ? 1 : o.minSeries
+        // 有日期的段即使只有 1 张也自成一张（否则跨天卡；GH #19）；无日期段仍守 minSeries
+        const need = cl.timeline || day ? 1 : o.minSeries
         if (keep.length < need) continue
-        const newest = keep[keep.length - 1]
+        const newest = keep[keep.length - 1] || cl.timeline
         const newestMs = snapshotTime(newest)
         // 还在进行中（最新一张不到 minAgeHours）：先不动，免得每轮都改写同一天的时间线卡。
         // 只有时间线卡互相合并（extras）时不卡新鲜度：合回一张不会每轮反复改写。
         if (!extras.length && newestMs !== null && minAgeMs > 0 && nowMs - newestMs < minAgeMs) continue
         if (cl.timeline) slot.used = true
         const keeper = cl.timeline || newest
+        // 已有无日期时间线卡被这一天复用（整桶只有这一天）时把日期补进标题
+        const retitle = day && !snapshotDay(keeper.title)
         out.push({
           stem: prefix, kind, day, count: keep.length,
-          first: keep[0].createdAt || null, last: newest.createdAt || null,
+          first: keep[0]?.createdAt || null, last: newest?.createdAt || null,
           timeline: {
             id: keeper.id, path: keeper.path, title: keeper.title, existing: !!cl.timeline,
-            newTitle: cl.timeline ? keeper.title : snapshotTimelineTitle(prefix, day),
+            newTitle: cl.timeline && !retitle ? keeper.title : snapshotTimelineTitle(prefix, day),
           },
           members: keep.map((m) => ({ id: m.id, path: m.path, title: m.title, createdAt: m.createdAt || null })),
         })

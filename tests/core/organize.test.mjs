@@ -129,18 +129,21 @@ test('snapshots 之后 topics 不再塌成 1 张：snapshots,topics 连跑时间
   assert.equal(timelines().length, 3)
 })
 
-test('planSnapshotSeries：同前缀 + 时间戳且 ≥ minSeries 才成序列；已有时间线卡 1 张也追加', () => {
+test('planSnapshotSeries：时间戳 + 前缀分组，带日期的卡一天一张（GH #19）；已有无日期卡补日期', () => {
   const mk = (id, title, kind = 'project', tags = ['巡检']) => ({ id, path: `${id}.md`, kind, title, body: cjk(50), tags, createdAt: `2026-10-${10 + id}` })
   const cards = [mk(1, '巡检 2026-10-11'), mk(2, '巡检 2026-10-12'), mk(3, '巡检 2026-10-13'), mk(4, '日报 2026-10-11'), mk(5, '日报 2026-10-12')]
   const s = planSnapshotSeries(cards)
-  assert.equal(s.length, 1)
-  assert.equal(s[0].count, 3)
-  assert.equal(s[0].timeline.path, '3.md', '默认保留最新一张作为时间线卡')
-  assert.equal(s[0].timeline.newTitle, '巡检（时间线）')
+  assert.equal(s.length, 5, '两个前缀 × 各自每个日期一段；单张的日期也成段')
+  assert.deepEqual(s.map((x) => x.stem), ['巡检', '巡检', '巡检', '日报', '日报'])
+  assert.deepEqual(s.map((x) => x.day), ['2026-10-11', '2026-10-12', '2026-10-13', '2026-10-11', '2026-10-12'])
+  assert.ok(s.every((x) => x.count === 1), '同一天只有 1 张就不跨天合并')
+  assert.equal(s[2].timeline.path, '3.md', '默认保留最新一张作为时间线卡')
+  assert.equal(s[2].timeline.newTitle, '巡检 2026-10-13（时间线）')
   const s2 = planSnapshotSeries([mk(6, '巡检（时间线）'), mk(7, '巡检 2026-10-20')])
   assert.equal(s2.length, 1)
   assert.equal(s2[0].timeline.path, '6.md')
   assert.equal(s2[0].timeline.existing, true)
+  assert.equal(s2[0].timeline.newTitle, '巡检 2026-10-20（时间线）', '唯一一天时给已有无日期卡补日期')
 })
 
 test('planTagNormalize：持久化规范写法优先于计数（不翻转）；新选定的进 decided', () => {
@@ -255,12 +258,13 @@ test('tidyPlan：报告同主题组与快照序列；不在默认批次里', asy
   assert.equal(plan.duplicates.length, 0, '改写卡正文相似度低，旧的近重复判定抓不到')
   assert.equal(plan.topics.length, 1)
   assert.deepEqual([plan.topics[0].canonical.path, ...plan.topics[0].members.map((m) => m.path)].sort(), [...rw].sort())
-  assert.equal(plan.snapshots.length, 1)
-  assert.equal(plan.snapshots[0].count, 4)
-  assert.deepEqual(plan.snapshots[0].members.map((m) => m.path), sn)
+  assert.equal(plan.snapshots.length, 4, '一天一张，不再合成跨天卡')
+  assert.ok(plan.snapshots.every((g) => g.count === 1))
+  assert.deepEqual(plan.snapshots.map((g) => g.members[0].path), sn)
+  assert.ok(plan.snapshots.every((g) => /2026-10-\d{2}（时间线）$/.test(g.timeline.newTitle)), '每张标题都带日期')
   assert.ok(!TIDY_BATCHES.includes('topics') && !TIDY_BATCHES.includes('snapshots'), '默认不自动合并/删除')
   const text = formatTidyPlan(plan)
-  assert.ok(text.includes('同主题组') && text.includes('周期性快照序列') && text.includes('值班巡检快照（时间线）'))
+  assert.ok(text.includes('同主题组') && text.includes('周期性快照序列') && text.includes('值班巡检 2026-10-10（时间线）'))
 })
 
 test('tidyPlan 幂等：连续两次 planId 与结果一致；默认 apply 不动同主题/快照卡', async () => {
@@ -318,19 +322,22 @@ test('可选批次 snapshots：归入时间线卡（改标题 + 时间线小节�
   const plan = await tidyPlan(root, quiet)
   const res = await tidyApply(root, { ...quiet, confirm: true, planId: plan.planId, batches: ['snapshots'] })
   assert.equal(res.ok, true, JSON.stringify(res.batches))
-  const rows = db.prepare('SELECT path, title, body FROM cards').all()
-  assert.equal(rows.length, 1)
-  assert.equal(rows[0].path, sn[sn.length - 1])
-  assert.equal(rows[0].title, '值班巡检快照（时间线）')
-  assert.ok(rows[0].body.includes('## 时间线'))
-  for (const p of sn.slice(0, -1)) assert.ok(rows[0].body.includes(`### 值班巡检快照 ${p.slice(-13, -3)}`), p)
+  const rows = db.prepare('SELECT path, title, body FROM cards ORDER BY path').all()
+  assert.equal(rows.length, 4, '四天四张，一天都没被跨天合并')
+  assert.deepEqual(rows.map((r) => r.path), sn)
+  for (const r of rows) {
+    assert.match(r.title, /2026-10-\d{2}（时间线）$/)
+    assert.ok(r.body.includes('## 时间线'))
+    assert.ok(r.body.includes(`### 值班巡检快照 ${r.path.slice(-13, -3)}`))
+  }
   const again = await tidyPlan(root, quiet)
   assert.equal(again.snapshots.length, 0, '归并后再 plan 没有新的快照建议')
-  // 新快照进来：归入已有时间线卡（插入时间往前放，避开 24 小时新鲜度门槛）
+  // 新一天的新快照进来：多天并存时不再并进别的日期，新建带日期的时间线卡
   insertCard(db, { path: '02-Projects/oncall-2026-10-20.md', kind: 'project', title: '值班巡检快照 2026-10-20 09:00', tags: ['oncall'], body: cjk(100), updatedAt: '2026-10-20T09:00:00.000Z' })
   const p3 = await tidyPlan(root, quiet)
   assert.equal(p3.snapshots.length, 1)
-  assert.equal(p3.snapshots[0].timeline.existing, true)
+  assert.equal(p3.snapshots[0].timeline.existing, false)
+  assert.equal(p3.snapshots[0].timeline.newTitle, '值班巡检 2026-10-20（时间线）')
   // 回滚第一次归并
   db.prepare("DELETE FROM cards WHERE path = '02-Projects/oncall-2026-10-20.md'").run()
   const rb = await tidyRollback(root, res.rollbackFile, quiet)
